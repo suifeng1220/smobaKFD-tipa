@@ -25,7 +25,7 @@ jobs:
         run: brew install ldid
 
       - name: Build tipa
-        run: ./build.sh "${{ github.event.inputs.version || '1.0.0' }}"
+        run: bash build.sh "${{ github.event.inputs.version || '1.0.0' }}"
 
       - name: Upload tipa
         uses: actions/upload-artifact@v4
