@@ -1,0 +1,46 @@
+smobaKFD / S45王者KFD —— 源码归档（全量）
+==========================================
+
+归档时间：2026-11-16 16:35:14
+Git 提交：fbd998912ebfae8e3558c5dd4b67b28171c5415e
+分支    ：main（短号 fbd9989）
+顶层目录：smobaKFD/
+
+【本版改动（相对 20261116_1600）】
+  1. 内核利用链对齐 Dopamine 3.0.13（commit d817f5d）
+     - kfd/Info.plist：physpuppet 升 priority 1000 并覆盖 16.0–16.3.1；
+       landa 降 900（15.0–15.8.6 / 16.0–16.6.1）；smith 600 不变
+     - DOJailbreaker：删除 16.x/A16 硬剔除，改为读 framework Info.plist 排序
+     - puaf.h：恢复上游 #if __arm64e__ 条件编译
+  2. 内核利用改单发制（commit fbd9989）
+     - DOJailbreaker：删除候选链，只跑选中的一条，失败即停
+     - libkfd.h kopen：physpuppet/smith 的 krkw 失败改为 cleanup+free+return 0，
+       不再带病继续 info_run；landa 重试加 3 次上限
+     - physpuppet.h / smith.h：free 补 uaddr==0 保护
+
+【包含】
+  绘图/        主界面 UIKit（BBZView）、悬浮球面板（SLBall）、绘制层（DrawView）、
+               过直播窗口、游戏偏移（绘图/游戏/SDK.h）
+  sources/     HUD 进程入口（HUDApp）、AX/HID 事件回调（三指三击）
+  HID/         触摸注入与旁听
+  kfd/         kfd 内核原语（kread/kwrite、PUAF 三种变体、KRKW）
+  exploits/    Dopamine 利用管理层（DOJailbreaker / DOExploitManager）
+  libraries/   libjailbreak、XPF、libgrabkernel2.a、libpartial.a（预编译静态库）
+  dependencies/build/  Dopamine 构建产物（jbctl / opainject / *.dylib 等）
+  headers/     私有 SPI 头（AXEvent / IOKit）
+  supports/    Sandbox-Info.plist、entitlements.plist、Assets.xcassets（AppIcon）
+  Resources/  Books.xcodeproj  Makefile  build.sh  .github/workflows/
+  ui设计/      界面风格稿 p1~p5（HTML）
+  字体/ ImGui 1.91.5/ MBProgressHUD/ zstd/  第三方源码
+  菜单.md      功能与面板说明
+
+【未包含】
+  .git/                    完整历史见 smobaKFD_S45_历史_20261116_1635.bundle
+  packages/、*.tipa        已构建的安装包
+  .DS_Store                系统缓存文件
+
+【恢复】
+  解压后：
+      git init && git add -A && git commit -m "restore S45_20261116_1635"
+      git pull "$PWD/smobaKFD_S45_历史_20261116_1635.bundle" main   # 需要历史时
+  Xcode 打开 Books.xcodeproj，或参考 .github/workflows/build.yml 在 macOS 上构建。
