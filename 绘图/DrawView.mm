@@ -98,6 +98,15 @@ static bool 地图已手调 = false;            // 0x100223580（plist 里有 ma
 static bool cfg_fov_probe = false;         // 0x100223590
 static bool cfg_status = false;            // 左下角状态浮层开关（默认关，不自动弹出）
 
+// 面板「微调」页的三个开关
+static bool cfg_mapsize_on = false;        // 地图大小可调：开 → 用 mapSize；关 → 按屏幕自动适配
+static bool cfg_skillpos_on = false;       // CD 位置可调：开 → 用 skillY；关 → 内置默认 27
+static bool cfg_monsteroff_on = false;     // 野怪点位对齐微调
+static float cfg_monsterOffX = 0.0f;       // 野怪点左/右偏移（逻辑点）
+static float cfg_monsterOffY = 0.0f;       // 野怪点上/下偏移（逻辑点）
+static bool 有手调尺寸 = false;            // plist 里有 mapSize
+static bool 位置已手调 = false;            // plist 里 mapX / mapY 都在
+
 static const char* 设置路径 = "/var/mobile/Library/Preferences/com.map.settings.plist";
 
 // StartBooks 局部静态
@@ -442,10 +451,29 @@ static void 读配置() {
     cfg_skillY    = 读浮点(cfg, @"skillY", 27.0f);
     cfg_team      = (int)读浮点(cfg, @"team", 0.0f);
 
-    // 用户手动调过地图位置 → 停止小地图自适配回写
-    地图已手调 = [cfg objectForKey:@"mapX"] != nil
-              || [cfg objectForKey:@"mapY"] != nil
-              || [cfg objectForKey:@"mapSize"] != nil;
+    // 用户手动调过地图位置 / 尺寸 → 停止对应项的自适配回写
+    有手调尺寸 = [cfg objectForKey:@"mapSize"] != nil;
+    位置已手调 = [cfg objectForKey:@"mapX"] != nil && [cfg objectForKey:@"mapY"] != nil;
+    地图已手调 = 有手调尺寸 || 位置已手调;
+
+    // 面板「微调」页的三个开关。缺键时按老行为推断（有手调值就当开关是开的），
+    // 老配置升级上来不会突然跳位置。
+    {
+        id v = [cfg objectForKey:@"mapsize_on"];
+        cfg_mapsize_on = v ? [v boolValue] : 有手调尺寸;
+    }
+    {
+        id v = [cfg objectForKey:@"skillpos_on"];
+        cfg_skillpos_on = v ? [v boolValue] : ([cfg objectForKey:@"skillY"] != nil);
+    }
+    cfg_monsteroff_on = 读布尔(cfg, @"monsteroff_on");
+    cfg_monsterOffX   = 读浮点(cfg, @"monsterOffX", 0.0f);
+    cfg_monsterOffY   = 读浮点(cfg, @"monsterOffY", 0.0f);
+    if (cfg_monsterOffX < -80.0f) cfg_monsterOffX = -80.0f;
+    if (cfg_monsterOffX > 80.0f) cfg_monsterOffX = 80.0f;
+    if (cfg_monsterOffY < -80.0f) cfg_monsterOffY = -80.0f;
+    if (cfg_monsterOffY > 80.0f) cfg_monsterOffY = 80.0f;
+    if (!cfg_skillpos_on) cfg_skillY = 27.0f;   // 关掉就回到内置默认位置
 
     // fov_addr 支持 "0x..." 字符串或数字
     id fa = [cfg objectForKey:@"fov_addr"];
@@ -467,7 +495,8 @@ static void 读配置() {
 }
 
 // 小地图自适配回写：参数变化 ≥1.0 才写 plist
-static void 回写地图配置(float mapX, float mapY, float mapSize) {
+// 写尺寸 = false 时只写位置：面板已经手动定了大小，自动适配别把人家拖过的值冲掉。
+static void 回写地图配置(float mapX, float mapY, float mapSize, bool 写尺寸) {
     static double 上次 = 0;
     double now = CACurrentMediaTime();
     if (now - 上次 < 3.0) return;
@@ -478,14 +507,21 @@ static void 回写地图配置(float mapX, float mapY, float mapSize) {
     float 旧X = [dict objectForKey:@"mapX"] ? [[dict objectForKey:@"mapX"] floatValue] : -1e30f;
     float 旧Y = [dict objectForKey:@"mapY"] ? [[dict objectForKey:@"mapY"] floatValue] : -1e30f;
     float 旧S = [dict objectForKey:@"mapSize"] ? [[dict objectForKey:@"mapSize"] floatValue] : -1e30f;
-    if (fabsf(旧X - mapX) >= 1.0f || fabsf(旧Y - mapY) >= 1.0f || fabsf(旧S - mapSize) >= 1.0f) {
+    bool 尺寸变了 = 写尺寸 && fabsf(旧S - mapSize) >= 1.0f;
+    if (fabsf(旧X - mapX) >= 1.0f || fabsf(旧Y - mapY) >= 1.0f || 尺寸变了) {
         dict[@"mapX"]    = @(roundf(mapX * 10.0f) / 10.0f);
         dict[@"mapY"]    = @(roundf(mapY * 10.0f) / 10.0f);
-        dict[@"mapSize"] = @(roundf(mapSize * 10.0f) / 10.0f);
+        if (写尺寸) dict[@"mapSize"] = @(roundf(mapSize * 10.0f) / 10.0f);
         BOOL ok = [dict writeToFile:path atomically:YES];
-        cfg_mapX = mapX; cfg_mapY = mapY; cfg_mapSize = mapSize;
-        if (ok) 地图已手调 = true;
-        日志("小地图自适配 %.1f/%.1f/%.1f 回写 plist=%d", mapX, mapY, mapSize, ok ? 1 : 0);
+        cfg_mapX = mapX; cfg_mapY = mapY;
+        if (写尺寸) cfg_mapSize = mapSize;
+        if (ok) {
+            地图已手调 = true;
+            位置已手调 = true;
+            if (写尺寸) 有手调尺寸 = true;
+        }
+        日志("小地图自适配 %.1f/%.1f/%.1f 写尺寸=%d 回写 plist=%d",
+             mapX, mapY, mapSize, 写尺寸 ? 1 : 0, ok ? 1 : 0);
     }
 }
 
@@ -1541,13 +1577,20 @@ void Draw::StartBooks() {
         读配置();
     }
 
-    // 小地图自适配（没手调过才回写）
-    if (!地图已手调) {
-        float 基准 = 短边 / 缩放;
-        cfg_mapX = 基准 * 0.085333f;
-        cfg_mapY = 基准 * 0.0053333f;
-        cfg_mapSize = 基准 * 0.328f;
-        回写地图配置(cfg_mapX, cfg_mapY, cfg_mapSize);
+    // 小地图自适配：位置没手调过就按屏幕算；尺寸看面板「地图大小可调」
+    // —— 开关关掉 → 尺寸跟着屏幕自动算；开关打开 → 用滑条写进 plist 的 mapSize。
+    {
+        bool 用自动尺寸 = !(cfg_mapsize_on && 有手调尺寸);
+        if (!位置已手调 || 用自动尺寸) {
+            float 基准 = 短边 / 缩放;
+            float 新X = 位置已手调 ? cfg_mapX : 基准 * 0.085333f;
+            float 新Y = 位置已手调 ? cfg_mapY : 基准 * 0.0053333f;
+            float 新尺寸 = 用自动尺寸 ? 基准 * 0.328f : cfg_mapSize;
+            cfg_mapX = 新X;
+            cfg_mapY = 新Y;
+            cfg_mapSize = 新尺寸;
+            回写地图配置(新X, 新Y, 新尺寸, 用自动尺寸);
+        }
     }
 
     // 找进程看门狗：12 秒没推进就另起线程
@@ -1820,6 +1863,11 @@ void Draw::StartBooks() {
                 my = 2.0f * (地图.y + 地图.w * 0.5f) - my;
             }
             if (点在小地图(地图, mx, my)) {
+                // 面板「野怪点位对齐微调」：手动偏移，单位是逻辑点，最后一起乘缩放
+                if (cfg_monsteroff_on) {
+                    mx += cfg_monsterOffX;
+                    my += cfg_monsterOffY;
+                }
                 mx *= 缩放;
                 my *= 缩放;
                 if (野怪[m].cd < 野怪[m].刷新) {
