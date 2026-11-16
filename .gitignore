@@ -149,3 +149,7 @@ smobaKFD源码归档_*.zip
 # UI 设计稿（临时对比用，不进包）
 ui设计/
 smobaKFD_S45_历史_*.bundle
+
+# 修复：确保 dependencies 目录（含 jailbreak 头文件与预编译库）被跟踪
+!dependencies/
+!dependencies/**
