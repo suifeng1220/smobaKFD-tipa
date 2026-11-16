@@ -46,6 +46,15 @@ static void SL写开关(NSString *键, BOOL 值) {
     [d writeToFile:SL配置路径 atomically:YES];
 }
 
+// 键不存在时先落一个缺省值：面板显示的状态必须和绘制层的实际行为一致。
+// （比如以前从没调过地图大小，开关就该显示"关"，而不是空着让人以为开了）
+static void SL确保开关(NSString *键, BOOL 缺省) {
+    NSMutableDictionary *d = SL配置();
+    if (d[键] != nil) return;
+    d[键] = @(缺省);
+    [d writeToFile:SL配置路径 atomically:YES];
+}
+
 static float SL读浮点(NSString *键, float 缺省) {
     id v = SL配置()[键];
     return v ? [v floatValue] : 缺省;
@@ -341,8 +350,13 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
 @interface SL滑条行 : SL控件
 - (instancetype)initWithTitle:(NSString *)标题 key:(NSString *)键
                          最小:(float)最小 最大:(float)最大 格式:(NSString *)格式;
+/// 带缺省值：plist 里还没这个键时先显示缺省，拖动才落盘（地图大小 / 偏移 / CD 位置用）
+- (instancetype)initWithTitle:(NSString *)标题 key:(NSString *)键
+                         最小:(float)最小 最大:(float)最大 缺省:(float)缺省 格式:(NSString *)格式;
 - (void)刷新;
 - (void)取点:(CGPoint)点 写盘:(BOOL)写盘;
+/// 拖动/点按改了值时回调（面板用它对联动开关自动打开）
+@property (nonatomic, copy) void (^值变更回调)(float 值);
 @end
 
 @implementation SL滑条行 {
@@ -356,12 +370,17 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
 
 - (instancetype)initWithTitle:(NSString *)标题 key:(NSString *)键
                          最小:(float)最小 最大:(float)最大 格式:(NSString *)格式 {
+    return [self initWithTitle:标题 key:键 最小:最小 最大:最大 缺省:1.2f 格式:格式];
+}
+
+- (instancetype)initWithTitle:(NSString *)标题 key:(NSString *)键
+                         最小:(float)最小 最大:(float)最大 缺省:(float)缺省 格式:(NSString *)格式 {
     if ((self = [super initWithFrame:CGRectZero])) {
         _键 = [键 copy];
         _格式 = [格式 copy];
         _最小 = 最小;
         _最大 = 最大;
-        _值 = SL读浮点(_键, 1.2f);
+        _值 = SL读浮点(_键, 缺省);
         if (_值 < _最小) _值 = _最小;
         if (_值 > _最大) _值 = _最大;
         self.标题 = 标题;
@@ -394,10 +413,13 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
     if (右 <= 左 + 8.0f) return;
     CGFloat t = (点.x - 左) / (右 - 左);
     t = MAX(0.0f, MIN(1.0f, t));
+    float 旧值 = _值;
     _值 = _最小 + (float)t * (_最大 - _最小);
     _拖动中 = YES;
     [self setNeedsDisplay];
     if (写盘) SL写浮点(_键, _值);
+    // 值真的变了才回调：避免"点一下没动"也把联动开关打开
+    if (self.值变更回调 && fabsf(_值 - 旧值) > 0.01f) self.值变更回调(_值);
 }
 
 - (void)drawRect:(CGRect)rect {
@@ -716,9 +738,12 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
 - (void)搭建页0;
 - (void)搭建页1;
 - (void)搭建页2;
+- (void)搭建页3;
 - (void)切到页:(NSInteger)页;
 - (UIView *)加卡片:(NSString *)卡名 y:(CGFloat)y 高:(CGFloat)高 页:(NSInteger)页;
 - (void)加控件:(SL控件 *)控件 卡片:(UIView *)卡片 第几行:(NSInteger)行 页:(NSInteger)页;
+- (void)加控件:(SL控件 *)控件 卡片:(UIView *)卡片 第几行:(NSInteger)行 页:(NSInteger)页
+          行高:(CGFloat)行高 首行:(CGFloat)首行;
 - (SL控件 *)命中:(CGPoint)面板点;
 @end
 
@@ -752,6 +777,7 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
         [self 搭建页0];
         [self 搭建页1];
         [self 搭建页2];
+        [self 搭建页3];
         [self 切到页:0];
         [self 刷新];
     }
@@ -869,7 +895,8 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
 
     NSArray *项 = @[@[@"绘制", @"square.grid.2x2.fill"],
                     @[@"调节", @"slider.horizontal.3"],
-                    @[@"通用", @"ellipsis.circle.fill"]];
+                    @[@"通用", @"ellipsis.circle.fill"],
+                    @[@"微调", @"arrow.up.arrow.down.circle.fill"]];
     for (NSInteger i = 0; i < (NSInteger)项.count; ++i) {
         SL导航项 *导航 = [[SL导航项 alloc] initWithTitle:项[i][0] 图标:项[i][1] 页号:i];
         导航.frame = CGRectMake(14.0f, 10.0f + (CGFloat)i * 44.0f, SL侧栏宽 - 28.0f, 38.0f);
@@ -1004,9 +1031,71 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
     说明.text = @"拖动 SL 球可换位置，点一下展开/收起面板。\n"
                 @"三指连击三下可收起/放回悬浮球（只藏球，绘制不受影响）。\n"
                 @"直播模式开启后绘制层不进截图/录屏，屏幕上照常显示。\n"
+                @"「微调」页可改地图大小、野怪点位偏移、CD 上下位置。\n"
                 @"开关直接改 com.map.settings.plist，绘制层每秒同步一次。\n"
                 @"换赛季需要重新对 SDK 偏移（世界 / 相机）。";
     [_页容器[2] addSubview:说明];
+}
+
+// ---------- 微调页：地图大小 / 野怪点位 / 技能 CD ----------
+
+- (void)搭建页3 {
+    [self 新页:3];
+
+    // 开关缺键时先按「老行为」补一个缺省：调过 mapSize 就算开、没调过就算关。
+    // 这样面板显示的状态和绘制层的判断始终一致，不会出现"开关关着却在生效"。
+    NSDictionary *已有配置 = SL配置();
+    SL确保开关(@"mapsize_on", 已有配置[@"mapSize"] != nil);
+    SL确保开关(@"skillpos_on", 已有配置[@"skillY"] != nil);
+    SL确保开关(@"monsteroff_on", NO);
+
+    const CGFloat 首行 = 26.0f;
+    const CGFloat 行距 = 26.0f;
+
+    // ---- 小地图大小 ----
+    CGFloat 卡A高 = 首行 + 行距 * 2.0f + 4.0f;
+    UIView *卡A = [self 加卡片:@"小地图" y:6.0f 高:卡A高 页:3];
+    [self 加控件:[[SL开关行 alloc] initWithTitle:@"地图大小可调" key:@"mapsize_on"]
+          卡片:卡A 第几行:0 页:3 行高:行距 首行:首行];
+    SL滑条行 *大小 = [[SL滑条行 alloc] initWithTitle:@"地图大小" key:@"mapSize"
+                                                最小:60.0f 最大:300.0f 缺省:123.0f 格式:@"%.0f"];
+    // 直接拖滑条 = 想手动调，顺手把开关点亮，省得拖了没反应
+    大小.值变更回调 = ^(float 值) {
+        if (!SL读开关(@"mapsize_on")) SL写开关(@"mapsize_on", YES);
+    };
+    [self 加控件:大小 卡片:卡A 第几行:1 页:3 行高:行距 首行:首行];
+
+    // ---- 野怪点位对齐 ----
+    CGFloat 卡By = 6.0f + 卡A高 + 6.0f;
+    CGFloat 卡B高 = 首行 + 行距 * 3.0f + 4.0f;
+    UIView *卡B = [self 加卡片:@"野怪点位" y:卡By 高:卡B高 页:3];
+    [self 加控件:[[SL开关行 alloc] initWithTitle:@"点位对齐微调" key:@"monsteroff_on"]
+          卡片:卡B 第几行:0 页:3 行高:行距 首行:首行];
+    SL滑条行 *偏X = [[SL滑条行 alloc] initWithTitle:@"左右偏移" key:@"monsterOffX"
+                                               最小:-40.0f 最大:40.0f 缺省:0.0f 格式:@"%.0f"];
+    偏X.值变更回调 = ^(float 值) {
+        if (!SL读开关(@"monsteroff_on")) SL写开关(@"monsteroff_on", YES);
+    };
+    [self 加控件:偏X 卡片:卡B 第几行:1 页:3 行高:行距 首行:首行];
+    SL滑条行 *偏Y = [[SL滑条行 alloc] initWithTitle:@"上下偏移" key:@"monsterOffY"
+                                               最小:-40.0f 最大:40.0f 缺省:0.0f 格式:@"%.0f"];
+    偏Y.值变更回调 = ^(float 值) {
+        if (!SL读开关(@"monsteroff_on")) SL写开关(@"monsteroff_on", YES);
+    };
+    [self 加控件:偏Y 卡片:卡B 第几行:2 页:3 行高:行距 首行:首行];
+
+    // ---- 技能 CD 位置 ----
+    CGFloat 卡Cy = 卡By + 卡B高 + 6.0f;
+    CGFloat 卡C高 = 首行 + 行距 * 2.0f + 4.0f;
+    UIView *卡C = [self 加卡片:@"技能CD" y:卡Cy 高:卡C高 页:3];
+    [self 加控件:[[SL开关行 alloc] initWithTitle:@"CD 位置可调" key:@"skillpos_on"]
+          卡片:卡C 第几行:0 页:3 行高:行距 首行:首行];
+    SL滑条行 *CD位 = [[SL滑条行 alloc] initWithTitle:@"CD 上下" key:@"skillY"
+                                               最小:0.0f 最大:120.0f 缺省:27.0f 格式:@"%.0f"];
+    CD位.值变更回调 = ^(float 值) {
+        if (!SL读开关(@"skillpos_on")) SL写开关(@"skillpos_on", YES);
+    };
+    [self 加控件:CD位 卡片:卡C 第几行:1 页:3 行高:行距 首行:首行];
 }
 
 - (void)更新直播提示:(BOOL)开 {
