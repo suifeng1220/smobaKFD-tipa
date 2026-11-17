@@ -432,8 +432,22 @@ static float 读浮点(NSDictionary* cfg, NSString* key, float 缺省) {
 
 
 static void 读配置() {
-    NSDictionary* cfg = [NSDictionary dictionaryWithContentsOfFile:@(设置路径)];
-    if (!cfg) return;
+    NSMutableDictionary* 可变 = [[NSDictionary dictionaryWithContentsOfFile:@(设置路径)] mutableCopy];
+    if (!可变) return;
+
+    // v18 一次性迁移：以前自动适配写回的 mapX/mapY/mapSize 会被下一帧当成"用户手调"，
+    // 于是自动适配第一次写就被永久锁死 —— 这就是"自动对齐改了没反应"的真正原因。
+    // 这里把两个开关复位成自动，并打上版本号，之后永远按开关走。
+    {
+        id 版本 = [可变 objectForKey:@"mapAutoVer"];
+        if (!版本 || [版本 intValue] < 2) {
+            可变[@"mapsize_on"] = @NO;
+            可变[@"mappos_on"] = @NO;
+            可变[@"mapAutoVer"] = @2;
+            [可变 writeToFile:@(设置路径) atomically:YES];
+        }
+    }
+    NSDictionary* cfg = 可变;
     {
         id raw = [cfg objectForKey:@"draw"];
         cfg_draw = raw ? [raw boolValue] : true;   // 没有 draw 键默认开
@@ -457,8 +471,10 @@ static void 读配置() {
     cfg_team      = (int)读浮点(cfg, @"team", 0.0f);
 
     // 用户手动调过地图位置 / 尺寸 → 停止对应项的自适配回写
-    有手调尺寸 = [cfg objectForKey:@"mapSize"] != nil;
-    bool 有手调位置 = [cfg objectForKey:@"mapX"] != nil && [cfg objectForKey:@"mapY"] != nil;
+    // mapAuto=1 表示这些值是自动适配自己写进去的，不能算手调（否则自动适配把自己锁死）
+    bool 自动写的 = 读布尔(cfg, @"mapAuto");
+    有手调尺寸 = [cfg objectForKey:@"mapSize"] != nil && !自动写的;
+    bool 有手调位置 = [cfg objectForKey:@"mapX"] != nil && [cfg objectForKey:@"mapY"] != nil && !自动写的;
 
     // 面板「微调」页的开关。缺键时按老行为推断（有手调值就当开关是开的），
     // 老配置升级上来不会突然跳位置。
@@ -535,13 +551,15 @@ static void 回写地图配置(float mapX, float mapY, float mapSize, bool 写�
         dict[@"mapY"] = @(roundf(mapY * 10.0f) / 10.0f);
     }
     if (写尺寸) dict[@"mapSize"] = @(roundf(mapSize * 10.0f) / 10.0f);
+    dict[@"mapAuto"] = @YES;      // 标记：这几个值是自动适配写的，不是手调
     BOOL ok = [dict writeToFile:path atomically:YES];
     if (写位置) { cfg_mapX = mapX; cfg_mapY = mapY; }
     if (写尺寸) cfg_mapSize = mapSize;
     if (ok) {
-        if (写位置) 位置已手调 = true;
-        if (写尺寸) 有手调尺寸 = true;
-        地图已手调 = 有手调尺寸 || 位置已手调;
+        // 自动写回不算手调，两个标志保持 false，下一帧继续自动跟屏幕走
+        有手调尺寸 = false;
+        位置已手调 = false;
+        地图已手调 = false;
     }
     日志("小地图自适配 %.1f/%.1f/%.1f 写尺寸=%d 写位置=%d 回写 plist=%d",
          mapX, mapY, mapSize, 写尺寸 ? 1 : 0, 写位置 ? 1 : 0, ok ? 1 : 0);
@@ -1032,12 +1050,17 @@ static unsigned 读CD秒(uint64_t 技能对象, uint64_t 偏移) {
 }
 
 // 回城检测：技能对象+360 → +272 ≥0x128 且 (值-296)==1
-static bool 读回城(uint64_t 技能对象) {
+// 返回 0=不在回城 1=指针链命中 2=直读字段命中（两套判据都试，日志里标来源）
+static int 读回城来源(uint64_t 技能对象) {
     uint64_t a = vm_read<uint64_t>(技能对象 + SDK::回城对象);
-    if (!IsValidAddr(a)) return false;
-    uint64_t b = vm_read<uint64_t>(a + SDK::回城状态);
-    if (!IsValidAddr(b)) return false;
-    return b >= 0x128 && vm_read<int>(b - 296) == 1;
+    if (IsValidAddr(a)) {
+        uint64_t b = vm_read<uint64_t>(a + SDK::回城状态);
+        if (IsValidAddr(b) && b >= 0x128 && vm_read<int>(b - 296) == 1) return 1;
+    }
+    // SDK 注释写的是「实体+360 → +272 非零即在回城」，与上面的指针链版本冲突。
+    // 把 +360 本身当状态字段读一次做兜底：指针低 32 位不可能恰好等于 1，误报率可忽略。
+    if (vm_read<int>(技能对象 + SDK::回城对象) == 1) return 2;
+    return 0;
 }
 
 // ==================== 矩阵 / 投影 ====================
@@ -1648,11 +1671,13 @@ void Draw::StartBooks() {
     }
 
     // 小地图自适配：位置和尺寸各自独立
+    //   判定只看开关，不再看"plist 里有没有值"——旧逻辑一旦自动写过一次，
+    //   下一帧就把自己算出的值当成人手调的，从此再也不自动算（v17 之前一直踩这个坑）。
     //   尺寸：mapsize_on 关 → 跟屏幕自动算；开 → 用滑条的 mapSize
     //   位置：mappos_on  关 → 跟屏幕自动算；开 → 用滑条的 mapX / mapY
     {
-        bool 用自动尺寸 = !(cfg_mapsize_on && 有手调尺寸);
-        bool 用自动位置 = !(cfg_mappos_on && 位置已手调);
+        bool 用自动尺寸 = !cfg_mapsize_on;
+        bool 用自动位置 = !cfg_mappos_on;
         if (用自动位置 || 用自动尺寸) {
             // 系数按原生小地图实测标定（截图像素 / 屏幕短边）：
             //   原生小地图宽 313px / 屏高 1280px = 0.2445；左边距 164px = 0.128 短边；上边距 ~5px。
@@ -1751,25 +1776,42 @@ void Draw::StartBooks() {
              cfg_mapSize * 缩放, cfg_mapSize * 缩放, 2.0f);
     }
 
-    // 对齐辅助：四角括号 + 中心十字。原生小地图的内框不会画出来，
-    // 拖动「大小 / 地图X / 地图Y」时对着括号贴，比对着整块矩形瞎瞄准得多。
-    if (cfg_mapalign && cfg_map) {
-        const float 臂 = 12.0f * 缩放;
-        const float 粗 = 1.6f * 缩放;
+    // 对齐辅助：高对比度取景框 + 中心十字 + 底部数值读标。
+    // 旧版括号画在青色边框正上方、同色同粗，看起来和"只开了小地图"没区别 —— 等于没画。
+    // 现在改成白色粗括号 + 红色十字 + 半透明对角线，并把 mapX/mapY/尺寸 直接打在屏幕上，
+    // 关没关、调到多少，一眼可读。也不再要求「小地图」开关同时打开。
+    if (cfg_mapalign) {
         const float 左 = cfg_mapX * 缩放, 上 = cfg_mapY * 缩放;
-        const float 右 = 左 + cfg_mapSize * 缩放, 下 = 上 + cfg_mapSize * 缩放;
-        const ImU32 色 = 0xFF00FFFF;
-        画线(色, 左, 上, 左 + 臂, 上, 粗);
-        画线(色, 左, 上, 左, 上 + 臂, 粗);
-        画线(色, 右, 上, 右 - 臂, 上, 粗);
-        画线(色, 右, 上, 右, 上 + 臂, 粗);
-        画线(色, 左, 下, 左 + 臂, 下, 粗);
-        画线(色, 左, 下, 左, 下 - 臂, 粗);
-        画线(色, 右, 下, 右 - 臂, 下, 粗);
-        画线(色, 右, 下, 右, 下 - 臂, 粗);
+        const float 宽 = cfg_mapSize * 缩放;
+        const float 右 = 左 + 宽, 下 = 上 + 宽;
+        const float 臂 = 24.0f * 缩放;
+        const float 粗 = 2.8f * 缩放;
+        const ImU32 角 = 0xFFFFFFFF;      // 白
+        const ImU32 叉 = 0xFFFF4040;      // 红（中心）
+        // 对角线：判断中心偏没偏，比盯着四条边直观
+        画线(0x50FF00FF, 左, 上, 右, 下, 1.2f * 缩放);
+        画线(0x50FF00FF, 右, 上, 左, 下, 1.2f * 缩放);
+        // 四角 L 括号
+        画线(角, 左, 上, 左 + 臂, 上, 粗);
+        画线(角, 左, 上, 左, 上 + 臂, 粗);
+        画线(角, 右, 上, 右 - 臂, 上, 粗);
+        画线(角, 右, 上, 右, 上 + 臂, 粗);
+        画线(角, 左, 下, 左 + 臂, 下, 粗);
+        画线(角, 左, 下, 左, 下 - 臂, 粗);
+        画线(角, 右, 下, 右 - 臂, 下, 粗);
+        画线(角, 右, 下, 右, 下 - 臂, 粗);
+        // 中心十字
         const float 心X = (左 + 右) * 0.5f, 心Y = (上 + 下) * 0.5f;
-        画线(色, 心X - 臂, 心Y, 心X + 臂, 心Y, 粗);
-        画线(色, 心X, 心Y - 臂, 心X, 心Y + 臂, 粗);
+        画线(叉, 心X - 臂, 心Y, 心X + 臂, 心Y, 粗);
+        画线(叉, 心X, 心Y - 臂, 心X, 心Y + 臂, 粗);
+        // 数值读标（逻辑点，未乘缩放）
+        char 标[80];
+        snprintf(标, sizeof(标), "X %.1f  Y %.1f  尺寸 %.1f",
+                 cfg_mapX, cfg_mapY, cfg_mapSize);
+        画文字(心X, 下 + 11.0f * 缩放, 标, 0xFFFFFFFF, true, true, 11.0f * 缩放);
+        snprintf(标, sizeof(标), "自动 尺寸%s 位置%s",
+                 cfg_mapsize_on ? "关" : "开", cfg_mappos_on ? "关" : "开");
+        画文字(心X, 下 + 24.0f * 缩放, 标, 0xFF80FF80, true, true, 9.5f * 缩放);
     }
 
     // ==================== 实体循环 ====================
@@ -1788,6 +1830,12 @@ void Draw::StartBooks() {
     // 敌方回城：本轮收集（最多 5 个，够一队了）
     int 回城数 = 0;
     long long 回城英雄[5] = {0, 0, 0, 0, 0};
+    // 回城链诊断：3 秒一次，把 技能对象 / +360 / +272 三层指针和判定值打出来。
+    // 回城检测要是偏移不对，只有这行日志能证明到底错在哪一层。
+    static double 上次回城日志 = 0.0;
+    const bool 打回城日志 = (cfg_recall || cfg_camprobe)
+                          && (CACurrentMediaTime() - 上次回城日志 > 3.0);
+    if (打回城日志) 上次回城日志 = CACurrentMediaTime();
 
     SLIconCache* 图标缓存 = SLIconCache.共用;
     // 地图矩形一律用「未乘缩放」的逻辑值：小图坐标算出来是逻辑点，之后统一乘一次 缩放。
@@ -1834,6 +1882,20 @@ void Draw::StartBooks() {
 
         long long 英雄ID = vm_read<long long>(实体 + 40);
         uint64_t 技能对象 = vm_read<uint64_t>(实体 + 488);
+
+        // 回城检测放在这里：原来它藏在小地图图标那段（if cfg_map）里面，
+        // 小地图一关就完全不检测，横幅自然永远不出来。现在与 cfg_map 解耦。
+        int 回城来源 = IsValidAddr(技能对象) ? 读回城来源(技能对象) : 0;
+        bool 在回城 = 回城来源 != 0;
+        if (在回城 && 回城数 < 5) 回城英雄[回城数++] = 英雄ID;
+        if (打回城日志 && k < 3) {
+            uint64_t 链A = IsValidAddr(技能对象) ? vm_read<uint64_t>(技能对象 + SDK::回城对象) : 0;
+            uint64_t 链B = IsValidAddr(链A) ? vm_read<uint64_t>(链A + SDK::回城状态) : 0;
+            int 判值 = (IsValidAddr(链B) && 链B >= 0x128) ? vm_read<int>(链B - 296) : -999;
+            日志("回城链 k=%d 英雄=%lld 技能=%llx A=%llx B=%llx 判值=%d 直读=%d 来源=%d",
+                 k, 英雄ID, 技能对象, 链A, 链B, 判值,
+                 vm_read<int>(技能对象 + SDK::回城对象), 回城来源);
+        }
 
         // 技能图标列（屏幕上方）—— 对齐游戏记分板尺寸
         if (cfg_skill && IsValidAddr(技能对象)) {
@@ -1902,10 +1964,7 @@ void Draw::StartBooks() {
                 小图样屏Y[小图样数] = my;
                 小图样数++;
             }
-            if (IsValidAddr(技能对象) && 读回城(技能对象)) {
-                画文字(mx, my - 6.0f * 缩放, "回城", 0xFFFFFF00, true);
-                if (回城数 < 5) 回城英雄[回城数++] = 英雄ID;
-            }
+            if (在回城) 画文字(mx, my - 6.0f * 缩放, "回城", 0xFFFFFF00, true);
         }
 
         // 屏内：射线点 + 方框 + 血条 + 头像 + 文字
@@ -1951,6 +2010,11 @@ void Draw::StartBooks() {
 
     // ==================== 敌方回城提示 ====================
     // 屏幕顶部居中的横幅：谁在回城、几个，一眼能看到；边框红度脉动，抓眼角。
+    if (cfg_recall) {
+        // 待命指示：没人回城时在这里留一行很淡的字，用来证明开关确实读到了
+        // （看不到横幅时能立刻分清是"没人回城"还是"功能没生效"）
+        画文字(屏.x * 0.5f, 70.0f * 缩放, "回城提示 待命", 0x38FFFFFF, true, true, 9.0f * 缩放);
+    }
     if (cfg_recall && 回城数 > 0) {
         const float 图 = 16.0f * 缩放;
         const float 缝 = 4.0f * 缩放;
