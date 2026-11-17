@@ -2040,7 +2040,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v26 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v27 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -2128,10 +2128,9 @@ void Draw::StartBooks() {
              cfg_mapSize * 缩放, cfg_mapSize * 缩放, 2.0f);
     }
 
-    // 对齐辅助：高对比度取景框 + 中心十字 + 底部数值读标。
-    // 旧版括号画在青色边框正上方、同色同粗，看起来和"只开了小地图"没区别 —— 等于没画。
-    // 现在改成白色粗括号 + 红色十字 + 半透明对角线，并把 mapX/mapY/尺寸 直接打在屏幕上，
-    // 关没关、调到多少，一眼可读。也不再要求「小地图」开关同时打开。
+    // 对齐辅助：只剩四角白色 L 括号。
+    // v27 按用户要求砍掉：紫色对角线大 X、中心红十字、小地图下方三行数值读标。
+    // 括号本身仍用于把框跟原生金色描边对齐，不再要求「小地图」开关同时打开。
     if (cfg_mapalign) {
         const float 左 = cfg_mapX * 缩放, 上 = cfg_mapY * 缩放;
         const float 宽 = cfg_mapSize * 缩放;
@@ -2140,10 +2139,8 @@ void Draw::StartBooks() {
         const float 粗 = 2.8f * 缩放;
         const ImU32 角 = 0xFFFFFFFF;      // 白
         // ImGui 的 ImU32 是 0xAABBGGRR（低字节才是红），上次写成 0xFFFF4040 结果画出来是蓝的。
-        const ImU32 叉 = 0xFF4040FF;      // 红（中心）
-        // 对角线：判断中心偏没偏，比盯着四条边直观
-        画线(0x50FF00FF, 左, 上, 右, 下, 1.2f * 缩放);
-        画线(0x50FF00FF, 右, 上, 左, 下, 1.2f * 缩放);
+        // v27：按用户要求，只留四角白色 L 括号 —— 紫色对角线 X、中心红十字、
+        // 小地图下方那三行数值读标全部去掉，对局里不再挡视线。
         // 四角 L 括号
         画线(角, 左, 上, 左 + 臂, 上, 粗);
         画线(角, 左, 上, 左, 上 + 臂, 粗);
@@ -2153,22 +2150,6 @@ void Draw::StartBooks() {
         画线(角, 左, 下, 左, 下 - 臂, 粗);
         画线(角, 右, 下, 右 - 臂, 下, 粗);
         画线(角, 右, 下, 右, 下 - 臂, 粗);
-        // 中心十字
-        const float 心X = (左 + 右) * 0.5f, 心Y = (上 + 下) * 0.5f;
-        画线(叉, 心X - 臂, 心Y, 心X + 臂, 心Y, 粗);
-        画线(叉, 心X, 心Y - 臂, 心X, 心Y + 臂, 粗);
-        // 数值读标（逻辑点，未乘缩放）
-        char 标[80];
-        snprintf(标, sizeof(标), "X %.1f  Y %.1f  尺寸 %.1f",
-                 cfg_mapX, cfg_mapY, cfg_mapSize);
-        画文字(心X, 下 + 11.0f * 缩放, 标, 0xFFFFFFFF, true, true, 11.0f * 缩放);
-        snprintf(标, sizeof(标), "自动 尺寸%s 位置%s",
-                 cfg_mapsize_on ? "关" : "开", cfg_mappos_on ? "关" : "开");
-        画文字(心X, 下 + 24.0f * 缩放, 标, 0xFF80FF80, true, true, 9.5f * 缩放);
-        // 日志是否落盘 + 落地路径：看不到日志文件时，先看这一行
-        snprintf(标, sizeof(标), "日志 %s", 日志可用 ? 日志路径串 : "写入失败");
-        画文字(心X, 下 + 37.0f * 缩放, 标, 日志可用 ? 0xFF80C0FF : 0xFFFF7070,
-               true, true, 8.5f * 缩放);
     }
 
     // ==================== 实体循环 ====================
@@ -2208,10 +2189,10 @@ void Draw::StartBooks() {
     //   ② 6~10 秒后该偏移回到 0        ← 回城读条正好 8 秒
     //   ③ 紧接着这个实体坐标瞬移 > 25000 ← 传到泉水
     // 三条同时命中才认定，之后就能做到「按下回城立刻提示」。
-    static const int 差分长 = 0x800;
-    static unsigned char 差分旧[24][0x800];
-    static unsigned char 差分已记[24][0x800 / 4];
-    static unsigned char 差分新[0x800];
+    static const int 差分长 = 0x3000;
+    static unsigned char 差分旧[24][0x3000];
+    static unsigned char 差分已记[24][0x3000 / 4];
+    static unsigned char 差分新[0x3000];
     static bool 差分就绪[24] = {false};
     static int 差分实长[24] = {0};
     static uint64_t 差分键[24] = {0};
@@ -2220,12 +2201,10 @@ void Draw::StartBooks() {
     static unsigned 标定X[24] = {0}, 标定Z[24] = {0};
     static bool 标定有[24] = {false};
 
-    // v26 慢变捕获的基准表：实体本体 1 秒前的浮点值 + 最多 4 条子链
-    static float 漂前[24][0x400 / 4];
-    static float 漂链前[24][4][0x100 / 4];
-    static int 漂链整[24][4][0x100 / 4];
+    // v27 倒数捕获的基准表：实体本体 1 秒前的浮点值（窗口 12KB）
+    static float 漂前[24][0x3000 / 4];
+    static unsigned char 漂计[24][0x3000 / 4];
     static uint64_t 漂实体[24] = {0};
-    static uint64_t 漂链[24][4];
     static double 漂时[24] = {0.0};
     static bool 漂有[24] = {false};
 
@@ -2425,128 +2404,81 @@ void Draw::StartBooks() {
             }
         }
 
-        // ---- v26 慢变捕获（1Hz 窗口，两轮优先）----
-        // v25 的浮点分支是「每 0.2 秒比一次，|Δ|>0.5 才记」。回城读条是 8.0→0.0
-        // 连续下降的浮点，每 0.2 秒只掉 0.2，永远到不了 0.5 —— 所以 差分f 一条都没出。
-        // 现在改成 1 秒窗口，|Δ|≥0.4 就记；并且分两轮：
-        //   A 轮「漂移」只记值域 < 30 的慢变（8 秒读条计时器正好落在这一段）；
-        //   B 轮「漂浮」记其它慢变，每拍每条实体最多 2 行，免得坐标/动画噪音挤爆日志。
-        // 同时对实体里形似堆指针的字段做同样的比对，覆盖「状态在子对象里」的情况。
+        // ---- v27 倒数捕获（1Hz，窗口 0x400 → 0x3000）----
+        // v26 的「漂移」一条都没出，不是 bug，是窗口选错了：实体 +0x0..+0x400 里
+        //   ① 指针（1e13 量级，被 >20000 挡掉）
+        //   ② 小整数当 float 是次正规数，Δ 恒等于 0
+        //   ③ 坐标在 +0x2B8，20 万级，同样被 >20000 挡掉
+        // 三类噪音把窗口占满，真正的读条计时器反而在 0x400 之外。
+        // v27 换成「倒数检测」：只看 0.02 < 值 < 12.5 的浮点，且这一秒在往下走。
+        // 回城读条 8.0 → 0.0 每秒掉 1.0，必然命中；命中后立刻进候选台，
+        // 紧接着的坐标瞬移（传到泉水）会把它钉成回城位，横幅当场就能用。
         if (cfg_recall) {
             const double 现时2 = CACurrentMediaTime();
             if (漂实体[k] != 实体) {
                 漂实体[k] = 实体;
                 漂有[k] = false;
-                for (int c = 0; c < 4; ++c) 漂链[k][c] = 0;
             }
+            const int 扫长 = 差分实长[k] > 0 ? 差分实长[k] : 差分长;
             if (!漂有[k]) {
-                if (readMemory(实体, 差分新, 0x400)) {
-                    for (int o = 0; o + 4 <= 0x400; o += 4) {
+                if (readMemory(实体, 差分新, 扫长)) {
+                    for (int o = 0; o + 4 <= 扫长; o += 4) {
                         float f; memcpy(&f, 差分新 + o, 4);
                         漂前[k][o >> 2] = f;
                     }
-                    int 链数 = 0;
-                    // 定向：SDK 已知的子对象偏移优先（技能 0x150 / 回城 0x168 / 0x178 / 血量 0x1D0），
-                    // 读出来的指针若合法就直接纳入，占不满 4 条时再用通扫补齐。
-                    const int 已知链[4] = { 0x150, 0x168, 0x178, 0x1D0 };
-                    for (int i = 0; i < 4 && 链数 < 4; ++i) {
-                        uint64_t p = vm_read<uint64_t>(实体 + 已知链[i]);
-                        if (p <= 0x100000000ULL || p >= 0x10000000000ULL) {
-                            日志("子链读不到 k=%d 实体+0x%x = %llx", k, 已知链[i], p);
-                            continue;
-                        }
-                        漂链[k][链数] = p;
-                        if (readMemory(p, 差分新, 0x100)) {
-                            for (int q = 0; q + 4 <= 0x100; q += 4) {
-                                float f; memcpy(&f, 差分新 + q, 4);
-                                漂链前[k][链数][q >> 2] = f;
-                                int 整; memcpy(&整, 差分新 + q, 4);
-                                漂链整[k][链数][q >> 2] = 整;
-                            }
-                            日志("子链 k=%d +0x%x -> %llx", k, 已知链[i], p);
-                        }
-                        ++链数;
-                    }
-                    for (int o = 0; o + 8 <= 0x400 && 链数 < 4; o += 8) {
-                        uint64_t p = 0; memcpy(&p, 差分新 + o, 8);
-                        if (p <= 0x100000000ULL || p >= 0x10000000000ULL) continue;
-                        bool 重复 = false;
-                        for (int i = 0; i < 链数; ++i) if (漂链[k][i] == p) 重复 = true;
-                        if (重复) continue;
-                        漂链[k][链数] = p;
-                        if (readMemory(p, 差分新, 0x100)) {
-                            for (int q = 0; q + 4 <= 0x100; q += 4) {
-                                float f; memcpy(&f, 差分新 + q, 4);
-                                漂链前[k][链数][q >> 2] = f;
-                                int 整; memcpy(&整, 差分新 + q, 4);
-                                漂链整[k][链数][q >> 2] = 整;
-                            }
-                        }
-                        ++链数;
-                    }
+                    memset(漂计[k], 0, sizeof(漂计[k]));
                     漂有[k] = true;
                     漂时[k] = 现时2;
+                    日志("扫描就绪 k=%d 阵=%d 长=0x%x 实体=%llx", k, 阵营, 扫长, 实体);
                 }
             } else if (现时2 - 漂时[k] >= 1.0) {
                 漂时[k] = 现时2;
-                int 行A = 0, 行B = 0;
-                if (readMemory(实体, 差分新, 0x400)) {
-                    for (int o = 0; o + 4 <= 0x400; o += 4) {
-                        float a = 漂前[k][o >> 2], b;
-                        memcpy(&b, 差分新 + o, 4);
+                int 行 = 0;
+                if (readMemory(实体, 差分新, 扫长)) {
+                    for (int o = 0; o + 4 <= 扫长; o += 4) {
+                        float b; memcpy(&b, 差分新 + o, 4);
+                        const float a = 漂前[k][o >> 2];
                         漂前[k][o >> 2] = b;
-                        if (a != a || b != b) continue;
-                        const float 绝b = b < 0 ? -b : b;
-                        if (绝b > 20000.0f) continue;
-                        float d = b - a; if (d < 0) d = -d;
-                        if (d < 0.4f) continue;
-                        const float 绝a = a < 0 ? -a : a;
-                        if (绝a < 30.0f || 绝b < 30.0f) {
-                            if (行A < 6) {
-                                日志("漂移 k=%d 阵=%d +0x%03x %.2f->%.2f", k, 阵营, o, a, b);
-                                ++行A;
+                        if (a != a || b != b) { 漂计[k][o >> 2] = 0; continue; }
+                        const bool b好 = (b > 0.02f && b < 12.5f);
+                        const bool a好 = (a > 0.02f && a < 12.5f);
+                        if (!b好 && !a好) { 漂计[k][o >> 2] = 0; continue; }
+                        if (b好 && a好 && (a - b) > 0.05f) {
+                            // 往下走 = 计时器在读秒
+                            if (漂计[k][o >> 2] < 250) ++漂计[k][o >> 2];
+                            if (行 < 8) {
+                                日志("倒数 k=%d 阵=%d +0x%03x %.2f->%.2f 连降%d",
+                                     k, 阵营, o, a, b, (int)漂计[k][o >> 2]);
+                                ++行;
                             }
-                        } else if (行B < 2) {
-                            日志("漂浮 k=%d 阵=%d +0x%03x %.2f->%.2f", k, 阵营, o, a, b);
-                            ++行B;
-                        }
-                    }
-                }
-                for (int c = 0; c < 4; ++c) {
-                    if (!漂链[k][c]) continue;
-                    if (!readMemory(漂链[k][c], 差分新, 0x100)) continue;
-                    int 子行 = 0;
-                    for (int q = 0; q + 4 <= 0x100; q += 4) {
-                        float a = 漂链前[k][c][q >> 2], b;
-                        memcpy(&b, 差分新 + q, 4);
-                        漂链前[k][c][q >> 2] = b;
-                        int 整a = 漂链整[k][c][q >> 2], 整b;
-                        memcpy(&整b, 差分新 + q, 4);
-                        漂链整[k][c][q >> 2] = 整b;
-                        // SDK 对回城的描述是「+0x110 非零即在回城」→ 关键形态就是 0 ↔ 非0。
-                        // 所以子链里只要出现「一边是 0、另一边不是 0」，一律记（不比大小）。
-                        if ((整a == 0) != (整b == 0) && 子行 < 6) {
-                            日志("子链开关 k=%d 阵=%d 链%d@%llx +0x%03x %d->%d",
-                                 k, 阵营, c, 漂链[k][c], q, 整a, 整b);
-                            ++子行;
-                            continue;
-                        }
-                        if (a != a || b != b) continue;
-                        const float 绝b = b < 0 ? -b : b;
-                        if (绝b > 20000.0f) continue;
-                        float d = b - a; if (d < 0) d = -d;
-                        if (d < 0.4f) continue;
-                        const float 绝a = a < 0 ? -a : a;
-                        if (!(绝a < 30.0f || 绝b < 30.0f)) continue;
-                        if (子行 < 6) {
-                            日志("漂链 k=%d 阵=%d 链%d@%llx +0x%03x %.2f->%.2f",
-                                 k, 阵营, c, 漂链[k][c], q, a, b);
-                            ++子行;
+                            // 8 秒读条特征：从 ≥6 掉到 <0.5，且已连降 ≥3 秒
+                            if (a >= 6.0f && b < 0.5f && 漂计[k][o >> 2] >= 3) {
+                                候选台[候选指针].实体 = 实体;
+                                候选台[候选指针].偏移 = o;
+                                候选台[候选指针].值 = 8;
+                                候选台[候选指针].关时 = 现时2;
+                                候选台[候选指针].浮点 = true;
+                                候选指针 = (候选指针 + 1) % 16;
+                                日志("候选倒数 实体+0x%x %.2f->%.2f k=%d", o, a, b, k);
+                            }
+                        } else if (b好 && !a好) {
+                            if (行 < 4) {
+                                日志("出现 k=%d 阵=%d +0x%03x =%.3f", k, 阵营, o, b);
+                                ++行;
+                            }
+                            漂计[k][o >> 2] = 0;
+                        } else if (!b好 && a好) {
+                            if (行 < 4) {
+                                日志("消失 k=%d 阵=%d +0x%03x %.3f->%.3f", k, 阵营, o, a, b);
+                                ++行;
+                            }
+                            漂计[k][o >> 2] = 0;
                         }
                     }
                 }
             }
         }
+
 
         if (阵营 == (int)我方阵营) continue;
 
