@@ -105,6 +105,7 @@ static bool cfg_skillpos_on = false;       // CD 位置可调(XY)：开 → 用 
 static bool cfg_monsteroff_on = false;     // 野怪点位对齐微调
 static float cfg_monsterOffX = 0.0f;       // 野怪点左/右偏移（逻辑点）
 static float cfg_monsterOffY = 0.0f;       // 野怪点上/下偏移（逻辑点）
+static float cfg_monsterScale = 1.0f;      // 野怪点位缩放校正（1.0 = 原始比例，以图心为基准）
 static bool 有手调尺寸 = false;            // plist 里有 mapSize
 static bool 位置已手调 = false;            // plist 里 mapX / mapY 都在
 
@@ -480,6 +481,9 @@ static void 读配置() {
     if (cfg_monsterOffX > 80.0f) cfg_monsterOffX = 80.0f;
     if (cfg_monsterOffY < -80.0f) cfg_monsterOffY = -80.0f;
     if (cfg_monsterOffY > 80.0f) cfg_monsterOffY = 80.0f;
+    cfg_monsterScale = 读浮点(cfg, @"monsterScalePct", 100.0f) / 100.0f;
+    if (cfg_monsterScale < 0.60f) cfg_monsterScale = 0.60f;
+    if (cfg_monsterScale > 1.60f) cfg_monsterScale = 1.60f;
     if (!cfg_skillpos_on) {
         cfg_skillX = 11.0f;   // 关掉就回到内置默认位置
         cfg_skillY = 27.0f;
@@ -1476,20 +1480,27 @@ static int 读野怪(uint64_t 模块, 野怪信息* 输出, int 上限) {
     return 数;
 }
 
-// 小图坐标（英雄，/109000，阵营 1 时 y 取反）
-static void 小图坐标(int x, int z, unsigned 阵营, const ImVec4& 地图, float* 出X, float* 出Y) {
-    float 翻转 = 阵营符号(阵营);
+// 世界半程：世界坐标取 ±世界半程 时正好落在小地图矩形边界上。
+// 英雄的落点是按 109000 标定的，野怪原先单独用 100000，等于把整张图放大 9%，
+// 越靠地图边缘偏得越多，只靠平移滑条永远补不回来 —— 现在英雄/野怪共用这一个常量。
+static const float 世界半程 = 109000.0f;
+
+// 世界坐标 → 小地图逻辑坐标（未乘缩放）。翻转 = ±1，-1 时整体旋转 180°。
+static void 世界转小图(int x, int z, float 翻转, const ImVec4& 地图, float* 出X, float* 出Y) {
     float half = 地图.w * 0.5f;
-    *出X = ((x * 翻转) / 109000.0f) * 地图.w + 地图.x + half;
-    *出Y = ((z * 翻转) / 109000.0f) * (-地图.w) + 地图.y + half;
+    *出X = ((x * 翻转) / 世界半程) * 地图.w + 地图.x + half;
+    *出Y = ((z * 翻转) / 世界半程) * (-地图.w) + 地图.y + half;
 }
 
-// 野怪小图坐标（/100000）
-static void 野怪小图坐标(int x, int z, unsigned 阵营, const ImVec4& 地图, float* 出X, float* 出Y) {
-    float 翻转 = 阵营符号(阵营);
-    float half = 地图.w * 0.5f;
-    *出X = ((x * 翻转) / 100000.0f) * 地图.w + 地图.x + half;
-    *出Y = ((z * 翻转) / 100000.0f) * (-地图.w) + 地图.y + half;
+// 小图坐标（英雄）
+static void 小图坐标(int x, int z, unsigned 阵营, const ImVec4& 地图, float* 出X, float* 出Y) {
+    世界转小图(x, z, 阵营符号(阵营), 地图, 出X, 出Y);
+}
+
+// 严格在框内才算数（旧的「±一个地图宽」容忍度会把点画到框外，出现框外飘数字）
+static bool 在框内(const ImVec4& 地图, float x, float y) {
+    return x >= 地图.x && x <= 地图.x + 地图.w
+        && y >= 地图.y && y <= 地图.y + 地图.w;
 }
 
 static float 阵营符号(unsigned 阵营) {
@@ -1555,14 +1566,6 @@ static void 底部文字(const ImVec2& 屏, const char* 文案) {
 }
 
 // ==================== 主渲染 ====================
-
-static bool 点在小地图(const ImVec4& 地图, float x, float y) {
-    float 边距 = 地图.w;
-    return x > 地图.x - 边距
-        && x < 地图.x + 地图.w + 边距
-        && y > 地图.y - 边距
-        && y < 地图.y + 地图.w + 边距;
-}
 
 void Draw::StartBooks() {
     ImDrawList* dl = 画布();
@@ -1867,30 +1870,50 @@ void Draw::StartBooks() {
         野怪信息 野怪[20];
         for (int i = 0; i < 20; ++i) 野怪[i] = {0, 0, 0, 0, 0};
         野怪计 = 读野怪(模块基址, 野怪, 20);
+        // 诊断日志：3 秒一次，打印前 4 个野怪的原始世界坐标 → 小图逻辑坐标，方便对照
+        static double 上次野怪日志 = 0;
+        double 野怪日志时 = CACurrentMediaTime();
+        bool 打野怪日志 = (野怪日志时 - 上次野怪日志 > 3.0);
+        if (打野怪日志) 上次野怪日志 = 野怪日志时;
+        const float 图心X = 地图.x + 地图.w * 0.5f;
+        const float 图心Y = 地图.y + 地图.w * 0.5f;
         for (int m = 0; m < 野怪计; ++m) {
-            float mx = 0.0f, my = 0.0f;
-            野怪小图坐标(野怪[m].x, 野怪[m].z, 野怪[m].camp, 地图, &mx, &my);
-            // 先在逻辑坐标上判断/翻折，最后再乘一次缩放（否则与 地图 的量纲不一致）
-            if (!点在小地图(地图, mx, my)) {
-                // 镜像翻折（对面半图）
-                mx = 2.0f * (地图.x + 地图.w * 0.5f) - mx;
-                my = 2.0f * (地图.y + 地图.w * 0.5f) - my;
+            // 正 / 反两种朝向各算一次：野怪阵营字段（0/1/2）到底是哪边不确定，
+            // 按阵营取一路，落框外就换另一路，两路都落框外说明坐标无效，直接不画。
+            float 正X = 0.0f, 正Y = 0.0f, 反X = 0.0f, 反Y = 0.0f;
+            世界转小图(野怪[m].x, 野怪[m].z, 1.0f, 地图, &正X, &正Y);
+            世界转小图(野怪[m].x, 野怪[m].z, -1.0f, 地图, &反X, &反Y);
+            float mx, my;
+            if (阵营符号(野怪[m].camp) > 0.0f) { mx = 正X; my = 正Y; }
+            else                                { mx = 反X; my = 反Y; }
+            if (!在框内(地图, mx, my)) {
+                if (在框内(地图, 正X, 正Y))      { mx = 正X; my = 正Y; }
+                else if (在框内(地图, 反X, 反Y)) { mx = 反X; my = 反Y; }
+                else continue;
             }
-            if (点在小地图(地图, mx, my)) {
-                // 面板「野怪点位对齐微调」：手动偏移，单位是逻辑点，最后一起乘缩放
-                if (cfg_monsteroff_on) {
-                    mx += cfg_monsterOffX;
-                    my += cfg_monsterOffY;
-                }
-                mx *= 缩放;
-                my *= 缩放;
-                if (野怪[m].cd < 野怪[m].刷新) {
-                    char 秒串[16];
-                    snprintf(秒串, sizeof(秒串), "%d", 野怪[m].cd > 0 ? 野怪[m].cd : 0);
-                    画文字(mx, my - 10.0f * 缩放, 秒串, 0xFFFFFFFF, true);
-                } else {
-                    画实心圆(0xFF00FF00, mx, my, 2.0f * 缩放);
-                }
+            if (打野怪日志 && m < 4)
+                日志("野怪%d 世=(%d,%d) 阵=%d → 图=(%.1f,%.1f) 框=(%.1f,%.1f,%.1f) 缩=%.2f",
+                     m, 野怪[m].x, 野怪[m].z, 野怪[m].camp, mx, my,
+                     cfg_mapX, cfg_mapY, cfg_mapSize, 缩放);
+            // 缩放校正：以图心为基准缩放，补的是比例误差（平移补不了）
+            if (cfg_monsterScale < 0.999f || cfg_monsterScale > 1.001f) {
+                mx = 图心X + (mx - 图心X) * cfg_monsterScale;
+                my = 图心Y + (my - 图心Y) * cfg_monsterScale;
+                if (!在框内(地图, mx, my)) continue;
+            }
+            // 面板「野怪点位对齐微调」：手动平移，单位是逻辑点，最后一起乘缩放
+            if (cfg_monsteroff_on) {
+                mx += cfg_monsterOffX;
+                my += cfg_monsterOffY;
+            }
+            mx *= 缩放;
+            my *= 缩放;
+            if (野怪[m].cd > 0 && 野怪[m].cd < 野怪[m].刷新 && 野怪[m].cd <= 600) {
+                char 秒串[16];
+                snprintf(秒串, sizeof(秒串), "%d", 野怪[m].cd);
+                画文字(mx, my - 10.0f * 缩放, 秒串, 0xFFFFFFFF, true);
+            } else {
+                画实心圆(0xFF00FF00, mx, my, 2.0f * 缩放);
             }
         }
     }
