@@ -1050,8 +1050,8 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
     SL确保开关(@"skillpos_on", 已有配置[@"skillX"] != nil || 已有配置[@"skillY"] != nil);
     SL确保开关(@"monsteroff_on", NO);
 
-    const CGFloat 首行 = 24.0f;
-    const CGFloat 行距 = 25.0f;
+    const CGFloat 首行 = 20.0f;
+    const CGFloat 行距 = 23.0f;
 
     // ---- 小地图：大小 + 位置XY ----
     CGFloat 卡A高 = 首行 + 行距 * 5.0f + 4.0f;
@@ -1081,7 +1081,7 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
 
     // ---- 野怪点位对齐 ----
     CGFloat 卡By = 6.0f + 卡A高 + 6.0f;
-    CGFloat 卡B高 = 首行 + 行距 * 3.0f + 4.0f;
+    CGFloat 卡B高 = 首行 + 行距 * 4.0f + 4.0f;
     UIView *卡B = [self 加卡片:@"野怪点位" y:卡By 高:卡B高 页:3];
     [self 加控件:[[SL开关行 alloc] initWithTitle:@"点位对齐微调" key:@"monsteroff_on"]
           卡片:卡B 第几行:0 页:3 行高:行距 首行:首行];
@@ -1097,6 +1097,14 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
         if (!SL读开关(@"monsteroff_on")) SL写开关(@"monsteroff_on", YES);
     };
     [self 加控件:偏Y 卡片:卡B 第几行:2 页:3 行高:行距 首行:首行];
+    // 点位整体缩放（以图心为基准）：100% = 原始比例。
+    // 平移滑条只能挪整块，补不了比例差；这一条是专门补"整块放大/缩小"的。
+    SL滑条行 *缩 = [[SL滑条行 alloc] initWithTitle:@"点位缩放%" key:@"monsterScalePct"
+                                              最小:60.0f 最大:160.0f 缺省:100.0f 格式:@"%.0f"];
+    缩.值变更回调 = ^(float 值) {
+        if (!SL读开关(@"monsteroff_on")) SL写开关(@"monsteroff_on", YES);
+    };
+    [self 加控件:缩 卡片:卡B 第几行:3 页:3 行高:行距 首行:首行];
 
     // ---- 技能 CD 位置 XY ----
     CGFloat 卡Cy = 卡By + 卡B高 + 6.0f;
