@@ -663,14 +663,14 @@ static void 读配置() {
         // 读不到 plist 的分支同样要做一次几何复位（这台设备走的就是这条分支）
         {
             NSUserDefaults* ud = [NSUserDefaults standardUserDefaults];
-            if (![ud objectForKey:@"cfg2.geomVer"]) {
-                [ud setInteger:1 forKey:@"cfg2.geomVer"];
+            if ([[ud objectForKey:@"cfg2.geomVer"] intValue] < 2) {
+                [ud setInteger:2 forKey:@"cfg2.geomVer"];
                 SLCfg写开关("mapsize_on", false);
                 SLCfg写开关("mappos_on", false);
                 地图已手调 = false;
                 有手调尺寸 = false;
                 位置已手调 = false;
-                日志("几何复位：尺寸/位置回到自动（v21 首次，无 plist）");
+                日志("几何复位 v24：尺寸/位置回到自动（旧版残留 X=58.3 比原生右移 9px）");
             }
         }
         return;
@@ -768,13 +768,16 @@ static void 读配置() {
     // plist 只是"旧配置兼容"，面板直连（NSUserDefaults）那份优先级更高，最后灌进来覆盖。
     SLCfg同步缓存();
 
-    // v21 一次性几何复位：这台设备上出现的 59.5 / 1.7 / 135 既不是自动系数算出来的值，
-    // 也不在任何一个能读到的配置文件里 —— 属于来历不明的脏数据。
-    // 与其继续在脏数据上猜，不如复位成"自动"，让系数重新算一遍（430 基准 → 105.1）。
+    // v24 几何复位（第二版）：v23 跑起来后日志里是 尺寸开关=0 位置开关=1 → 尺寸走自动（136.0 正确），
+    // 位置却还锁在 58.3 —— 那是更早一版系数 0.1356 写进配置的残留值，
+    // 折算到设备像素是 175，而原生小地图左边界是 166，整整右移 9px。
+    // 这就是用户说的「地图左右两边差了一点」：左边缩进 9px、右边溢出 9px。
+    // 复位成自动 → 58.3 变 55.3（166px），右边 574px，与原生完全重合。
+    // plist 里那份也要一起改，否则下次启动又读回 YES。
     {
         NSUserDefaults* ud = [NSUserDefaults standardUserDefaults];
-        if (![ud objectForKey:@"cfg2.geomVer"]) {
-            [ud setInteger:1 forKey:@"cfg2.geomVer"];
+        if ([[ud objectForKey:@"cfg2.geomVer"] intValue] < 2) {
+            [ud setInteger:2 forKey:@"cfg2.geomVer"];
             cfg_mapsize_on = false;
             cfg_mappos_on = false;
             SLCfg写开关("mapsize_on", false);
@@ -782,7 +785,12 @@ static void 读配置() {
             地图已手调 = false;
             有手调尺寸 = false;
             位置已手调 = false;
-            日志("几何复位：尺寸/位置回到自动（v21 首次）");
+            if (用了) {
+                可变[@"mapsize_on"] = @NO;
+                可变[@"mappos_on"] = @NO;
+                [可变 writeToFile:用了 atomically:YES];
+            }
+            日志("几何复位 v24：尺寸/位置回到自动（旧残留 X=58.3 比原生右移 9px → 55.3）");
         }
     }
     // 「CD 位置可调」关着的时候，就算缓存里还留着旧坐标也回到内置默认，避免"开关关着却还在偏移"
