@@ -2015,7 +2015,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v23 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v24 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -2174,9 +2174,39 @@ void Draw::StartBooks() {
     // 曾误传 cfg_mapX*缩放，导致坐标被乘两次，所有图标飞出小地图 3 倍远。
     ImVec4 地图 = ImVec4(cfg_mapX, cfg_mapY, cfg_mapSize, cfg_mapSize);
 
-    static double 上次旗标 = 0.0;
-    const bool 打旗标 = cfg_recall && (CACurrentMediaTime() - 上次旗标 > 2.0);
-    if (打旗标) 上次旗标 = CACurrentMediaTime();
+    // ===== v24 回城位标定：内存差分 + 三连确认 =====
+    // 上一版「旗标」（只列 1..12 的整数）在真实对局里一条都没抓到 —— 回城状态要么是
+    // 位标志（整数值很大，比如 0x200），要么在 +0x400 之外。
+    // 改成差分：把实体 +0x0..+0x600 整块读出来和上一次比，记录所有「变化且像状态」的字段。
+    // 并且就地做自动标定，判据三连（缺一不可）：
+    //   ① 某偏移出现 0 → N（N ≤ 64）
+    //   ② 6~10 秒后该偏移回到 0        ← 回城读条正好 8 秒
+    //   ③ 紧接着这个实体坐标瞬移 > 25000 ← 传到泉水
+    // 三条同时命中才认定，之后就能做到「按下回城立刻提示」。
+    static const int 差分长 = 0x600;
+    static unsigned char 差分旧[24][0x600];
+    static unsigned char 差分已记[24][0x600 / 4];
+    static unsigned char 差分新[0x600];
+    static bool 差分就绪[24] = {false};
+    static int 差分实长[24] = {0};
+    static uint64_t 差分键[24] = {0};
+
+    static uint64_t 标定键[24] = {0};
+    static unsigned 标定X[24] = {0}, 标定Z[24] = {0};
+    static bool 标定有[24] = {false};
+
+    struct 开关项 { uint64_t 实体; int 偏移; int 值; double 开时; };
+    static 开关项 开关台[96];
+    struct 候选项 { uint64_t 实体; int 偏移; int 值; double 关时; };
+    static 候选项 候选台[16];
+    static int 开关指针 = 0, 候选指针 = 0;
+    static int 回城位偏移 = -1;
+    static int 回城位值 = 0;
+
+    static double 上次差分 = 0.0;
+    static int 本拍行数 = 0;                   // 一个采样周期内最多打 12 行，防日志爆掉
+    const bool 做差分 = cfg_recall && (CACurrentMediaTime() - 上次差分 > 0.2);
+    if (做差分) { 上次差分 = CACurrentMediaTime(); 本拍行数 = 0; }
 
     for (int k = 0; k < 数量 && k < 24; ++k) {
         uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * k);
@@ -2186,20 +2216,114 @@ void Draw::StartBooks() {
         int 阵营 = vm_read<int>(实体 + 52);
         if (阵营 >= -1 && 阵营 <= 7) 阵营直方[阵营 + 1]++;
 
-        // ---- 回城标定：把实体里所有「小整数」字段列出来（2 秒 1 次）----
-        // 用户按一次回城 → 日志里哪一位从 0 变 1/2、8 秒后又变回 0，那个偏移就是回城状态。
-        // 这条路不依赖 SDK 偏移准不准，反过来还能把偏移测出来。
-        if (打旗标) {
-            long long 旗英雄 = vm_read<long long>(实体 + 40);
-            char 袋[420] = {0}, 段[16];
-            for (int o = 0; o < 0x400; o += 4) {
-                int v = vm_read<int>(实体 + o);
-                if (v >= 1 && v <= 12) {
-                    snprintf(段, sizeof(段), " %x:%d", o, v);
-                    if (strlen(袋) + strlen(段) < sizeof(袋) - 1) strcat(袋, 段);
+        // ---- 回城位标定：内存差分（5 次/秒，覆盖实体 +0x0..+0x600）----
+        // 尾部跨页读不到时自动降档（0x600→0x300→0x180→0x100），保证一定有输出。
+        if (做差分) {
+            const double 现时 = CACurrentMediaTime();
+
+            // 1) 坐标：只为抓「瞬移」那一帧。自己人也跟，标定必须从自己的回城学。
+            bool 瞬移 = false;
+            unsigned 现X = 0, 现Z = 0;
+            if (读实体坐标(实体, &现X, &现Z) >= 0) {
+                if (标定键[k] != 实体) {
+                    标定键[k] = 实体;
+                    标定X[k] = 现X; 标定Z[k] = 现Z; 标定有[k] = true;
+                } else if (标定有[k]) {
+                    long long 差X = (long long)现X - (long long)标定X[k];
+                    long long 差Z = (long long)现Z - (long long)标定Z[k];
+                    if ((double)差X * 差X + (double)差Z * 差Z > 25000.0 * 25000.0) 瞬移 = true;
+                    标定X[k] = 现X; 标定Z[k] = 现Z;
                 }
             }
-            日志("旗标 k=%d 英=%lld 阵=%d%s", k, 旗英雄, 阵营, 袋);
+
+            // 2) 瞬移 = 一次回城收尾。看候选台里有没有「3 秒内关上、时长 6~10 秒」的开关
+            if (瞬移 && 回城位偏移 < 0) {
+                for (int i = 0; i < 16; ++i) {
+                    if (候选台[i].实体 != 实体 || 候选台[i].值 == 0) continue;
+                    if (现时 - 候选台[i].关时 > 3.0) continue;
+                    回城位偏移 = 候选台[i].偏移;
+                    回城位值 = 候选台[i].值;
+                    日志("★学到回城位 实体+0x%x 值=%d 瞬移距关=%.1fs k=%d",
+                         回城位偏移, 回城位值, 现时 - 候选台[i].关时, k);
+                    break;
+                }
+            }
+
+            // 3) 全字段差分
+            if (差分键[k] != 实体) {          // 槽位换人了，旧快照作废
+                差分键[k] = 实体;
+                差分就绪[k] = false;
+                memset(差分已记[k], 0xFF, sizeof(差分已记[k]));
+            }
+            int 试长 = 差分实长[k] > 0 ? 差分实长[k] : 差分长;
+            bool 读到 = readMemory(实体, 差分新, 试长);
+            if (!读到) {
+                for (int 备 = 试长 / 2; 备 >= 0x100; 备 /= 2) {
+                    if (readMemory(实体, 差分新, 备)) {
+                        试长 = 备; 差分实长[k] = 备; 读到 = true;
+                        break;
+                    }
+                }
+            }
+            if (读到) {
+                if (差分就绪[k]) {
+                    int 记数 = 0, 省略 = 0;
+                    for (int o = 0; o + 4 <= 试长; o += 4) {
+                        int 旧值, 新值;
+                        memcpy(&旧值, 差分旧[k] + o, 4);
+                        memcpy(&新值, 差分新 + o, 4);
+                        if (旧值 == 新值) continue;
+
+                        // 台账：0→N 记开，N→0 记关并算时长（6~10 秒的进候选台）
+                        if (旧值 == 0 && 新值 > 0 && 新值 <= 64) {
+                            int 位 = -1;
+                            for (int i = 0; i < 96; ++i)
+                                if (开关台[i].实体 == 实体 && 开关台[i].偏移 == o) { 位 = i; break; }
+                            if (位 < 0) { 位 = 开关指针; 开关指针 = (开关指针 + 1) % 96; }
+                            开关台[位].实体 = 实体; 开关台[位].偏移 = o;
+                            开关台[位].值 = 新值; 开关台[位].开时 = 现时;
+                        } else if (旧值 > 0 && 旧值 <= 64 && 新值 == 0) {
+                            for (int i = 0; i < 96; ++i) {
+                                if (开关台[i].实体 != 实体 || 开关台[i].偏移 != o) continue;
+                                double 时长 = 现时 - 开关台[i].开时;
+                                if (时长 >= 5.5 && 时长 <= 11.5) {
+                                    候选台[候选指针].实体 = 实体;
+                                    候选台[候选指针].偏移 = o;
+                                    候选台[候选指针].值 = 旧值;
+                                    候选台[候选指针].关时 = 现时;
+                                    候选指针 = (候选指针 + 1) % 16;
+                                    日志("候选开关 实体+0x%x 值=%d 时长%.1fs k=%d", o, 旧值, 时长, k);
+                                }
+                                开关台[i].实体 = 0;
+                                break;
+                            }
+                        }
+
+                        const int 旧绝 = 旧值 < 0 ? -旧值 : 旧值;
+                        const int 新绝 = 新值 < 0 ? -新值 : 新值;
+                        const unsigned 异或 = (unsigned)(旧值 ^ 新值);
+                        const bool 小整数 = (旧绝 <= 64 || 新绝 <= 64);
+                        const bool 单位 = (异或 != 0) && ((异或 & (异或 - 1)) == 0)
+                                       && (新绝 <= 0x10000);
+                        if (!小整数 && !单位) continue;      // 坐标浮点/血量，跳过
+                        const unsigned char 码 = (unsigned char)(新值 < 0 ? 0 : (新值 > 254 ? 254 : 新值));
+                        if (差分已记[k][o >> 2] == 码) continue;   // 同值不重复刷
+                        差分已记[k][o >> 2] = 码;
+                        if (记数 < 8 && 本拍行数 < 12) {
+                            日志("差分 k=%d 阵=%d +0x%03x %d->%d", k, 阵营, o, 旧值, 新值);
+                            ++本拍行数;
+                        } else {
+                            ++省略;
+                        }
+                        ++记数;
+                    }
+                    if (省略) 日志("差分 k=%d 阵=%d 另有 %d 条变化省略", k, 阵营, 省略);
+                }
+                memcpy(差分旧[k], 差分新, 试长);
+                差分就绪[k] = true;
+            } else {
+                差分就绪[k] = false;   // 这一帧读不到，下次重新建基准
+            }
         }
 
         if (阵营 == (int)我方阵营) continue;
@@ -2264,15 +2388,21 @@ void Draw::StartBooks() {
         const bool 轨迹候选 = 轨.候选;
 
         int 回城来源 = 读回城来源(实体);
-        bool 在回城 = 回城来源 != 0 || 轨迹确认;
+        // v24：轨迹判定（站定 5 秒 + 瞬移 > 25000）本质上是「已经传到泉水了」才成立，
+        // 正好是用户不要的那个时间点，已降级为诊断信号。横幅只认两样：
+        //   ① 本局学到的回城位（按下回城那一刻就为真）
+        //   ② 老 SDK 偏移链（这台机器上目前是死的，留着以防哪天复活）
+        const bool 学到回城 = (回城位偏移 >= 0) && (vm_read<int>(实体 + 回城位偏移) == 回城位值);
+        bool 在回城 = 学到回城 || 回城来源 != 0;
         if (在回城 && 回城数 < 5) 回城英雄[回城数++] = 英雄ID;
         if (打回城日志 && k < 3) {
             uint64_t 链A = vm_read<uint64_t>(实体 + SDK::回城对象);
             uint64_t 链B = IsValidAddr(链A) ? vm_read<uint64_t>(链A + SDK::回城状态) : 0;
             int 判值 = (IsValidAddr(链B) && 链B >= 0x128) ? vm_read<int>(链B - 296) : -999;
             int 字段值 = IsValidAddr(链A) ? vm_read<int>(链A + SDK::回城状态) : -999;
-            日志("回城链 k=%d 英雄=%lld 实体=%llx A=%llx B=%llx 判值=%d 状态字段=%d 来源=%d",
-                 k, 英雄ID, 实体, 链A, 链B, 判值, 字段值, 回城来源);
+            日志("回城链 k=%d 英雄=%lld 实体=%llx A=%llx B=%llx 判值=%d 状态字段=%d 来源=%d 轨迹=%d/%d 回城位=%d 学到=%d",
+                 k, 英雄ID, 实体, 链A, 链B, 判值, 字段值, 回城来源,
+                 (int)轨迹候选, (int)轨迹确认, 回城位偏移, (int)学到回城);
             // 偏移猜不准时，把实体 +0x150 起的 12 个 int 打出来：
             // 让用户按一次回城，对比这串数字哪一位从 0 变 1，就能反推真正的状态偏移。
             if (cfg_camprobe) {
