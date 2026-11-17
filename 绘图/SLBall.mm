@@ -965,11 +965,9 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
 - (void)搭建页0 {
     [self 新页:0];
 
-    // 绘制与信息合并成一张卡；8 行要一屏放下，行高收到 30
+    // 绘制与信息合并成一张卡
     CGFloat 首行 = 28.0f;
     CGFloat 行距 = 30.0f;
-    CGFloat 卡高 = 首行 + 行距 * 8.0f + 8.0f;
-    UIView *卡 = [self 加卡片:@"绘制" y:SL卡片顶 高:卡高 页:0];
 
     NSArray *行 = @[@[@"总开关",   @"draw"],
                     @[@"小地图",   @"map"],
@@ -978,7 +976,12 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
                     @[@"野怪显示", @"monster"],
                     @[@"血量显示", @"health"],
                     @[@"方框显示", @"box"],
-                    @[@"射线显示", @"line"]];
+                    @[@"射线显示", @"line"],
+                    @[@"回城提示", @"recall"],
+                    @[@"对齐辅助", @"mapalign"]];
+
+    CGFloat 卡高 = 首行 + 行距 * (CGFloat)行.count + 8.0f;
+    UIView *卡 = [self 加卡片:@"绘制" y:SL卡片顶 高:卡高 页:0];
 
     for (NSInteger i = 0; i < (NSInteger)行.count; ++i) {
         SL开关行 *开关 = [[SL开关行 alloc] initWithTitle:行[i][0] key:行[i][1]];
