@@ -1048,8 +1048,8 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
     // 开关缺键时先按「老行为」补一个缺省：调过 mapSize 就算开、没调过就算关。
     // 这样面板显示的状态和绘制层的判断始终一致，不会出现"开关关着却在生效"。
     NSDictionary *已有配置 = SL配置();
-    SL确保开关(@"mapsize_on", 已有配置[@"mapSize"] != nil);
-    SL确保开关(@"mappos_on", 已有配置[@"mapX"] != nil && 已有配置[@"mapY"] != nil);
+    SL确保开关(@"mapsize_on", NO);    // 默认自动：按屏幕实测系数算，不再默认锁死在手调值上
+    SL确保开关(@"mappos_on", NO);
     SL确保开关(@"skillpos_on", 已有配置[@"skillX"] != nil || 已有配置[@"skillY"] != nil);
     SL确保开关(@"monsteroff_on", NO);
 
