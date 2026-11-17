@@ -11,6 +11,7 @@
 #include <cmath>
 #include <mach/mach.h>
 #include <sys/sysctl.h>
+#include <sys/stat.h>
 #include "BBZGui.h"
 #include "游戏/SDK.h"
 
@@ -113,6 +114,30 @@ static bool 有手调尺寸 = false;            // plist 里有 mapSize
 static bool 位置已手调 = false;            // plist 里 mapX / mapY 都在
 
 static const char* 设置路径 = "/var/mobile/Library/Preferences/com.map.settings.plist";
+
+// 备用位置：App 沙盒自己的 Documents。
+// 只认 /var/mobile/Library/Preferences 太脆：那条路径一旦读不到（无根越狱重定向 / 沙盒），
+// 整份配置就等于不存在，读配置() 直接 return，所有开关都表现为"点了没反应"。
+static NSString* 沙盒配置路径(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/com.map.settings.plist"];
+}
+
+// 两条路径都试，谁先读到用谁；返回 nil 表示哪都没有
+static NSDictionary* 读配置文件(NSString** 用了哪条) {
+    NSFileManager* fm = [NSFileManager defaultManager];
+    NSString* 候选[2] = { @(设置路径), 沙盒配置路径() };
+    for (int i = 0; i < 2; ++i) {
+        NSString* p = 候选[i];
+        if (![fm fileExistsAtPath:p]) continue;
+        NSDictionary* d = [NSDictionary dictionaryWithContentsOfFile:p];
+        if (d) {
+            if (用了哪条) *用了哪条 = p;
+            return d;
+        }
+    }
+    if (用了哪条) *用了哪条 = nil;
+    return nil;
+}
 
 // StartBooks 局部静态
 static float 缩放系数 = 1.0f;              // 缩放 = 短边/物理短边
@@ -465,8 +490,26 @@ static float 读浮点(NSDictionary* cfg, NSString* key, float 缺省) {
 
 
 static void 读配置() {
-    NSMutableDictionary* 可变 = [[NSDictionary dictionaryWithContentsOfFile:@(设置路径)] mutableCopy];
-    if (!可变) return;
+    NSString* 用了 = nil;
+    NSMutableDictionary* 可变 = [读配置文件(&用了) mutableCopy];
+    if (!可变) {
+        // 一条都读不到：把两条路径的实际情况记下来（有几次就够定位了）
+        static double 上次没读到 = 0;
+        double 现在 = CACurrentMediaTime();
+        if (现在 - 上次没读到 > 5.0) {
+            上次没读到 = 现在;
+            NSFileManager* fm = [NSFileManager defaultManager];
+            const char* 主 = 设置路径;
+            char 细节[256] = {0};
+            struct stat st;
+            bool 主有 = stat(主, &st) == 0;
+            snprintf(细节, sizeof(细节), "主路径存在=%d 大小=%lld 沙盒存在=%d",
+                     主有 ? 1 : 0, 主有 ? (long long)st.st_size : -1LL,
+                     [fm fileExistsAtPath:沙盒配置路径()] ? 1 : 0);
+            日志("配置读不到 %s", 细节);
+        }
+        return;
+    }
 
     // v18 一次性迁移：以前自动适配写回的 mapX/mapY/mapSize 会被下一帧当成"用户手调"，
     // 于是自动适配第一次写就被永久锁死 —— 这就是"自动对齐改了没反应"的真正原因。
@@ -477,7 +520,7 @@ static void 读配置() {
             可变[@"mapsize_on"] = @NO;
             可变[@"mappos_on"] = @NO;
             可变[@"mapAutoVer"] = @2;
-            [可变 writeToFile:@(设置路径) atomically:YES];
+            [可变 writeToFile:用了 atomically:YES];
         }
     }
     NSDictionary* cfg = 可变;
@@ -561,6 +604,19 @@ static void 读配置() {
     if (cfg_mapSize > 999.0f) cfg_mapSize = 999.0f;
     if (cfg_fov < 0.1f) cfg_fov = 0.1f;
     if (cfg_fov > 10.0f) cfg_fov = 10.0f;
+
+    // 配置快照：5 秒一次，把「用了哪条路径 + 关键开关 + 地图三值」写进日志。
+    // 以后再出现"开关点了没反应"，先看这一行就够了，不用再猜。
+    static double 上次快照 = 0;
+    double 快照时 = CACurrentMediaTime();
+    if (快照时 - 上次快照 > 5.0) {
+        上次快照 = 快照时;
+        日志("配置 %s draw=%d map=%d monster=%d align=%d recall=%d 尺寸开关=%d 位置开关=%d 尺寸%.1f X%.1f Y%.1f",
+             [用了 UTF8String], cfg_draw ? 1 : 0, cfg_map ? 1 : 0, cfg_monster ? 1 : 0,
+             cfg_mapalign ? 1 : 0, cfg_recall ? 1 : 0,
+             cfg_mapsize_on ? 1 : 0, cfg_mappos_on ? 1 : 0,
+             cfg_mapSize, cfg_mapX, cfg_mapY);
+    }
 }
 
 // 小地图自适配回写：参数变化 ≥1.0 才写 plist
@@ -570,9 +626,9 @@ static void 回写地图配置(float mapX, float mapY, float mapSize, bool 写�
     double now = CACurrentMediaTime();
     if (now - 上次 < 3.0) return;
     上次 = now;
-    NSString* path = @(设置路径);
-    NSMutableDictionary* dict = [[NSDictionary dictionaryWithContentsOfFile:path] mutableCopy];
-    if (!dict) dict = [NSMutableDictionary dictionary];
+    NSString* 读到 = nil;
+    NSMutableDictionary* dict = [读配置文件(&读到) mutableCopy];
+    if (!dict) { dict = [NSMutableDictionary dictionary]; 读到 = @(设置路径); }
     float 旧X = [dict objectForKey:@"mapX"] ? [[dict objectForKey:@"mapX"] floatValue] : -1e30f;
     float 旧Y = [dict objectForKey:@"mapY"] ? [[dict objectForKey:@"mapY"] floatValue] : -1e30f;
     float 旧S = [dict objectForKey:@"mapSize"] ? [[dict objectForKey:@"mapSize"] floatValue] : -1e30f;
@@ -585,7 +641,11 @@ static void 回写地图配置(float mapX, float mapY, float mapSize, bool 写�
     }
     if (写尺寸) dict[@"mapSize"] = @(roundf(mapSize * 10.0f) / 10.0f);
     dict[@"mapAuto"] = @YES;      // 标记：这几个值是自动适配写的，不是手调
-    BOOL ok = [dict writeToFile:path atomically:YES];
+    // 两条路径都写：读到哪条就写回哪条，另一条（沙盒内）也补一份，
+    // 这样万一主路径读写被系统拦掉，沙盒那份还能被下一帧读到。
+    BOOL ok = [dict writeToFile:读到 atomically:YES];
+    NSString* 沙盒 = 沙盒配置路径();
+    if (![读到 isEqualToString:沙盒]) [dict writeToFile:沙盒 atomically:YES];
     if (写位置) { cfg_mapX = mapX; cfg_mapY = mapY; }
     if (写尺寸) cfg_mapSize = mapSize;
     if (ok) {
@@ -594,8 +654,8 @@ static void 回写地图配置(float mapX, float mapY, float mapSize, bool 写�
         位置已手调 = false;
         地图已手调 = false;
     }
-    日志("小地图自适配 %.1f/%.1f/%.1f 写尺寸=%d 写位置=%d 回写 plist=%d",
-         mapX, mapY, mapSize, 写尺寸 ? 1 : 0, 写位置 ? 1 : 0, ok ? 1 : 0);
+    日志("小地图自适配 %.1f/%.1f/%.1f 写尺寸=%d 写位置=%d 回写=%d 路径=%s",
+         mapX, mapY, mapSize, 写尺寸 ? 1 : 0, 写位置 ? 1 : 0, ok ? 1 : 0, [读到 UTF8String]);
 }
 
 // ==================== 进程查找 ====================
@@ -1083,16 +1143,20 @@ static unsigned 读CD秒(uint64_t 技能对象, uint64_t 偏移) {
 }
 
 // 回城检测：技能对象+360 → +272 ≥0x128 且 (值-296)==1
-// 返回 0=不在回城 1=指针链命中 2=直读字段命中（两套判据都试，日志里标来源）
-static int 读回城来源(uint64_t 技能对象) {
-    uint64_t a = vm_read<uint64_t>(技能对象 + SDK::回城对象);
+// 返回 0=不在回城 1=指针链命中 2=直读字段命中 3=状态字段(非零)
+// 注意：SDK 写的是「实体+360」，以前调用方传的是技能对象（实体+488 解出来的那个），
+// 层级错了一级，所以判值永远是 0、来源永远是 0 —— 回城横幅自然一次都不弹。
+static int 读回城来源(uint64_t 实体) {
+    uint64_t a = vm_read<uint64_t>(实体 + SDK::回城对象);
     if (IsValidAddr(a)) {
         uint64_t b = vm_read<uint64_t>(a + SDK::回城状态);
         if (IsValidAddr(b) && b >= 0x128 && vm_read<int>(b - 296) == 1) return 1;
+        // SDK 注释："+272 非零即在回城"，把那个字段直接当状态读
+        int 状态 = vm_read<int>(a + SDK::回城状态);
+        if (状态 == 1) return 3;
     }
-    // SDK 注释写的是「实体+360 → +272 非零即在回城」，与上面的指针链版本冲突。
-    // 把 +360 本身当状态字段读一次做兜底：指针低 32 位不可能恰好等于 1，误报率可忽略。
-    if (vm_read<int>(技能对象 + SDK::回城对象) == 1) return 2;
+    // 最外层兜底：实体+360 本身就是状态字（指针低 32 位不可能恰好等于 1，误报可忽略）
+    if (vm_read<int>(实体 + SDK::回城对象) == 1) return 2;
     return 0;
 }
 
@@ -1934,16 +1998,17 @@ void Draw::StartBooks() {
 
         // 回城检测放在这里：原来它藏在小地图图标那段（if cfg_map）里面，
         // 小地图一关就完全不检测，横幅自然永远不出来。现在与 cfg_map 解耦。
-        int 回城来源 = IsValidAddr(技能对象) ? 读回城来源(技能对象) : 0;
+        // 参数用「实体」：SDK 里 回城对象(0x168) 是实体字段，不是技能对象字段。
+        int 回城来源 = 读回城来源(实体);
         bool 在回城 = 回城来源 != 0;
         if (在回城 && 回城数 < 5) 回城英雄[回城数++] = 英雄ID;
         if (打回城日志 && k < 3) {
-            uint64_t 链A = IsValidAddr(技能对象) ? vm_read<uint64_t>(技能对象 + SDK::回城对象) : 0;
+            uint64_t 链A = vm_read<uint64_t>(实体 + SDK::回城对象);
             uint64_t 链B = IsValidAddr(链A) ? vm_read<uint64_t>(链A + SDK::回城状态) : 0;
             int 判值 = (IsValidAddr(链B) && 链B >= 0x128) ? vm_read<int>(链B - 296) : -999;
-            日志("回城链 k=%d 英雄=%lld 技能=%llx A=%llx B=%llx 判值=%d 直读=%d 来源=%d",
-                 k, 英雄ID, 技能对象, 链A, 链B, 判值,
-                 vm_read<int>(技能对象 + SDK::回城对象), 回城来源);
+            int 字段值 = IsValidAddr(链A) ? vm_read<int>(链A + SDK::回城状态) : -999;
+            日志("回城链 k=%d 英雄=%lld 实体=%llx A=%llx B=%llx 判值=%d 状态字段=%d 来源=%d",
+                 k, 英雄ID, 实体, 链A, 链B, 判值, 字段值, 回城来源);
         }
 
         // 技能图标列（屏幕上方）—— 对齐游戏记分板尺寸
