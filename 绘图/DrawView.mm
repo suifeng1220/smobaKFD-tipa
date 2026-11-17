@@ -2040,7 +2040,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v25 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v26 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -2219,6 +2219,14 @@ void Draw::StartBooks() {
     static uint64_t 标定键[24] = {0};
     static unsigned 标定X[24] = {0}, 标定Z[24] = {0};
     static bool 标定有[24] = {false};
+
+    // v26 慢变捕获的基准表：实体本体 1 秒前的浮点值 + 最多 4 条子链
+    static float 漂前[24][0x400 / 4];
+    static float 漂链前[24][4][0x100 / 4];
+    static uint64_t 漂实体[24] = {0};
+    static uint64_t 漂链[24][4];
+    static double 漂时[24] = {0.0};
+    static bool 漂有[24] = {false};
 
     struct 开关项 { uint64_t 实体; int 偏移; int 值; double 开时; bool 浮点; };
     static 开关项 开关台[96];
@@ -2416,6 +2424,92 @@ void Draw::StartBooks() {
             }
         }
 
+        // ---- v26 慢变捕获（1Hz 窗口，两轮优先）----
+        // v25 的浮点分支是「每 0.2 秒比一次，|Δ|>0.5 才记」。回城读条是 8.0→0.0
+        // 连续下降的浮点，每 0.2 秒只掉 0.2，永远到不了 0.5 —— 所以 差分f 一条都没出。
+        // 现在改成 1 秒窗口，|Δ|≥0.4 就记；并且分两轮：
+        //   A 轮「漂移」只记值域 < 30 的慢变（8 秒读条计时器正好落在这一段）；
+        //   B 轮「漂浮」记其它慢变，每拍每条实体最多 2 行，免得坐标/动画噪音挤爆日志。
+        // 同时对实体里形似堆指针的字段做同样的比对，覆盖「状态在子对象里」的情况。
+        if (cfg_recall) {
+            const double 现时2 = CACurrentMediaTime();
+            if (漂实体[k] != 实体) {
+                漂实体[k] = 实体;
+                漂有[k] = false;
+                for (int c = 0; c < 4; ++c) 漂链[k][c] = 0;
+            }
+            if (!漂有[k]) {
+                if (readMemory(实体, 差分新, 0x400)) {
+                    for (int o = 0; o + 4 <= 0x400; o += 4) {
+                        float f; memcpy(&f, 差分新 + o, 4);
+                        漂前[k][o >> 2] = f;
+                    }
+                    int 链数 = 0;
+                    for (int o = 0; o + 8 <= 0x400 && 链数 < 4; o += 8) {
+                        uint64_t p = 0; memcpy(&p, 差分新 + o, 8);
+                        if (p <= 0x100000000ULL || p >= 0x10000000000ULL) continue;
+                        漂链[k][链数] = p;
+                        if (readMemory(p, 差分新, 0x100)) {
+                            for (int q = 0; q + 4 <= 0x100; q += 4) {
+                                float f; memcpy(&f, 差分新 + q, 4);
+                                漂链前[k][链数][q >> 2] = f;
+                            }
+                        }
+                        ++链数;
+                    }
+                    漂有[k] = true;
+                    漂时[k] = 现时2;
+                }
+            } else if (现时2 - 漂时[k] >= 1.0) {
+                漂时[k] = 现时2;
+                int 行A = 0, 行B = 0;
+                if (readMemory(实体, 差分新, 0x400)) {
+                    for (int o = 0; o + 4 <= 0x400; o += 4) {
+                        float a = 漂前[k][o >> 2], b;
+                        memcpy(&b, 差分新 + o, 4);
+                        漂前[k][o >> 2] = b;
+                        if (a != a || b != b) continue;
+                        const float 绝b = b < 0 ? -b : b;
+                        if (绝b > 20000.0f) continue;
+                        float d = b - a; if (d < 0) d = -d;
+                        if (d < 0.4f) continue;
+                        const float 绝a = a < 0 ? -a : a;
+                        if (绝a < 30.0f || 绝b < 30.0f) {
+                            if (行A < 6) {
+                                日志("漂移 k=%d 阵=%d +0x%03x %.2f->%.2f", k, 阵营, o, a, b);
+                                ++行A;
+                            }
+                        } else if (行B < 2) {
+                            日志("漂浮 k=%d 阵=%d +0x%03x %.2f->%.2f", k, 阵营, o, a, b);
+                            ++行B;
+                        }
+                    }
+                }
+                for (int c = 0; c < 4; ++c) {
+                    if (!漂链[k][c]) continue;
+                    if (!readMemory(漂链[k][c], 差分新, 0x100)) continue;
+                    int 子行 = 0;
+                    for (int q = 0; q + 4 <= 0x100; q += 4) {
+                        float a = 漂链前[k][c][q >> 2], b;
+                        memcpy(&b, 差分新 + q, 4);
+                        漂链前[k][c][q >> 2] = b;
+                        if (a != a || b != b) continue;
+                        const float 绝b = b < 0 ? -b : b;
+                        if (绝b > 20000.0f) continue;
+                        float d = b - a; if (d < 0) d = -d;
+                        if (d < 0.4f) continue;
+                        const float 绝a = a < 0 ? -a : a;
+                        if (!(绝a < 30.0f || 绝b < 30.0f)) continue;
+                        if (子行 < 4) {
+                            日志("漂链 k=%d 阵=%d 链%d@%llx +0x%03x %.2f->%.2f",
+                                 k, 阵营, c, 漂链[k][c], q, a, b);
+                            ++子行;
+                        }
+                    }
+                }
+            }
+        }
+
         if (阵营 == (int)我方阵营) continue;
 
         int 血当前 = 读血量当前(实体);
@@ -2495,13 +2589,13 @@ void Draw::StartBooks() {
             日志("回城链 k=%d 英雄=%lld 实体=%llx A=%llx B=%llx 判值=%d 状态字段=%d 来源=%d 轨迹=%d/%d 回城位=%d 学到=%d",
                  k, 英雄ID, 实体, 链A, 链B, 判值, 字段值, 回城来源,
                  (int)轨迹候选, (int)轨迹确认, 回城位偏移, (int)学到回城);
-            // v25：0x10c 是唯一两次都精确对上「按回城那一刻」的偏移（1→2，两个不同实体各一次），
-            // 但它之后再没回 1 —— 所以把 0x0F8..0x118 这 9 个邻居一起打出来，
-            // 判断它到底是「状态位」还是「计数器/一次性标记」。
+            // v26：把邻域放宽到 +0x100..+0x1A0（原来只到 0x118）。
+            // SDK 里 回城对象=0x168，它到底是不是一个能读的指针，这里能直接看出来
+            // （十进制十几位、约 1e13 量级的就是 0x2a... 的堆指针）。
             {
-                char 邻[240] = {0};
-                char 段邻[24];
-                for (int o = 0x0F8; o <= 0x118; o += 4) {
+                char 邻[760] = {0};
+                char 段邻[28];
+                for (int o = 0x100; o <= 0x1A0; o += 4) {
                     snprintf(段邻, sizeof(段邻), " %x:%d", o, vm_read<int>(实体 + o));
                     if (strlen(邻) + strlen(段邻) < sizeof(邻) - 1) strcat(邻, 段邻);
                 }
