@@ -1109,9 +1109,10 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
     };
     [self 加控件:偏Y 卡片:卡B 第几行:2 页:3 行高:行距 首行:首行];
     // 点位整体缩放（以图心为基准）：100% = 原始比例。
+    // v23 起这一条对「英雄头像 + 野怪点 + 屏外指示线」全部生效（走同一个 世界转小图）。
     // 平移滑条只能挪整块，补不了比例差；这一条是专门补"整块放大/缩小"的。
-    SL滑条行 *缩 = [[SL滑条行 alloc] initWithTitle:@"点位缩放%" key:@"monsterScalePct"
-                                              最小:60.0f 最大:160.0f 缺省:100.0f 格式:@"%.0f"];
+    SL滑条行 *缩 = [[SL滑条行 alloc] initWithTitle:@"小图比例%" key:@"monsterScalePct"
+                                              最小:70.0f 最大:130.0f 缺省:100.0f 格式:@"%.0f"];
     缩.值变更回调 = ^(float 值) {
         if (!SL读开关(@"monsteroff_on")) SL写开关(@"monsteroff_on", YES);
     };
