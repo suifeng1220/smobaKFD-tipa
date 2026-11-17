@@ -102,6 +102,9 @@ static bool cfg_status = false;            // 左下角状态浮层开关（默�
 static bool cfg_mapsize_on = false;        // 地图大小可调：开 → 用 mapSize；关 → 按屏幕自动适配
 static bool cfg_mappos_on = false;         // 地图位置可调(XY)：开 → 用 mapX/mapY；关 → 按屏幕自动适配
 static bool cfg_skillpos_on = false;       // CD 位置可调(XY)：开 → 用 skillX/skillY；关 → 内置默认 11/27
+static bool cfg_mapalign = false;          // 小地图对齐辅助：画四角括号 + 中心十字
+static bool cfg_recall = false;            // 敌方回城提示：屏幕顶部横幅
+static bool cfg_camprobe = false;          // 相机探测（只在日志里输出，找小地图相机用）
 static bool cfg_monsteroff_on = false;     // 野怪点位对齐微调
 static float cfg_monsterOffX = 0.0f;       // 野怪点左/右偏移（逻辑点）
 static float cfg_monsterOffY = 0.0f;       // 野怪点上/下偏移（逻辑点）
@@ -475,6 +478,9 @@ static void 读配置() {
     位置已手调 = 有手调位置 && cfg_mappos_on;
     地图已手调 = 有手调尺寸 || 位置已手调;
     cfg_monsteroff_on = 读布尔(cfg, @"monsteroff_on");
+    cfg_mapalign = 读布尔(cfg, @"mapalign");
+    cfg_recall = 读布尔(cfg, @"recall");
+    cfg_camprobe = 读布尔(cfg, @"camprobe");
     cfg_monsterOffX   = 读浮点(cfg, @"monsterOffX", 0.0f);
     cfg_monsterOffY   = 读浮点(cfg, @"monsterOffY", 0.0f);
     if (cfg_monsterOffX < -80.0f) cfg_monsterOffX = -80.0f;
@@ -1096,6 +1102,55 @@ static float 列长转视距(const float* m) {
     return len > 0.05f ? 2.0f * atanf(1.0f / len) : 0.0f;
 }
 
+// ==================== 相机探测 ====================
+
+// 目的：找出游戏的小地图相机（正交、视口在小地图那块），拿到它的视口矩形后
+// 就不用再拿屏幕短边乘系数去猜小地图的位置和大小了。
+// 纯读，10 秒一次，failsafe：地址不合法就跳过，不会写任何内存。
+static void 相机探测(uint64_t 模块) {
+    static double 上次 = 0;
+    double now = CACurrentMediaTime();
+    if (now - 上次 < 10.0) return;
+    上次 = now;
+
+    const uint64_t 根表[2] = { SDK::根相机, SDK::根相机备 };
+    for (int r = 0; r < 2; ++r) {
+        uint64_t a = vm_read<uint64_t>(模块 + 根表[r]);
+        if (!IsValidAddr(a)) continue;
+        uint64_t b = vm_read<uint64_t>(a + 184);
+        if (!IsValidAddr(b)) continue;
+        日志("相机探测 根%d a=0x%llx b=0x%llx", r, a, b);
+        for (int i = 0; i < 8; ++i) {
+            uint64_t c = vm_read<uint64_t>(b + 8ULL * i);
+            if (!IsValidAddr(c)) continue;
+            uint64_t d = vm_read<uint64_t>(c + 8);
+            if (!IsValidAddr(d)) continue;
+            float m[16];
+            bool 正常 = true;
+            for (int k = 0; k < 16; ++k) {
+                m[k] = vm_read<float>(d + 296 + 4ULL * k);
+                if (!isfinite(m[k]) || fabsf(m[k]) > 10000000.0f) { 正常 = false; break; }
+            }
+            if (!正常) continue;
+            bool 正交 = fabsf(m[11]) < 0.0001f && fabsf(m[15] - 1.0f) < 0.0001f;
+            日志("  [%d.%d] b=0x%llx c=0x%llx d=0x%llx m11=%.4f m15=%.4f 列长=%.3f %s",
+                 r, i, b, c, d, m[11], m[15], 矩阵列长(m), 正交 ? "正交★" : "透视");
+            // 视口候选：Unity 的 Camera.rect 是 4 个 0..1 的 float，在物体附近扫一遍
+            for (int off = 0; off <= 80; off += 4) {
+                float vx = vm_read<float>(d + off);
+                float vy = vm_read<float>(d + off + 4);
+                float vw = vm_read<float>(d + off + 8);
+                float vh = vm_read<float>(d + off + 12);
+                if (!isfinite(vx) || !isfinite(vy) || !isfinite(vw) || !isfinite(vh)) continue;
+                if (vx < 0.0f || vx > 1.0f || vy < 0.0f || vy > 1.0f) continue;
+                if (vw <= 0.0f || vw > 1.0f || vh <= 0.0f || vh > 1.0f) continue;
+                if (vw < 0.05f || vh < 0.05f) continue;
+                日志("    视口候选 d+%d = (%.3f, %.3f, %.3f, %.3f)", off, vx, vy, vw, vh);
+            }
+        }
+    }
+}
+
 // ==================== 视距 ====================
 
 // 写视距：fov_addr 有效才写；单位支持度/弧度
@@ -1599,10 +1654,13 @@ void Draw::StartBooks() {
         bool 用自动尺寸 = !(cfg_mapsize_on && 有手调尺寸);
         bool 用自动位置 = !(cfg_mappos_on && 位置已手调);
         if (用自动位置 || 用自动尺寸) {
+            // 系数按原生小地图实测标定（截图像素 / 屏幕短边）：
+            //   原生小地图宽 313px / 屏高 1280px = 0.2445；左边距 164px = 0.128 短边；上边距 ~5px。
+            // 旧值 0.328 比原生大 34%，自动模式下必然对不齐 —— 所以以前只能靠手调大小滑条。
             float 基准 = 短边 / 缩放;
-            float 新X = 用自动位置 ? 基准 * 0.085333f : cfg_mapX;
-            float 新Y = 用自动位置 ? 基准 * 0.0053333f : cfg_mapY;
-            float 新尺寸 = 用自动尺寸 ? 基准 * 0.328f : cfg_mapSize;
+            float 新X = 用自动位置 ? 基准 * 0.128f : cfg_mapX;
+            float 新Y = 用自动位置 ? 基准 * 0.004f : cfg_mapY;
+            float 新尺寸 = 用自动尺寸 ? 基准 * 0.2445f : cfg_mapSize;
             cfg_mapX = 新X;
             cfg_mapY = 新Y;
             cfg_mapSize = 新尺寸;
@@ -1659,6 +1717,7 @@ void Draw::StartBooks() {
     }
 
     // 视距：fov_on 时写/自校准，失败或未开时按需探测
+    if (cfg_camprobe) 相机探测(模块基址);
     if (cfg_fov_on) {
         if (!写视距(cfg_fov) && !视距自校准(矩阵, cfg_fov))
             视距探测扫(矩阵);
@@ -1692,6 +1751,27 @@ void Draw::StartBooks() {
              cfg_mapSize * 缩放, cfg_mapSize * 缩放, 2.0f);
     }
 
+    // 对齐辅助：四角括号 + 中心十字。原生小地图的内框不会画出来，
+    // 拖动「大小 / 地图X / 地图Y」时对着括号贴，比对着整块矩形瞎瞄准得多。
+    if (cfg_mapalign && cfg_map) {
+        const float 臂 = 12.0f * 缩放;
+        const float 粗 = 1.6f * 缩放;
+        const float 左 = cfg_mapX * 缩放, 上 = cfg_mapY * 缩放;
+        const float 右 = 左 + cfg_mapSize * 缩放, 下 = 上 + cfg_mapSize * 缩放;
+        const ImU32 色 = 0xFF00FFFF;
+        画线(色, 左, 上, 左 + 臂, 上, 粗);
+        画线(色, 左, 上, 左, 上 + 臂, 粗);
+        画线(色, 右, 上, 右 - 臂, 上, 粗);
+        画线(色, 右, 上, 右, 上 + 臂, 粗);
+        画线(色, 左, 下, 左 + 臂, 下, 粗);
+        画线(色, 左, 下, 左, 下 - 臂, 粗);
+        画线(色, 右, 下, 右 - 臂, 下, 粗);
+        画线(色, 右, 下, 右, 下 - 臂, 粗);
+        const float 心X = (左 + 右) * 0.5f, 心Y = (上 + 下) * 0.5f;
+        画线(色, 心X - 臂, 心Y, 心X + 臂, 心Y, 粗);
+        画线(色, 心X, 心Y - 臂, 心X, 心Y + 臂, 粗);
+    }
+
     // ==================== 实体循环 ====================
     int 有效实体 = 0, 有坐标实体 = 0, 屏内实体 = 0;
     int 阵营直方[9] = {0};           // -1..7
@@ -1705,6 +1785,9 @@ void Draw::StartBooks() {
     int 小图样阵营[3] = {0, 0, 0};
     unsigned 小图样世X[3] = {0, 0, 0}, 小图样世Z[3] = {0, 0, 0};
     float 小图样屏X[3] = {0, 0, 0}, 小图样屏Y[3] = {0, 0, 0};
+    // 敌方回城：本轮收集（最多 5 个，够一队了）
+    int 回城数 = 0;
+    long long 回城英雄[5] = {0, 0, 0, 0, 0};
 
     SLIconCache* 图标缓存 = SLIconCache.共用;
     // 地图矩形一律用「未乘缩放」的逻辑值：小图坐标算出来是逻辑点，之后统一乘一次 缩放。
@@ -1819,8 +1902,10 @@ void Draw::StartBooks() {
                 小图样屏Y[小图样数] = my;
                 小图样数++;
             }
-            if (IsValidAddr(技能对象) && 读回城(技能对象))
+            if (IsValidAddr(技能对象) && 读回城(技能对象)) {
                 画文字(mx, my - 6.0f * 缩放, "回城", 0xFFFFFF00, true);
+                if (回城数 < 5) 回城英雄[回城数++] = 英雄ID;
+            }
         }
 
         // 屏内：射线点 + 方框 + 血条 + 头像 + 文字
@@ -1861,6 +1946,31 @@ void Draw::StartBooks() {
                 snprintf(血文字, sizeof(血文字), "%d血 %d", 血当前, (int)英雄ID);
                 画文字(sx, 框y + 框高 + 8.0f * 缩放, 血文字, 0xFFFFFFFF, true);
             }
+        }
+    }
+
+    // ==================== 敌方回城提示 ====================
+    // 屏幕顶部居中的横幅：谁在回城、几个，一眼能看到；边框红度脉动，抓眼角。
+    if (cfg_recall && 回城数 > 0) {
+        const float 图 = 16.0f * 缩放;
+        const float 缝 = 4.0f * 缩放;
+        const float 边 = 8.0f * 缩放;
+        const float 字宽 = 30.0f * 缩放;
+        const float 宽 = 边 * 2.0f + 字宽 + 缝 + 回城数 * 图 + (回城数 - 1) * 缝;
+        const float 高 = 图 + 边 * 2.0f;
+        const float 左 = 屏.x * 0.5f - 宽 * 0.5f;
+        const float 顶 = 70.0f * 缩放;
+        float 闪 = 0.45f + 0.55f * (0.5f + 0.5f * sinf((float)now * 6.0f));
+        ImU32 框色 = ((ImU32)(60.0f + 195.0f * 闪) << 24) | 0x000000FF;
+        画实心矩形(0xB8100C10, 左, 顶, 宽, 高);
+        画框(框色, 左, 顶, 宽, 高, 1.6f * 缩放);
+        画文字(左 + 边 + 字宽 * 0.5f, 顶 + 高 * 0.5f, "回城", 0xFFFFFFFF, true, true);
+        for (int i = 0; i < 回城数; ++i) {
+            float ix = 左 + 边 + 字宽 + 缝 + i * (图 + 缝);
+            char 编号[8] = {0};
+            if (回城英雄[i] > 0) snprintf(编号, sizeof(编号), "%d", (int)(回城英雄[i] % 1000));
+            id 纹 = [图标缓存 英雄:(int)回城英雄[i]];
+            画图标(纹, 0xE0000000, 回城英雄[i] > 0 ? 编号 : nullptr, ix, 顶 + 边, 图);
         }
     }
 
