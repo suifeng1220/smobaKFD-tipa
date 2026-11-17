@@ -27,43 +27,48 @@ void KernelLogLine(const char *line);
 #endif
 
 // ==================== 配置读写 ====================
+//
+// 以前这里写 /var/mobile/Library/Preferences/com.map.settings.plist，绘制层每秒读同一个文件。
+// 真机上这条路会断：文件读不到时绘制层直接 return，面板照旧显示"已开启"，
+// 于是所有开关都表现为"点了没反应"。
+// 现在面板和绘制层同进程直连（改内存变量 + NSUserDefaults 持久化），文件只当旧配置兼容。
+extern "C" {
+    void  SLCfg写开关(const char* 键, bool 值);
+    void  SLCfg写数值(const char* 键, float 值);
+    bool  SLCfg读开关(const char* 键);
+    float SLCfg读数值(const char* 键, float 缺省);
+    bool  SLCfg有键(const char* 键);
+    void  SLCfg同步缓存(void);
+}
 
 static NSString *const SL配置路径 = @"/var/mobile/Library/Preferences/com.map.settings.plist";
 
+// 仅用于「键在不在」这类旧判断的兼容快照；真正的读写都走上面的直连接口
 static NSMutableDictionary *SL配置(void) {
     NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:SL配置路径];
     return d ?: [NSMutableDictionary dictionary];
 }
 
 static BOOL SL读开关(NSString *键) {
-    id v = SL配置()[键];
-    return v ? [v boolValue] : NO;
+    return SLCfg读开关([键 UTF8String]) ? YES : NO;
 }
 
 static void SL写开关(NSString *键, BOOL 值) {
-    NSMutableDictionary *d = SL配置();
-    d[键] = @(值);
-    [d writeToFile:SL配置路径 atomically:YES];
+    SLCfg写开关([键 UTF8String], 值 ? true : false);
 }
 
 // 键不存在时先落一个缺省值：面板显示的状态必须和绘制层的实际行为一致。
-// （比如以前从没调过地图大小，开关就该显示"关"，而不是空着让人以为开了）
 static void SL确保开关(NSString *键, BOOL 缺省) {
-    NSMutableDictionary *d = SL配置();
-    if (d[键] != nil) return;
-    d[键] = @(缺省);
-    [d writeToFile:SL配置路径 atomically:YES];
+    if (SLCfg有键([键 UTF8String])) return;
+    SLCfg写开关([键 UTF8String], 缺省 ? true : false);
 }
 
 static float SL读浮点(NSString *键, float 缺省) {
-    id v = SL配置()[键];
-    return v ? [v floatValue] : 缺省;
+    return SLCfg读数值([键 UTF8String], 缺省);
 }
 
 static void SL写浮点(NSString *键, float 值) {
-    NSMutableDictionary *d = SL配置();
-    d[键] = @(值);
-    [d writeToFile:SL配置路径 atomically:YES];
+    SLCfg写数值([键 UTF8String], 值);
 }
 
 // 日志：HUD 是独立进程，App 的日志框看不到，另落一份文件。
@@ -1044,6 +1049,9 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
 
 - (void)搭建页3 {
     [self 新页:3];
+
+    // 面板刚开始搭建就把绘制层缓存里的值同步进来，滑条显示的数才和实际绘制一致
+    SLCfg同步缓存();
 
     // 开关缺键时先按「老行为」补一个缺省：调过 mapSize 就算开、没调过就算关。
     // 这样面板显示的状态和绘制层的判断始终一致，不会出现"开关关着却在生效"。
