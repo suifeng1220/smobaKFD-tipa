@@ -663,14 +663,18 @@ static void 读配置() {
         // 读不到 plist 的分支同样要做一次几何复位（这台设备走的就是这条分支）
         {
             NSUserDefaults* ud = [NSUserDefaults standardUserDefaults];
-            if ([[ud objectForKey:@"cfg2.geomVer"] intValue] < 2) {
-                [ud setInteger:2 forKey:@"cfg2.geomVer"];
+            if ([[ud objectForKey:@"cfg2.geomVer"] intValue] < 3) {
+                [ud setInteger:3 forKey:@"cfg2.geomVer"];
                 SLCfg写开关("mapsize_on", false);
                 SLCfg写开关("mappos_on", false);
+                SLCfg写数值("monsterScalePct", 100.0f);
+                SLCfg写开关("monsteroff_on", false);
+                SLCfg写数值("monsterOffX", 0.0f);
+                SLCfg写数值("monsterOffY", 0.0f);
                 地图已手调 = false;
                 有手调尺寸 = false;
                 位置已手调 = false;
-                日志("几何复位 v24：尺寸/位置回到自动（旧版残留 X=58.3 比原生右移 9px）");
+                日志("几何复位 v24（无 plist 分支）：位置/尺寸回自动、小图比例回100%%、野怪平移归零");
             }
         }
         return;
@@ -768,29 +772,41 @@ static void 读配置() {
     // plist 只是"旧配置兼容"，面板直连（NSUserDefaults）那份优先级更高，最后灌进来覆盖。
     SLCfg同步缓存();
 
-    // v24 几何复位（第二版）：v23 跑起来后日志里是 尺寸开关=0 位置开关=1 → 尺寸走自动（136.0 正确），
-    // 位置却还锁在 58.3 —— 那是更早一版系数 0.1356 写进配置的残留值，
-    // 折算到设备像素是 175，而原生小地图左边界是 166，整整右移 9px。
-    // 这就是用户说的「地图左右两边差了一点」：左边缩进 9px、右边溢出 9px。
-    // 复位成自动 → 58.3 变 55.3（166px），右边 574px，与原生完全重合。
+    // v24 一次性复位（geomVer 1 → 3）：把三处「旧版残留 + 手动调歪」的脏数据一次清干净。
+    //  ① 地图位置/尺寸锁死：配置里 mapX=58.26、mappos_on=true，折算成设备像素是 175，
+    //     而原生小地图左边界是 166 —— 整块右移 9px，左边缩进、右边溢出，就是「左右两边差了一点」。
+    //     复位成自动 → 58.3 变 55.3（166px），右边 574px，与原生完全重合（高度/尺寸本来就对）。
+    //  ② 小图比例 107.6%：这一条把英雄/野怪点位整体放大 7.6%，光看点位会以为「世界半程」错了。
+    //     复位成 100%，比例交给 世界半程 一个常量负责，滑条只留作手动微调。
+    //  ③ 野怪点位平移 monsteroff_on=true / OffX=1.32：同上，先归零。
     // plist 里那份也要一起改，否则下次启动又读回 YES。
     {
         NSUserDefaults* ud = [NSUserDefaults standardUserDefaults];
-        if ([[ud objectForKey:@"cfg2.geomVer"] intValue] < 2) {
-            [ud setInteger:2 forKey:@"cfg2.geomVer"];
+        if ([[ud objectForKey:@"cfg2.geomVer"] intValue] < 3) {
+            [ud setInteger:3 forKey:@"cfg2.geomVer"];
             cfg_mapsize_on = false;
             cfg_mappos_on = false;
             SLCfg写开关("mapsize_on", false);
             SLCfg写开关("mappos_on", false);
+            SLCfg写数值("monsterScalePct", 100.0f);
+            cfg_monsterScale = 1.0f;
+            SLCfg写开关("monsteroff_on", false);
+            SLCfg写数值("monsterOffX", 0.0f);
+            SLCfg写数值("monsterOffY", 0.0f);
+            cfg_monsterOffX = 0.0f;
+            cfg_monsterOffY = 0.0f;
             地图已手调 = false;
             有手调尺寸 = false;
             位置已手调 = false;
             if (用了) {
                 可变[@"mapsize_on"] = @NO;
                 可变[@"mappos_on"] = @NO;
+                可变[@"monsteroff_on"] = @NO;
+                可变[@"monsterScalePct"] = @100.0;
+                可变[@"monsterOffX"] = @0.0;
                 [可变 writeToFile:用了 atomically:YES];
             }
-            日志("几何复位 v24：尺寸/位置回到自动（旧残留 X=58.3 比原生右移 9px → 55.3）");
+            日志("几何复位 v24：位置 58.3→55.3（左移9px）、尺寸回自动、小图比例回100%%、野怪平移归零");
         }
     }
     // 「CD 位置可调」关着的时候，就算缓存里还留着旧坐标也回到内置默认，避免"开关关着却还在偏移"
@@ -1868,15 +1884,16 @@ static int 读野怪(uint64_t 模块, 野怪信息* 输出, int 上限) {
 // 英雄的落点是按 109000 标定的，野怪原先单独用 100000，等于把整张图放大 9%，
 // 越靠地图边缘偏得越多，只靠平移滑条永远补不回来 —— 现在英雄/野怪共用这一个常量。
 //
-// v23 重新标定（109000 → 115200）：
-// 拿 4 个已知世界坐标的野怪点，和截图里游戏自己画的野怪图标逐一配对，
-// 残差随「离图心的距离」线性变化、在图心处为 0：左半张 -5.3/-6.3/-8.6/-6.8px，
-// 右半张（把同一批点按 180° 对称镜像后取图标）符号相反。最小二乘拟合：
-//   x 方向比例误差 +5.72%，y 方向 +5.74%（两个轴几乎完全一致，说明是纯比例错、没有平移）
-// => 真实半程 = 109000 * 1.057 = 115,200。
-// 图标簇的 180° 对称中心 = (367.1, 205.4) 图像像素，正好等于 HUD 框中心 (370, 207) 设备像素，
-// 说明「地图位置/尺寸」是对的，错的只有世界→小图的比例。
-static const float 世界半程 = 115200.0f;
+// v24 重新标定（109000 → 115200 → 103500）：
+// 前两版都是「反推」出来的，绕了远路。v24 换成最直接的测法 ——
+// v23 把野怪点画成洋红实心点，于是可以从用户的对局截图里把「HUD 画的点」和
+// 「游戏自己画的小苗图标」直接配对：20 个野怪里有 18 个在 30px 内配上对，
+// 残差随离图心的距离严格线性变化（x 从 -14.3 单调走到 -2.0，y 从 -5.1 走到 +4.4），
+// 这就是纯比例错。最小二乘：x 斜率 1.0344、y 斜率 1.0337（两轴只差 0.07%，可信）。
+// 也就是说 HUD 的点比游戏近了 3.4%。当时配置里还压着 107.6% 的「小图比例」，
+// 所以真实半程 = 115200 / (1.034 × 1.0759758) ≈ 103,500。
+// 同一批数据还量出：HUD 框中心比原生小地图中心右移 8.8px（见下方几何复位）。
+static const float 世界半程 = 103500.0f;
 
 // 世界坐标 → 小地图逻辑坐标（未乘缩放）。翻转 = ±1，-1 时整体旋转 180°。
 // 小图比例（cfg_monsterScale，面板「小图比例%」）在这里统一生效：
