@@ -2208,10 +2208,10 @@ void Draw::StartBooks() {
     //   ② 6~10 秒后该偏移回到 0        ← 回城读条正好 8 秒
     //   ③ 紧接着这个实体坐标瞬移 > 25000 ← 传到泉水
     // 三条同时命中才认定，之后就能做到「按下回城立刻提示」。
-    static const int 差分长 = 0x600;
-    static unsigned char 差分旧[24][0x600];
-    static unsigned char 差分已记[24][0x600 / 4];
-    static unsigned char 差分新[0x600];
+    static const int 差分长 = 0x800;
+    static unsigned char 差分旧[24][0x800];
+    static unsigned char 差分已记[24][0x800 / 4];
+    static unsigned char 差分新[0x800];
     static bool 差分就绪[24] = {false};
     static int 差分实长[24] = {0};
     static uint64_t 差分键[24] = {0};
@@ -2223,6 +2223,7 @@ void Draw::StartBooks() {
     // v26 慢变捕获的基准表：实体本体 1 秒前的浮点值 + 最多 4 条子链
     static float 漂前[24][0x400 / 4];
     static float 漂链前[24][4][0x100 / 4];
+    static int 漂链整[24][4][0x100 / 4];
     static uint64_t 漂实体[24] = {0};
     static uint64_t 漂链[24][4];
     static double 漂时[24] = {0.0};
@@ -2445,14 +2446,40 @@ void Draw::StartBooks() {
                         漂前[k][o >> 2] = f;
                     }
                     int 链数 = 0;
-                    for (int o = 0; o + 8 <= 0x400 && 链数 < 4; o += 8) {
-                        uint64_t p = 0; memcpy(&p, 差分新 + o, 8);
-                        if (p <= 0x100000000ULL || p >= 0x10000000000ULL) continue;
+                    // 定向：SDK 已知的子对象偏移优先（技能 0x150 / 回城 0x168 / 0x178 / 血量 0x1D0），
+                    // 读出来的指针若合法就直接纳入，占不满 4 条时再用通扫补齐。
+                    const int 已知链[4] = { 0x150, 0x168, 0x178, 0x1D0 };
+                    for (int i = 0; i < 4 && 链数 < 4; ++i) {
+                        uint64_t p = vm_read<uint64_t>(实体 + 已知链[i]);
+                        if (p <= 0x100000000ULL || p >= 0x10000000000ULL) {
+                            日志("子链读不到 k=%d 实体+0x%x = %llx", k, 已知链[i], p);
+                            continue;
+                        }
                         漂链[k][链数] = p;
                         if (readMemory(p, 差分新, 0x100)) {
                             for (int q = 0; q + 4 <= 0x100; q += 4) {
                                 float f; memcpy(&f, 差分新 + q, 4);
                                 漂链前[k][链数][q >> 2] = f;
+                                int 整; memcpy(&整, 差分新 + q, 4);
+                                漂链整[k][链数][q >> 2] = 整;
+                            }
+                            日志("子链 k=%d +0x%x -> %llx", k, 已知链[i], p);
+                        }
+                        ++链数;
+                    }
+                    for (int o = 0; o + 8 <= 0x400 && 链数 < 4; o += 8) {
+                        uint64_t p = 0; memcpy(&p, 差分新 + o, 8);
+                        if (p <= 0x100000000ULL || p >= 0x10000000000ULL) continue;
+                        bool 重复 = false;
+                        for (int i = 0; i < 链数; ++i) if (漂链[k][i] == p) 重复 = true;
+                        if (重复) continue;
+                        漂链[k][链数] = p;
+                        if (readMemory(p, 差分新, 0x100)) {
+                            for (int q = 0; q + 4 <= 0x100; q += 4) {
+                                float f; memcpy(&f, 差分新 + q, 4);
+                                漂链前[k][链数][q >> 2] = f;
+                                int 整; memcpy(&整, 差分新 + q, 4);
+                                漂链整[k][链数][q >> 2] = 整;
                             }
                         }
                         ++链数;
@@ -2493,6 +2520,17 @@ void Draw::StartBooks() {
                         float a = 漂链前[k][c][q >> 2], b;
                         memcpy(&b, 差分新 + q, 4);
                         漂链前[k][c][q >> 2] = b;
+                        int 整a = 漂链整[k][c][q >> 2], 整b;
+                        memcpy(&整b, 差分新 + q, 4);
+                        漂链整[k][c][q >> 2] = 整b;
+                        // SDK 对回城的描述是「+0x110 非零即在回城」→ 关键形态就是 0 ↔ 非0。
+                        // 所以子链里只要出现「一边是 0、另一边不是 0」，一律记（不比大小）。
+                        if ((整a == 0) != (整b == 0) && 子行 < 6) {
+                            日志("子链开关 k=%d 阵=%d 链%d@%llx +0x%03x %d->%d",
+                                 k, 阵营, c, 漂链[k][c], q, 整a, 整b);
+                            ++子行;
+                            continue;
+                        }
                         if (a != a || b != b) continue;
                         const float 绝b = b < 0 ? -b : b;
                         if (绝b > 20000.0f) continue;
@@ -2500,7 +2538,7 @@ void Draw::StartBooks() {
                         if (d < 0.4f) continue;
                         const float 绝a = a < 0 ? -a : a;
                         if (!(绝a < 30.0f || 绝b < 30.0f)) continue;
-                        if (子行 < 4) {
+                        if (子行 < 6) {
                             日志("漂链 k=%d 阵=%d 链%d@%llx +0x%03x %.2f->%.2f",
                                  k, 阵营, c, 漂链[k][c], q, a, b);
                             ++子行;
