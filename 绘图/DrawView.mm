@@ -240,6 +240,42 @@ static int 日志环写 = 0;
 static int 日志环量 = 0;
 static std::atomic_flag 日志锁 = ATOMIC_FLAG_INIT;
 static FILE* 日志文件 = nullptr;
+static FILE* 日志文件2 = nullptr;
+static bool 日志可用 = false;
+static char 日志路径串[256] = {0};
+
+// 开日志：把所有能打开的候选路径都打开（不止第一个），沙盒里哪条通就落哪条。
+// 以前只试 /var/mobile/Documents（沙盒外，TrollStore 常被拒），失败了才退 HOME，
+// 结果诊断日志根本没落盘 —— 让用户找半天找不到文件，问题也就无从定位。
+static void 初始化日志(void) {
+  @autoreleasepool {
+    NSMutableArray<NSString*>* 候选 = [NSMutableArray array];
+    NSArray* 文档 = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (文档.count > 0) [候选 addObject:[文档[0] stringByAppendingPathComponent:@"ab_draw.log"]];
+    const char* home = getenv("HOME");
+    if (home) [候选 addObject:[NSString stringWithFormat:@"%s/Documents/ab_draw.log", home]];
+    [候选 addObject:@"/var/mobile/Documents/ab_draw.log"];
+    [候选 addObject:@"/tmp/ab_draw.log"];
+
+    NSMutableSet<NSString*>* 已开 = [NSMutableSet set];
+    for (NSString* p in 候选) {
+        NSString* 键 = [p stringByStandardizingPath];
+        if ([已开 containsObject:键]) continue;
+        [已开 addObject:键];
+        FILE* f = fopen(p.UTF8String, "a");
+        if (!f) continue;
+        if (!日志文件) {
+            日志文件 = f;
+            日志可用 = true;
+            snprintf(日志路径串, sizeof(日志路径串), "%s", p.UTF8String);
+        } else if (!日志文件2) {
+            日志文件2 = f;
+        } else {
+            fclose(f);
+        }
+    }
+  }
+}
 
 static void 日志入环(const char* line) {
     while (std::atomic_flag_test_and_set_explicit(&日志锁, std::memory_order_acquire)) {}
@@ -257,28 +293,25 @@ void 日志(const char* fmt, ...) {
     va_start(va, fmt);
     if (!日志初始化) {
         日志初始化 = true;
-        日志文件 = fopen("/var/mobile/Documents/ab_draw.log", "a");
-        if (!日志文件) {
-            const char* home = getenv("HOME");
-            if (home) {
-                char path[512] = {0};
-                snprintf(path, sizeof(path), "%s/Documents/ab_draw.log", home);
-                日志文件 = fopen(path, "a");
-            }
-        }
-        if (!日志文件) 日志文件 = fopen("/tmp/ab_draw.log", "a");
+        初始化日志();
     }
     char line[600];
     vsnprintf(line, sizeof(line), fmt, va);
     va_end(va);
     日志入环(line);
     KernelLogLine(line);
-    if (日志文件) {
+    if (日志文件 || 日志文件2) {
         time_t now = time(nullptr);
         struct tm tmv;
         localtime_r(&now, &tmv);
-        fprintf(日志文件, "%02d:%02d:%02d %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, line);
-        fflush(日志文件);
+        if (日志文件) {
+            fprintf(日志文件, "%02d:%02d:%02d %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, line);
+            fflush(日志文件);
+        }
+        if (日志文件2) {
+            fprintf(日志文件2, "%02d:%02d:%02d %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, line);
+            fflush(日志文件2);
+        }
     }
 }
 
@@ -1693,6 +1726,18 @@ void Draw::StartBooks() {
         }
     }
 
+    // 启动横幅：每次启动写一行，把版本、缩放、屏幕尺寸和日志落地路径都记下来。
+    // 这样"日志到底写没写成功"不用猜，屏幕上和日志里都能看到。
+    {
+        static bool 已记启动 = false;
+        if (!已记启动) {
+            已记启动 = true;
+            初始化日志();
+            日志("=== smobaKFD v19 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+                 日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
+        }
+    }
+
     // 找进程看门狗：12 秒没推进就另起线程
     int 调用 = 找进程调用.load();
     if (调用 == 找进程调用快照) {
@@ -1812,6 +1857,10 @@ void Draw::StartBooks() {
         snprintf(标, sizeof(标), "自动 尺寸%s 位置%s",
                  cfg_mapsize_on ? "关" : "开", cfg_mappos_on ? "关" : "开");
         画文字(心X, 下 + 24.0f * 缩放, 标, 0xFF80FF80, true, true, 9.5f * 缩放);
+        // 日志是否落盘 + 落地路径：看不到日志文件时，先看这一行
+        snprintf(标, sizeof(标), "日志 %s", 日志可用 ? 日志路径串 : "写入失败");
+        画文字(心X, 下 + 37.0f * 缩放, 标, 日志可用 ? 0xFF80C0FF : 0xFFFF7070,
+               true, true, 8.5f * 缩放);
     }
 
     // ==================== 实体循环 ====================
