@@ -12,6 +12,7 @@
 #include <mach/mach.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
+#include <cstring>
 #include "BBZGui.h"
 #include "游戏/SDK.h"
 
@@ -114,6 +115,155 @@ static bool 有手调尺寸 = false;            // plist 里有 mapSize
 static bool 位置已手调 = false;            // plist 里 mapX / mapY 都在
 
 static const char* 设置路径 = "/var/mobile/Library/Preferences/com.map.settings.plist";
+
+// ==================== 面板 ↔ 绘制层直连 ====================
+// 以前面板写 plist、绘制层每秒读 plist。可这条路在真机上会断：plist 路径被沙盒或
+// 越狱重定向吃掉时，读配置() 拿到 nil 直接 return，开关和滑条看着动了，
+// 一个字节都没进绘制层 —— 这就是"点了没反应"的根。
+// 面板和绘制层本来就在同一个进程里，没必要绕文件：直接改内存变量，
+// 再往 NSUserDefaults 存一份（cfprefsd 走 XPC，不过文件系统，沙盒拦不住），重启后自动恢复。
+struct SL键项 {
+    const char* 键;
+    void*       址;
+    bool        浮点;
+};
+
+static SL键项 键表[] = {
+    { "draw",            &cfg_draw,            false },
+    { "line",            &cfg_line,            false },
+    { "box",             &cfg_box,             false },
+    { "avatar",          &cfg_avatar,          false },
+    { "map",             &cfg_map,             false },
+    { "skill",           &cfg_skill,           false },
+    { "monster",         &cfg_monster,         false },
+    { "health",          &cfg_health,          false },
+    { "livemode",        &cfg_livemode,        false },
+    { "fov_on",          &cfg_fov_on,          false },
+    { "status",          &cfg_status,          false },
+    { "recall",          &cfg_recall,          false },
+    { "mapalign",        &cfg_mapalign,        false },
+    { "camprobe",        &cfg_camprobe,        false },
+    { "mapsize_on",      &cfg_mapsize_on,      false },
+    { "mappos_on",       &cfg_mappos_on,       false },
+    { "skillpos_on",     &cfg_skillpos_on,     false },
+    { "monsteroff_on",   &cfg_monsteroff_on,   false },
+    { "fov_probe",       &cfg_fov_probe,       false },
+    { "fov",             &cfg_fov,             true  },
+    { "mapX",            &cfg_mapX,            true  },
+    { "mapY",            &cfg_mapY,            true  },
+    { "mapSize",         &cfg_mapSize,         true  },
+    { "skillX",          &cfg_skillX,          true  },
+    { "skillY",          &cfg_skillY,          true  },
+    { "monsterOffX",     &cfg_monsterOffX,     true  },
+    { "monsterOffY",     &cfg_monsterOffY,     true  },
+    { "monsterScalePct", &cfg_monsterScale,    true  },   // 面板存百分比，内存里是倍数
+};
+
+static SL键项* 找键(const char* 键) {
+    const size_t 数 = sizeof(键表) / sizeof(键表[0]);
+    for (size_t i = 0; i < 数; ++i)
+        if (strcmp(键表[i].键, 键) == 0) return &键表[i];
+    return nullptr;
+}
+
+// 百分比键：面板/日志用 100 表示原始大小，内存里用 1.0
+static bool 是百分比键(const char* 键) { return strcmp(键, "monsterScalePct") == 0; }
+
+static NSMutableSet<NSString*>* 桥键集(void) {
+    static NSMutableSet* s = nil;
+    if (!s) s = [NSMutableSet new];     // new 而不是 set：静态持有，不能是 autorelease
+    return s;
+}
+
+// 键表里没有的（面板专属 UI 状态，比如悬浮球隐藏）走这张杂项表
+static NSMutableDictionary<NSString*, id>* 桥杂项(void) {
+    static NSMutableDictionary* d = nil;
+    if (!d) d = [NSMutableDictionary new];
+    return d;
+}
+
+static NSString* 桥存储键(const char* 键) {
+    return [@"cfg2." stringByAppendingString:@(键)];
+}
+
+extern "C" {
+
+void SLCfg写开关(const char* 键, bool 值) {
+    SL键项* it = 找键(键);
+    if (it) {
+        if (it->浮点) *(float*)it->址 = 值 ? 1.0f : 0.0f;
+        else *(bool*)it->址 = 值;
+    } else {
+        桥杂项()[@(键)] = @(值);
+    }
+    [[NSUserDefaults standardUserDefaults] setBool:值 forKey:桥存储键(键)];
+    [桥键集() addObject:@(键)];
+}
+
+void SLCfg写数值(const char* 键, float 值) {
+    SL键项* it = 找键(键);
+    if (it && it->浮点) {
+        *(float*)it->址 = 是百分比键(键) ? 值 / 100.0f : 值;
+    } else if (it) {
+        *(bool*)it->址 = 值 != 0.0f;
+    } else {
+        桥杂项()[@(键)] = @(值);
+    }
+    [[NSUserDefaults standardUserDefaults] setFloat:值 forKey:桥存储键(键)];
+    [桥键集() addObject:@(键)];
+}
+
+bool SLCfg读开关(const char* 键) {
+    SL键项* it = 找键(键);
+    if (!it) {
+        id v = 桥杂项()[@(键)];
+        return v ? [v boolValue] : false;
+    }
+    return it->浮点 ? (*(float*)it->址 != 0.0f) : *(bool*)it->址;
+}
+
+float SLCfg读数值(const char* 键, float 缺省) {
+    SL键项* it = 找键(键);
+    if (!it || !it->浮点) {
+        id v = 桥杂项()[@(键)];
+        return v ? [v floatValue] : 缺省;
+    }
+    float v = *(float*)it->址;
+    return 是百分比键(键) ? v * 100.0f : v;
+}
+
+bool SLCfg有键(const char* 键) {
+    return [桥键集() containsObject:@(键)];
+}
+
+// 启动/读配置时调用：把 NSUserDefaults 里存的值灌回内存变量。
+// 这一层是"开关能记住"的唯一保障 —— plist 读不到也不影响。
+void SLCfg同步缓存(void) {
+    NSUserDefaults* ud = [NSUserDefaults standardUserDefaults];
+    const size_t 数 = sizeof(键表) / sizeof(键表[0]);
+    for (size_t i = 0; i < 数; ++i) {
+        NSString* k = 桥存储键(键表[i].键);
+        id v = [ud objectForKey:k];
+        if (!v) continue;
+        if (键表[i].浮点) {
+            float f = [v floatValue];
+            *(float*)键表[i].址 = 是百分比键(键表[i].键) ? f / 100.0f : f;
+        } else {
+            *(bool*)键表[i].址 = [v boolValue];
+        }
+        [桥键集() addObject:@(键表[i].键)];
+    }
+    NSArray* 杂项键 = [[ud dictionaryRepresentation] allKeys];
+    for (NSString* k in 杂项键) {
+        if (![k hasPrefix:@"cfg2."]) continue;
+        NSString* 短 = [k substringFromIndex:5];
+        if (找键([短 UTF8String])) continue;
+        桥杂项()[短] = [ud objectForKey:k];
+        [桥键集() addObject:短];
+    }
+}
+
+}   // extern "C"
 
 // 备用位置：App 沙盒自己的 Documents。
 // 只认 /var/mobile/Library/Preferences 太脆：那条路径一旦读不到（无根越狱重定向 / 沙盒），
@@ -508,6 +658,21 @@ static void 读配置() {
                      [fm fileExistsAtPath:沙盒配置路径()] ? 1 : 0);
             日志("配置读不到 %s", 细节);
         }
+        // plist 读不到不等于没配置：面板直连写进 NSUserDefaults 的那份还在
+        SLCfg同步缓存();
+        // 读不到 plist 的分支同样要做一次几何复位（这台设备走的就是这条分支）
+        {
+            NSUserDefaults* ud = [NSUserDefaults standardUserDefaults];
+            if (![ud objectForKey:@"cfg2.geomVer"]) {
+                [ud setInteger:1 forKey:@"cfg2.geomVer"];
+                SLCfg写开关("mapsize_on", false);
+                SLCfg写开关("mappos_on", false);
+                地图已手调 = false;
+                有手调尺寸 = false;
+                位置已手调 = false;
+                日志("几何复位：尺寸/位置回到自动（v21 首次，无 plist）");
+            }
+        }
         return;
     }
 
@@ -582,11 +747,6 @@ static void 读配置() {
     cfg_monsterScale = 读浮点(cfg, @"monsterScalePct", 100.0f) / 100.0f;
     if (cfg_monsterScale < 0.60f) cfg_monsterScale = 0.60f;
     if (cfg_monsterScale > 1.60f) cfg_monsterScale = 1.60f;
-    if (!cfg_skillpos_on) {
-        cfg_skillX = 11.0f;   // 关掉就回到内置默认位置
-        cfg_skillY = 27.0f;
-    }
-
     // fov_addr 支持 "0x..." 字符串或数字
     id fa = [cfg objectForKey:@"fov_addr"];
     if (fa) {
@@ -605,14 +765,41 @@ static void 读配置() {
     if (cfg_fov < 0.1f) cfg_fov = 0.1f;
     if (cfg_fov > 10.0f) cfg_fov = 10.0f;
 
+    // plist 只是"旧配置兼容"，面板直连（NSUserDefaults）那份优先级更高，最后灌进来覆盖。
+    SLCfg同步缓存();
+
+    // v21 一次性几何复位：这台设备上出现的 59.5 / 1.7 / 135 既不是自动系数算出来的值，
+    // 也不在任何一个能读到的配置文件里 —— 属于来历不明的脏数据。
+    // 与其继续在脏数据上猜，不如复位成"自动"，让系数重新算一遍（430 基准 → 105.1）。
+    {
+        NSUserDefaults* ud = [NSUserDefaults standardUserDefaults];
+        if (![ud objectForKey:@"cfg2.geomVer"]) {
+            [ud setInteger:1 forKey:@"cfg2.geomVer"];
+            cfg_mapsize_on = false;
+            cfg_mappos_on = false;
+            SLCfg写开关("mapsize_on", false);
+            SLCfg写开关("mappos_on", false);
+            地图已手调 = false;
+            有手调尺寸 = false;
+            位置已手调 = false;
+            日志("几何复位：尺寸/位置回到自动（v21 首次）");
+        }
+    }
+    // 「CD 位置可调」关着的时候，就算缓存里还留着旧坐标也回到内置默认，避免"开关关着却还在偏移"
+    if (!cfg_skillpos_on) {
+        cfg_skillX = 11.0f;
+        cfg_skillY = 27.0f;
+    }
+
     // 配置快照：5 秒一次，把「用了哪条路径 + 关键开关 + 地图三值」写进日志。
     // 以后再出现"开关点了没反应"，先看这一行就够了，不用再猜。
     static double 上次快照 = 0;
     double 快照时 = CACurrentMediaTime();
     if (快照时 - 上次快照 > 5.0) {
         上次快照 = 快照时;
+        const char* 路径 = 用了 ? [用了 UTF8String] : "(plist 未读到, 走本地缓存)";
         日志("配置 %s draw=%d map=%d monster=%d align=%d recall=%d 尺寸开关=%d 位置开关=%d 尺寸%.1f X%.1f Y%.1f",
-             [用了 UTF8String], cfg_draw ? 1 : 0, cfg_map ? 1 : 0, cfg_monster ? 1 : 0,
+             路径, cfg_draw ? 1 : 0, cfg_map ? 1 : 0, cfg_monster ? 1 : 0,
              cfg_mapalign ? 1 : 0, cfg_recall ? 1 : 0,
              cfg_mapsize_on ? 1 : 0, cfg_mappos_on ? 1 : 0,
              cfg_mapSize, cfg_mapX, cfg_mapY);
@@ -1896,7 +2083,8 @@ void Draw::StartBooks() {
         const float 臂 = 24.0f * 缩放;
         const float 粗 = 2.8f * 缩放;
         const ImU32 角 = 0xFFFFFFFF;      // 白
-        const ImU32 叉 = 0xFFFF4040;      // 红（中心）
+        // ImGui 的 ImU32 是 0xAABBGGRR（低字节才是红），上次写成 0xFFFF4040 结果画出来是蓝的。
+        const ImU32 叉 = 0xFF4040FF;      // 红（中心）
         // 对角线：判断中心偏没偏，比盯着四条边直观
         画线(0x50FF00FF, 左, 上, 右, 下, 1.2f * 缩放);
         画线(0x50FF00FF, 右, 上, 左, 下, 1.2f * 缩放);
@@ -2009,6 +2197,17 @@ void Draw::StartBooks() {
             int 字段值 = IsValidAddr(链A) ? vm_read<int>(链A + SDK::回城状态) : -999;
             日志("回城链 k=%d 英雄=%lld 实体=%llx A=%llx B=%llx 判值=%d 状态字段=%d 来源=%d",
                  k, 英雄ID, 实体, 链A, 链B, 判值, 字段值, 回城来源);
+            // 偏移猜不准时，把实体 +0x150 起的 12 个 int 打出来：
+            // 让用户按一次回城，对比这串数字哪一位从 0 变 1，就能反推真正的状态偏移。
+            if (cfg_camprobe) {
+                char 扫[220] = {0};
+                char 段[24];
+                for (int o = 0; o < 11; ++o) {
+                    snprintf(段, sizeof(段), " %d", vm_read<int>(实体 + 0x150 + o * 4));
+                    if (strlen(扫) + strlen(段) < sizeof(扫) - 1) strcat(扫, 段);
+                }
+                日志("回城扫描 实体+0x150:%s", 扫);
+            }
         }
 
         // 技能图标列（屏幕上方）—— 对齐游戏记分板尺寸
