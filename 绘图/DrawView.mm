@@ -2254,6 +2254,75 @@ static void 我方自检(uint64_t 数组, int 数量, const float* 矩阵, float
              敌数, 敌屏内, (敌近 > 1e8) ? -1.0 : 敌近);
 }
 
+// ==================== v47：两跳指针轨迹 + 野怪已知真值对照 ====================
+// v46 实测（_ab_v46.log）留了三个必须解释的事实：
+//  ① 同一个槽（槽世键未变，实体不变）的 二+0x44 仍在两组值之间跳：
+//     k3 (47770,-27742) → (2027,418) → (38221,-34237) → (36500,34000)，最大距 68259。
+//  ② `二失=375/1750`，约 21% 的槽帧读不到 二，那一帧退回三链投票，
+//     于是输出里又出现 v36 的老僵尸值 (53395,56435)/(54045,54045)/(56368,53358)。
+//  ③ 我方自检的「最近者即我」不可靠：自身那一帧读失败时，它会挑到站泉水的队友
+//     （k4 二(1300,1299) 恒定、距心 323→2578 一路涨），所以「距心」不能单独用来判死偏移。
+// 要分清 ① 是「指针在换人」还是「对象里存了两份」，只能逐帧看指针本身：
+//   二 在两个地址间换 → 指针级换人（链的某一跳不稳）
+//   二 恒定、值在两组间换 → 同一对象里两份状态（逻辑位/插值位）
+// 另加一条对照：野怪用 +0x2B8 读出来一直是真坐标（v24 起用小地图 20 点标定过），
+//   把野怪的 0x2B8 与 野怪的二+0x44 并排打出来，就能判断 +0x44 到底是不是位置字段。
+static int 轨迹帧 = 0, 轨迹计 = 0;
+static void 指针轨迹(uint64_t 数组, int 数量) {
+    if (轨迹计 >= 400) return;
+    if (++轨迹帧 < 6) return;               // 约 10Hz
+    轨迹帧 = 0;
+    for (int k = 0; k < 数量 && k < 12 && 轨迹计 < 400; ++k) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (!IsValidAddr(e)) continue;
+        uint64_t 一 = vm_read<uint64_t>(e + 0xa8);
+        uint64_t 二 = IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0;
+        int x = 0, z = 0;
+        if (IsValidAddr(二)) {
+            x = vm_read<int>(二 + 0x44);
+            z = vm_read<int>(二 + 0x4C);
+        }
+        日志("轨迹 k=%d 实体=%llx 一=%llx 二=%llx v(%d,%d)", k,
+             (unsigned long long)e, (unsigned long long)一, (unsigned long long)二, x, z);
+        轨迹计++;
+    }
+}
+
+static int 对照帧 = 0, 对照计 = 0;
+static void 野怪对照(void) {
+    if (对照计 >= 12) return;
+    if (++对照帧 < 20) return;
+    对照帧 = 0;
+    ++对照计;
+
+    uint64_t 根 = 0;
+    uint64_t a = vm_read<uint64_t>(模块基址 + SDK::根野怪);
+    if (IsValidAddr(a)) {
+        uint64_t b = vm_read<uint64_t>(a + 952);
+        if (IsValidAddr(b)) {
+            uint64_t c = vm_read<uint64_t>(b + 136);
+            if (IsValidAddr(c)) 根 = vm_read<uint64_t>(c + 320);
+        }
+    }
+    if (!IsValidAddr(根)) { 日志("野怪对照 第%d次 根无效", 对照计); return; }
+
+    char 串[460] = {0};
+    int 位 = 0;
+    for (int i = 0; i < 20 && 位 < 400; ++i) {
+        uint64_t 怪 = vm_read<uint64_t>(根 + 24ULL * i);
+        if (!IsValidAddr(怪)) continue;
+        int x = vm_read<int>(怪 + SDK::坐标X);
+        int z = vm_read<int>(怪 + SDK::坐标Y);
+        if ((!x && !z) || x < -200000 || x > 200000 || z < -200000 || z > 200000) continue;
+        uint64_t 一 = vm_read<uint64_t>(怪 + 0xa8);
+        uint64_t 二 = IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0;
+        int bx = 0, bz = 0;
+        if (IsValidAddr(二)) { bx = vm_read<int>(二 + 0x44); bz = vm_read<int>(二 + 0x4C); }
+        位 += snprintf(串 + 位, sizeof(串) - 位, "[%d]2B8(%d,%d)二44(%d,%d) ", i, x, z, bx, bz);
+    }
+    日志("野怪对照 第%d次 %s", 对照计, 串);
+}
+
 // ==================== v39：锁定实体逐帧坐标序列 ====================
 // 扫描候选表要 20 秒才出，先打 200 帧原始序列，肉眼就能看出「交替」的周期，
 // 以及交替两组值里哪一组在连续。
@@ -3148,7 +3217,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v46 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v47 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -3341,6 +3410,9 @@ void Draw::StartBooks() {
     全槽对比(数组, 数量, 矩阵, 屏.x, 屏.y);
     // v46：我方英雄自检（相机跟人走 = 免费真值，用来判定 二+0x44 是否真的可用）
     我方自检(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
+    // v47：两跳指针轨迹（看 二 是否在换地址）+ 野怪已知真值对照（看 +0x44 是否位置字段）
+    指针轨迹(数组, 数量);
+    野怪对照();
 
     for (int k = 0; k < 数量 && k < 24; ++k) {
         uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * k);
