@@ -1441,6 +1441,65 @@ static unsigned 槽世X[24] = {0}, 槽世Z[24] = {0};
 static double   槽世最大跳[24] = {0};
 static int      世界跳计 = 0;
 static int      零血连续[24] = {0};      // v35：连续读到「血=0」的帧数，单帧脏读不算死
+
+// ==================== v36 坐标稳定闸门 ====================
+// v35 实测结论：同一实体（指针整局不变）的坐标会在两个真实位置之间反复切换，
+// 相距 3000~10000 世界单位（同一时刻 小图跳变 实测 9~16pt），每帧约两次。
+// 帧率 60、纹理全命中、阵营从不切换 —— 也就是说闪的是「这一帧读到的位置」。
+// 这里不做根因假设，只做输出闸门：
+//   小幅位移（<=1200 世界单位/帧，正常走位）  → 直接跟随
+//   大幅跳变（>1200）                          → 先压住，等同一新位置连续 4 帧站住再认
+// 正常走位零延迟；真瞬移（闪现/复活）延后 4 帧 ≈ 66ms，肉眼无感。
+static unsigned 槽稳X[24] = {0}, 槽稳Z[24] = {0};
+static unsigned 槽稳候X[24] = {0}, 槽稳候Z[24] = {0};
+static bool     槽稳有[24] = {false};
+static int      槽稳待[24] = {0};
+static int      稳定压计 = 0;    // 被压掉的帧数（说明抖动有多频繁）
+static int      稳定接计 = 0;    // 接受新位置的次数
+
+static void 稳定坐标(int k, unsigned* X, unsigned* Z) {
+    if (k < 0 || k >= 24) return;
+    unsigned rx = *X, rz = *Z;
+    if (!槽稳有[k]) {
+        槽稳X[k] = rx; 槽稳Z[k] = rz; 槽稳有[k] = true; 槽稳待[k] = 0; 稳定接计++;
+        return;
+    }
+    double dx = (double)rx - (double)槽稳X[k];
+    double dz = (double)rz - (double)槽稳Z[k];
+    if (dx * dx + dz * dz <= 1200.0 * 1200.0) {
+        槽稳X[k] = rx; 槽稳Z[k] = rz; 槽稳待[k] = 0; 稳定接计++;
+        return;
+    }
+    double cx = (double)rx - (double)槽稳候X[k];
+    double cz = (double)rz - (double)槽稳候Z[k];
+    bool 同候 = (槽稳待[k] > 0) && (cx * cx + cz * cz <= 900.0 * 900.0);
+    槽稳候X[k] = rx; 槽稳候Z[k] = rz;
+    槽稳待[k] = 同候 ? 槽稳待[k] + 1 : 1;
+    if (槽稳待[k] >= 4) {
+        槽稳X[k] = rx; 槽稳Z[k] = rz; 槽稳待[k] = 0; 稳定接计++;
+        if (稳定接计 <= 20)
+            日志("稳定认新 k=%d 新(%d,%d) 距%.0f", k, (int)rx, (int)rz, sqrt(dx * dx + dz * dz));
+        return;
+    }
+    稳定压计++;
+    *X = 槽稳X[k];
+    *Z = 槽稳Z[k];
+}
+
+// 诊断：把当前链每一步解出来的指针打出来，用来判断「两个位置」是不是
+// 中间某一跳指向了不同对象（打印前 8 次，开销可忽略）
+static void 记链中间(int k, uint64_t 实体) {
+    if (当前链 < 0 || 当前链 >= 3) return;
+    const SDK::坐标链& 链 = SDK::坐标链表[当前链];
+    uint64_t p = 实体, a = 0, b = 0, c = 0, d = 0;
+    if (!链步(&p, 链.一)) return; a = p;
+    if (!链步(&p, 链.二)) return; b = p;
+    if (!链步(&p, 链.三)) return; c = p;
+    if (!链步(&p, 链.四)) return; d = p;
+    日志("链中间 k=%d 实体=%llx 一=%llx 二=%llx 三=%llx 址=%llx",
+         k, (unsigned long long)实体, (unsigned long long)a, (unsigned long long)b,
+         (unsigned long long)c, (unsigned long long)d);
+}
 static int 稳定英雄ID(int k, uint64_t 实体, int 血上限) {
     if (k < 0 || k >= 24) return 0;
     // 槽位换人 → 重置（血量上限也变说明同槽位被另一个对象复用）
@@ -2297,7 +2356,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v35 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v36 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -2714,13 +2773,17 @@ void Draw::StartBooks() {
         unsigned 样X = 0, 样Z = 0;
         int 链 = 读实体坐标(实体, &样X, &样Z);
         if (链 < 0 || 样X == 1000000) continue;
+        const unsigned 原X = 样X, 原Z = 样Z;   // 原始值留着做诊断
+        稳定坐标(k, &样X, &样Z);                // v36：画出去之前先过闸门
 
         // v34 诊断：世界坐标帧间位移。一帧 16ms 英雄最多走几百单位，
         // 超过 3000 只可能是脏读/链跳。同时记录本窗口最大值（不看阈值）。
         {
             if (槽世键[k] == 实体) {
-                long long wx = (long long)样X - (long long)槽世X[k];
-                long long wz = (long long)样Z - (long long)槽世Z[k];
+                // v36：坐标可能是负数（-200000~0），存成 unsigned 后直接相减会变成 42 亿，
+                // 之前那些「距4294967030」「最大世跳=6073950821」全是这个符号问题造成的假跳。
+                long long wx = (long long)(int)原X - (long long)(int)槽世X[k];
+                long long wz = (long long)(int)原Z - (long long)(int)槽世Z[k];
                 double 距 = sqrt((double)wx * wx + (double)wz * wz);
                 if (距 > 槽世最大跳[k]) 槽世最大跳[k] = 距;
                 if (距 > 3000.0) {
@@ -2728,10 +2791,11 @@ void Draw::StartBooks() {
                     if (世界跳计 <= 30)
                         日志("世界跳变 k=%d 从(%d,%d)到(%d,%d) 距%.0f 链=%s",
                              k, (int)槽世X[k], (int)槽世Z[k],
-                             (int)样X, (int)样Z, 距, 链名(链));
+                             (int)原X, (int)原Z, 距, 链名(链));
+                    if (世界跳计 <= 8) 记链中间(k, 实体);
                 }
             }
-            槽世键[k] = 实体; 槽世X[k] = 样X; 槽世Z[k] = 样Z;
+            槽世键[k] = 实体; 槽世X[k] = 原X; 槽世Z[k] = 原Z;
         }
 
         有坐标实体++;
@@ -3058,13 +3122,13 @@ void Draw::StartBooks() {
         float fps = BBZGUI::GetIO().DeltaTime > 0.0f ? 1.0f / BBZGUI::GetIO().DeltaTime : 0.0f;
         double 全槽最大 = 0.0;
         for (int i = 0; i < 24; ++i) if (槽世最大跳[i] > 全槽最大) 全槽最大 = 槽世最大跳[i];
-        日志("n=%d 敌=%d 屏=%d 野=%d 阵[-1:%d 0:%d 1:%d 2:%d 3:%d] 血样%d/%d 链=%s 英雄=%d 我=%d 读=%d 限=%d 任务=%d 链=%s fps=%.0f m00=%.3f 阵切=%d 跳=%d 阵52=%d 阵C0=%d 体切=%d 世跳=%d 最大世跳=%.0f",
+        日志("n=%d 敌=%d 屏=%d 野=%d 阵[-1:%d 0:%d 1:%d 2:%d 3:%d] 血样%d/%d 链=%s 英雄=%d 我=%d 读=%d 限=%d 任务=%d 链=%s fps=%.0f m00=%.3f 阵切=%d 跳=%d 阵52=%d 阵C0=%d 体切=%d 世跳=%d 最大世跳=%.0f 稳压=%d 稳接=%d",
              数量, 有坐标实体, 屏内实体, 野怪计,
              阵营直方[0], 阵营直方[1], 阵营直方[2], 阵营直方[3], 阵营直方[4],
              首个血当前, 首个血上限, 链名(首个链), (int)首个英雄ID, 我方阵营,
              (int)读总数, 读限流计数, 任务端口 != 0, 链名(当前链), fps,
              矩阵[0], 阵营切换计, 位置跳计, 首个阵营52, 首个阵营C0, 实体阵营切换计,
-             世界跳计, 全槽最大);
+             世界跳计, 全槽最大, 稳定压计, 稳定接计);
         // v34：逐槽位世界坐标最大帧间位移（本窗口），单位是世界坐标。
         // 正常走位一帧几百；上一千说明读到的坐标在抖，跟原生头像就会错位。
         {
