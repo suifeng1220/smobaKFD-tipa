@@ -1693,7 +1693,6 @@ static int      锁槽 = -1;
 static int 扫调粗 = 0, 扫调细 = 0;
 static int 扫空帧 = 0;
 static float 扫屏宽 = 0.0f, 扫屏高 = 0.0f;
-static float 扫原宽 = 0.0f, 扫原高 = 0.0f;   // v43：调用者传进来的原始值，用于核对
 
 static bool 浮点可用(float f) {
     return isfinite(f) && fabsf(f) > 0.01f && fabsf(f) < 110000.0f;
@@ -1791,32 +1790,24 @@ static void 组长短名单() {
     }
 
     // ---- 组对：同一对象、同一解释、偏移差 +4 / +8 ----
-    // v43：① 内层改 j=i+1，原来 i/j 全遍历会重复组合；
-    //      ② 每对生成两种顺序（前=X后=Z 与 前=Z后=X）。我们并不知道 X 在低偏移还是高偏移，
-    //         v42 只试了「低偏移当 X」，如果实际是 Y,X 相邻（X 在高位），就永远配不出正确的一对。
-    //         两种都去投影，由投影结果决定，不靠假设。
     bool 满 = false;
     for (int o = 0; o < 扫对象数 && !满; ++o) {
         for (int i = 0; i < 短数[o] && !满; ++i) {
-            for (int j = i + 1; j < 短数[o]; ++j) {
+            for (int j = 0; j < 短数[o]; ++j) {
                 if (短类[o][i] != 短类[o][j]) continue;
                 int d = 短单[o][j] - 短单[o][i];
                 if (d != 4 && d != 8) continue;
                 int 倍 = (短类[o][i] == 1) ? 2 : 1;
-                for (int 向 = 0; 向 < 2; ++向) {
-                    for (int m = 0; m < 倍; ++m) {
-                        if (扫对数 >= 对上限) { 满 = true; break; }
-                        对统& p = 扫对[扫对数++];
-                        memset(&p, 0, sizeof(p));
-                        p.对象 = o;
-                        p.类 = 短类[o][i];
-                        p.倍率 = (短类[o][i] == 1 && m == 1) ? 0.001f : 1.0f;
-                        p.甲期 = (向 == 0) ? 短单[o][i] : 短单[o][j];
-                        p.乙期 = (向 == 0) ? 短单[o][j] : 短单[o][i];
-                    }
-                    if (满) break;
+                for (int m = 0; m < 倍; ++m) {
+                    if (扫对数 >= 对上限) { 满 = true; break; }
+                    对统& p = 扫对[扫对数++];
+                    memset(&p, 0, sizeof(p));
+                    p.对象 = o;
+                    p.类 = 短类[o][i];
+                    p.倍率 = (短类[o][i] == 1 && m == 1) ? 0.001f : 1.0f;
+                    p.甲期 = 短单[o][i];
+                    p.乙期 = 短单[o][j];
                 }
-                if (满) break;
             }
         }
     }
@@ -1867,9 +1858,7 @@ static void 输出扫描结果() {
         for (int i = 0; i < 扫对数; ++i) {
             if (用[i]) continue;
             对统& p = 扫对[i];
-            // v43：原来要求 p.帧数 严格等于 扫细计，只要某帧那个字落到界外被 continue 一次，
-            // 这个候选就永久出局 —— 真坐标偶尔越界（复活/传送瞬间）也会被误杀。放宽到一半。
-            if (p.帧数 < 扫细计 / 2 || p.帧数 == 0) continue;
+            if (p.帧数 < 扫细计 || p.帧数 == 0) continue;
             if (p.世变 < 2000) continue;
             double 内 = (double)p.屏内 / p.帧数;
             double 滑 = (double)p.屏平滑 / p.帧数;
@@ -1924,8 +1913,7 @@ static void 坐标自标定(int k, uint64_t 实体, const float* 矩阵, float �
         memset(扫对, 0, sizeof(扫对));
         扫对数 = 0; 扫粗计 = 0; 扫细计 = 0;
         扫调粗 = 0; 扫调细 = 0; 扫空帧 = 0;
-        扫屏宽 = fminf(宽, 高); 扫屏高 = fmaxf(宽, 高);   // v43：竖屏归一，宽取小边
-        扫原宽 = 宽; 扫原高 = 高;
+        扫屏宽 = 宽; 扫屏高 = 高;   // 与主流程 投影(..., 屏.x, 屏.y) 完全同源，不自作聪明
         扫键 = 实体;
         锁槽 = k;
         已试[k] = true;
@@ -1940,10 +1928,10 @@ static void 坐标自标定(int k, uint64_t 实体, const float* 矩阵, float �
         t = 扫对象址[2];
         扫对象址[3] = 链步(&t, 链.三) ? t : 0;
         扫阶段 = 1;
-        日志("自标定 锁定 k=%d 实体=%llx 一=%llx 二=%llx 三=%llx 活度=%d 屏=%.0fx%.0f 入=%.0fx%.0f 范围=0x%X",
+        日志("自标定 锁定 k=%d 实体=%llx 一=%llx 二=%llx 三=%llx 活度=%d 屏=%.0fx%.0f 范围=0x%X",
              k, (unsigned long long)扫对象址[0], (unsigned long long)扫对象址[1],
              (unsigned long long)扫对象址[2], (unsigned long long)扫对象址[3],
-             活度[k], 扫屏宽, 扫屏高, 扫原宽, 扫原高, 扫范围);
+             活度[k], 宽, 高, 扫范围);
         return;
     }
 
