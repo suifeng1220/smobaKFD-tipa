@@ -1610,117 +1610,286 @@ static void 稳定坐标(int k, unsigned* X, unsigned* Z) {
     稳定接计++;
 }
 
-// ==================== v39：实体内存坐标自标定扫描 ====================
-// v38 日志判决：
-//   ① 投票=1749/1 不是「三条链都读对」，而是 H5(0xa8,0x10,0x0,0x78) 与
-//      安卓(0xa8,0x10,0x0,0x60) 前三跳完全相同、只有最后一步不同，S44 的 0x268
-//      也解到同一处 —— 三条链必然同时读同一个对象，「多数票」是假象。
-//   ② 23:15:42 那一秒 4 个槽每帧在两点间严格交替：
-//        k1 (4026,3681)→(106,13719)→(357,13712)→(-6585,13970)→(3852,3459)
-//      两组各自还都平滑，说明每帧在两个「都在移动的对象」之间来回换，
-//      帧间 0.5~1.5 万单位 × 60fps = 每秒横跨四张地图，物理不可能。
-//      错误值占 50%，所以 9 帧中位数也吃不掉（中位数落在两簇中间 = 更糟）。
-// 结论：链读从根上就没有指向「这个英雄自己」。不再猜链，直接扫实体内存：
-//   找同时满足「长期在 ±110000 内」「不是常量」「帧间变化小（<3000）」的 4 字节 int，
-//   成对出现在相邻 8 字节上的，就是 X/Z。
-// 一次扫 4 个对象：实体本体 / +0xa8 / +0x10 / +0x0，每个 0~0x2000。
+// ==================== v40：坐标偏移自标定（两阶段 + 投影校验）====================
+// v39 的教训：只按「界内 + 会变 + 帧间平滑」筛单个 int，永远分不清「坐标」和
+//   计数器/计时器/血条/朝向角 —— 它们很多也满足界内、也会变、也很平滑。
+//   唯一有判别力的判据是：能不能画到屏幕上。真坐标投影后必然落在屏内、且连续。
+//
+// v37 的教训（为什么必须排除常量）：恒定垃圾值 (500,3213) 投影出来是一个固定点，
+//   屏内率 100%、屏平滑率 100%、屏最大跳 0 —— 在「稳定性」评分下是满分。
+//   所以粗筛阶段必须要求「确实在变」（变率 + 总变程），这一条就是给 v37 那个坑打的补丁。
+//
+// 阶段一（粗筛，300 次采样，每 2 帧一次）：4 个对象各扫 0~0x2000，
+//   逐 4 字节统计 界内率 / 变率 / 平滑率 / 最大帧间差 / 总变程。
+//   保留：界内≥85% 且 变率≥3% 且 平滑率≥80% 且 最大差≤6000 且 总变程≥1000。每对象最多 40 条。
+// 阶段二（配对校验，400 次采样）：短名单里偏移差 +4/+8 的组成 (X,Z) 对，
+//   每帧读一次、用当前相机矩阵投影，累计 投影成功 / 屏内 / 屏平滑 / 屏最大跳。
+//   打分 = 屏内率×2 + 屏平滑率 + 投影率×0.5 − 屏最大跳/屏宽，打印前 8 名。
+// 真坐标应当：屏内 100%、屏平滑 100%、屏最大跳 < 30px。
+static bool 投影(const float* m, int 世界X, int 世界Z, float* 屏X, float* 屏Y,
+                float 宽, float 高);
+
 #define 扫范围   0x2000
 #define 扫词数   (扫范围 / 4)
 #define 扫对象数 4
-#define 扫最多帧 400      // 每 3 帧采一次 → 400 次采样 ≈ 20 秒
+#define 扫粗帧   300
+#define 扫细帧   400
+#define 短上限   40
+#define 对上限   700
 
 struct 偏移统 {
     int 上值;
-    int 首值;
     int 帧数;
     int 界内;
+    int 变;
     int 小变;
     int 大跳;
-    int 恒定;
     int 最大差;
+    int 总变程;
+};
+
+struct 对统 {
+    int 对象;
+    int 甲期;      // X 的偏移
+    int 乙期;      // Z 的偏移
+    int 帧数;
+    int 投影成;
+    int 屏内;
+    int 屏平滑;
+    int 屏最大跳;
+    int 世变;      // 世界坐标累计变化量（排除常量对）
+    int 上屏X;
+    int 上屏Y;
+    int 上世X;
+    int 上世Z;
 };
 
 static 偏移统 扫统[扫对象数][扫词数];
+static 对统   扫对[对上限];
+static unsigned char 扫块[扫对象数][扫范围];
+static int    扫对数 = 0;
+static int    短单[扫对象数][短上限];
+static int    短数[扫对象数];
 static uint64_t 扫对象址[扫对象数] = {0, 0, 0, 0};
 static uint64_t 扫键 = 0;
-static int      扫帧 = 0;
-static bool     扫毕 = false;
+static int 扫粗计 = 0;
+static int 扫细计 = 0;
+static int 扫阶段 = 0;        // 0=未锁定 1=粗筛 2=配对校验 3=完成
+static int 稳槽 = -1, 稳连 = 0;
+static int 扫调粗 = 0, 扫调细 = 0;
+static int 扫空帧 = 0;        // 锁定实体连续缺席的帧数
+static float 扫屏宽 = 0.0f, 扫屏高 = 0.0f;
+
+static void 组长短名单() {
+    扫对数 = 0;
+    for (int o = 0; o < 扫对象数; ++o) {
+        短数[o] = 0;
+        if (!IsValidAddr(扫对象址[o])) continue;
+        for (int i = 0; i < 扫词数; ++i) {
+            偏移统& s = 扫统[o][i];
+            if (s.帧数 < 扫粗计) continue;
+            double 界 = (double)s.界内 / s.帧数;
+            double 变 = (double)s.变 / s.帧数;
+            double 滑 = (s.帧数 > 1) ? (double)s.小变 / (s.帧数 - 1) : 0.0;
+            if (界 < 0.85) continue;
+            if (变 < 0.03) continue;        // 排除常量（v37 的坑）
+            if (滑 < 0.80) continue;
+            if (s.最大差 > 6000) continue;
+            if (s.总变程 < 1000) continue;
+            if (短数[o] >= 短上限) break;
+            短单[o][短数[o]++] = i * 4;
+        }
+        日志("粗筛 对象%d 址=%llx 候选=%d", o, (unsigned long long)扫对象址[o], 短数[o]);
+    }
+
+    // 组对：偏移差 +4（X,Z 相邻，Y 在别处）或 +8（X,Y,Z 连续）
+    bool 满 = false;
+    for (int o = 0; o < 扫对象数 && !满; ++o) {
+        for (int i = 0; i < 短数[o] && !满; ++i) {
+            for (int j = 0; j < 短数[o]; ++j) {
+                int d = 短单[o][j] - 短单[o][i];
+                if (d != 4 && d != 8) continue;
+                if (扫对数 >= 对上限) { 满 = true; break; }
+                对统& p = 扫对[扫对数++];
+                memset(&p, 0, sizeof(p));
+                p.对象 = o; p.甲期 = 短单[o][i]; p.乙期 = 短单[o][j];
+            }
+        }
+    }
+    日志("配对 候选对数=%d", 扫对数);
+    // 一条候选都没有 = 这一轮英雄基本没动（站着不动，坐标不变，跟常量无法区分）。
+    // 不要把扫阶段推到 3（那样整局都不再试），退回去等下一次「连续 90 帧同实体」重来。
+    if (扫对数 == 0) {
+        static int 空轮 = 0;
+        空轮++;
+        日志("粗筛无候选 第%d轮（英雄未移动？）稍后重试", 空轮);
+        if (空轮 < 4) { 扫阶段 = 0; 稳连 = 0; 扫键 = 0; return; }
+    }
+
+    // 短名单明细，便于人工核对（每条带上最后一次读到的值）
+    for (int o = 0; o < 扫对象数; ++o) {
+        char 串[300] = {0};
+        int 位 = 0;
+        for (int i = 0; i < 短数[o] && 位 < 250; ++i) {
+            int idx = 短单[o][i] / 4;
+            位 += snprintf(串 + 位, sizeof(串) - 位, "+0x%X=%d ",
+                           短单[o][i], 扫统[o][idx].上值);
+        }
+        日志("短名单 对象%d %s", o, 串);
+    }
+}
 
 static void 输出扫描结果() {
-    日志("=== 坐标自标定 实体=%llx 帧=%d ===", (unsigned long long)扫键, 扫帧);
-    for (int o = 0; o < 扫对象数; ++o) {
-        日志("--- 对象%d 址=%llx ---", o, (unsigned long long)扫对象址[o]);
-        int 出 = 0;
-        for (int i = 0; i < 扫词数 && 出 < 30; ++i) {
-            偏移统& s = 扫统[o][i];
-            if (s.帧数 < 扫帧) continue;
-            double 界 = (double)s.界内 / s.帧数;
-            double 变 = (double)s.小变 / s.帧数;
-            double 跳 = (double)s.大跳 / s.帧数;
-            if (界 < 0.85) continue;          // 长期在界内
-            if (跳 > 0.08) continue;          // 不能有大跳
-            if (变 < 0.10) continue;          // 必须是会变的量（排除常量）
-            if (s.最大差 > 3000) continue;    // 帧间必须平滑
-            日志("候选 对象%d +0x%04X cur=%d 首=%d 界=%.0f 变=%.0f 跳=%.0f 最大差=%d",
-                 o, i * 4, s.上值, s.首值, 界 * 100, 变 * 100, 跳 * 100, s.最大差);
-            出++;
+    日志("=== 坐标自标定 实体=%llx 粗=%d 细=%d 对=%d ===",
+         (unsigned long long)扫键, 扫粗计, 扫细计, 扫对数);
+    bool 用[对上限];
+    memset(用, 0, sizeof(用));
+    int 出名 = 0;
+    for (int 名 = 1; 名 <= 8; ++名) {
+        int 最佳 = -1;
+        double 最高 = -1e9;
+        for (int i = 0; i < 扫对数; ++i) {
+            if (用[i]) continue;
+            对统& p = 扫对[i];
+            if (p.帧数 < 扫细计 || p.帧数 == 0) continue;
+            if (p.世变 < 2000) continue;          // 常量对直接淘汰
+            double 内 = (double)p.屏内 / p.帧数;
+            double 滑 = (double)p.屏平滑 / p.帧数;
+            double 投 = (double)p.投影成 / p.帧数;
+            double 分 = 内 * 2.0 + 滑 + 投 * 0.5 - (double)p.屏最大跳 / (扫屏宽 > 1 ? 扫屏宽 : 1);
+            if (分 > 最高) { 最高 = 分; 最佳 = i; }
         }
-        日志("对象%d 候选数=%d", o, 出);
+        if (最佳 < 0) break;
+        用[最佳] = true;
+        出名++;
+        对统& p = 扫对[最佳];
+        日志("配对%d 对象%d X=+0x%X(%d) Z=+0x%X(%d) 分=%.2f 投=%d/%d 屏内=%d/%d 屏滑=%d 屏最大跳=%d 世变=%d",
+             名, p.对象, p.甲期, p.上世X, p.乙期, p.上世Z, 最高,
+             p.投影成, p.帧数, p.屏内, p.帧数, p.屏平滑, p.屏最大跳, p.世变);
     }
+    if (出名 == 0)
+        日志("配对 无合格候选（世变<2000 或帧数不足）—— 下一版需要扩大扫描窗口或下钻子对象");
     日志("=== 坐标自标定结束 ===");
 }
 
-static void 坐标自标定(uint64_t 实体) {
-    if (扫毕 || 实体 == 0) return;
-    if (扫键 == 0) {
+static void 坐标自标定(int k, uint64_t 实体, const float* 矩阵, float 宽, float 高) {
+    if (扫阶段 >= 3 || 实体 == 0) return;
+
+    if (扫阶段 == 0) {
+        // 同一个槽连续 90 帧（约 1.5 秒）都是同一个实体，才认为锁到了真英雄，
+        // 避免锁到刚生成/刚复活的临时对象。
+        if (k == 稳槽) 稳连++;
+        else { 稳槽 = k; 稳连 = 1; }
+        if (稳连 < 90) return;
+
         memset(扫统, 0, sizeof(扫统));
+        memset(扫对, 0, sizeof(扫对));
+        扫对数 = 0; 扫粗计 = 0; 扫细计 = 0;
+        扫调粗 = 0; 扫调细 = 0; 扫空帧 = 0;
+        扫屏宽 = 宽; 扫屏高 = 高;
         扫键 = 实体;
-        扫帧 = 0;
-        const SDK::坐标链& 链 = SDK::坐标链表[0];        // H5：与安卓前 3 跳相同
+        for (int o = 0; o < 扫对象数; ++o) 扫对象址[o] = 0;
+
         扫对象址[0] = 实体;
+        const SDK::坐标链& 链 = SDK::坐标链表[0];        // H5：与安卓前 3 跳相同
         uint64_t t = 实体;
         扫对象址[1] = 链步(&t, 链.一) ? t : 0;
         t = 扫对象址[1];
         扫对象址[2] = 链步(&t, 链.二) ? t : 0;
         t = 扫对象址[2];
         扫对象址[3] = 链步(&t, 链.三) ? t : 0;
-        日志("坐标自标定 锁定实体=%llx 一=%llx 二=%llx 三=%llx",
-             (unsigned long long)扫对象址[0], (unsigned long long)扫对象址[1],
-             (unsigned long long)扫对象址[2], (unsigned long long)扫对象址[3]);
+        扫阶段 = 1;
+        日志("自标定 锁定 k=%d 实体=%llx 一=%llx 二=%llx 三=%llx 屏=%.0fx%.0f",
+             k, (unsigned long long)扫对象址[0], (unsigned long long)扫对象址[1],
+             (unsigned long long)扫对象址[2], (unsigned long long)扫对象址[3], 宽, 高);
+        return;
     }
-    if (扫键 != 实体) return;                  // 只看锁定的那一个
-    if (扫帧 >= 扫最多帧) { 输出扫描结果(); 扫毕 = true; return; }
 
-    // 每 3 帧扫一次：4 个对象 × 8KB 每帧扫会让 syscall 涨到 7680/s，掉帧。
-    // 采样率 20Hz 足够看出帧间平滑度。
-    static int 扫调计 = 0;
-    if (扫调计++ % 3 != 0) return;
-
-    for (int o = 0; o < 扫对象数; ++o) {
-        uint64_t 址 = 扫对象址[o];
-        if (!IsValidAddr(址)) continue;
-        unsigned char buf[扫范围];
-        if (!readMemory(址, buf, sizeof(buf))) continue;
-        for (int i = 0; i < 扫词数; ++i) {
-            int v = 0;
-            memcpy(&v, buf + i * 4, 4);
-            偏移统& s = 扫统[o][i];
-            if (s.帧数 == 0) {
-                s.首值 = v;
-            } else {
-                long long dd = (long long)v - (long long)s.上值;
-                if (dd < 0) dd = -dd;
-                if (dd == 0) s.恒定++;
-                else if (dd <= 4000) s.小变++;
-                else s.大跳++;
-                if ((int)dd > s.最大差) s.最大差 = (int)dd;
-            }
-            if (v > -110000 && v < 110000 && v != 0) s.界内++;
-            s.上值 = v;
-            s.帧数++;
+    if (实体 != 扫键) {
+        // 锁定的实体这一帧没出现（死亡/换槽）。超过 900 帧（约 15 秒）还没回来就重锁，
+        // 否则一旦锁到的人死了，整局扫描都不会再动。
+        if (++扫空帧 > 900) {
+            日志("自标定 目标丢失，重置");
+            扫阶段 = 0; 扫键 = 0; 稳连 = 0; 扫空帧 = 0;
         }
+        return;
     }
-    扫帧++;
+    扫空帧 = 0;
+
+    if (扫阶段 == 1) {
+        if (扫粗计 >= 扫粗帧) { 组长短名单(); if (扫阶段 == 1) 扫阶段 = 2; return; }
+        if ((扫调粗++ & 1) != 0) return;          // 每 2 帧采一次
+        for (int o = 0; o < 扫对象数; ++o) {
+            uint64_t 址 = 扫对象址[o];
+            if (!IsValidAddr(址)) continue;
+            if (!readMemory(址, 扫块[o], 扫范围)) continue;
+            for (int i = 0; i < 扫词数; ++i) {
+                int v = 0;
+                memcpy(&v, 扫块[o] + i * 4, 4);
+                偏移统& s = 扫统[o][i];
+                if (s.帧数 > 0) {
+                    long long dd = (long long)v - (long long)s.上值;
+                    if (dd < 0) dd = -dd;
+                    // v36 那个 unsigned 假跳的教训：差值可能是 42 亿，先夹住再转 int，
+                    // 否则 (int) 之后变负数，最大差/总变程全被污染。
+                    if (dd > 100000) dd = 100000;
+                    if (dd > 0) {
+                        s.变++;
+                        s.总变程 += (int)dd;
+                        if (dd <= 4000) s.小变++;
+                        else s.大跳++;
+                    }
+                    if ((int)dd > s.最大差) s.最大差 = (int)dd;
+                }
+                if (v > -110000 && v < 110000 && v != 0) s.界内++;
+                s.上值 = v;
+                s.帧数++;
+            }
+        }
+        扫粗计++;
+        return;
+    }
+
+    if (扫阶段 == 2) {
+        if (扫细计 >= 扫细帧) { 输出扫描结果(); 扫阶段 = 3; return; }
+        if ((扫调细++ & 1) != 0) return;
+
+        bool 有[扫对象数] = {false, false, false, false};
+        for (int o = 0; o < 扫对象数; ++o) {
+            uint64_t 址 = 扫对象址[o];
+            if (!IsValidAddr(址)) continue;
+            if (!readMemory(址, 扫块[o], 扫范围)) continue;
+            有[o] = true;
+        }
+        for (int i = 0; i < 扫对数; ++i) {
+            对统& p = 扫对[i];
+            if (!有[p.对象]) continue;
+            int x = 0, z = 0;
+            memcpy(&x, 扫块[p.对象] + p.甲期, 4);
+            memcpy(&z, 扫块[p.对象] + p.乙期, 4);
+            if (x <= -110000 || x >= 110000 || z <= -110000 || z >= 110000) continue;
+            float sx = 0.0f, sy = 0.0f;
+            if (!投影(矩阵, x, z, &sx, &sy, 扫屏宽, 扫屏高)) continue;
+            p.投影成++;
+            if (sx > -0.15f * 扫屏宽 && sx < 1.15f * 扫屏宽 &&
+                sy > -0.15f * 扫屏高 && sy < 1.15f * 扫屏高) p.屏内++;
+            if (p.帧数 > 0) {
+                double dx = (double)sx - (double)p.上屏X;
+                double dy = (double)sy - (double)p.上屏Y;
+                double d = sqrt(dx * dx + dy * dy);
+                if (d < 0.25 * (double)扫屏宽) p.屏平滑++;
+                if ((int)d > p.屏最大跳) p.屏最大跳 = (int)d;
+                long long wx = (long long)x - (long long)p.上世X;
+                long long wz = (long long)z - (long long)p.上世Z;
+                p.世变 += (int)(sqrt((double)(wx * wx + wz * wz)));
+            }
+            p.上屏X = (int)sx; p.上屏Y = (int)sy;
+            p.上世X = x; p.上世Z = z;
+            p.帧数++;
+        }
+        扫细计++;
+        return;
+    }
 }
 
 // ==================== v39：锁定实体逐帧坐标序列 ====================
@@ -2617,7 +2786,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v39 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v40 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -3027,8 +3196,8 @@ void Draw::StartBooks() {
 
         if (阵营 == (int)我方阵营) continue;
 
-        // v39：坐标自标定（只跑一次，锁第一个敌方实体，扫 20 秒）
-        坐标自标定(实体);
+        // v40：坐标偏移自标定（只跑一次：粗筛 300 采样 → 配对投影校验 400 采样）
+        坐标自标定(k, 实体, 矩阵, 屏.x, 屏.y);
 
         int 血当前 = 读血量当前(实体);
         int 血上限 = 读血量上限(实体);
