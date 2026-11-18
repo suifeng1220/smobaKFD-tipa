@@ -1299,6 +1299,7 @@ static void 链打分(uint64_t 数组, int 数量) {
 
 static const char* 链名(int i) {
     if (i == 4) return "二";
+    if (i == 5) return "二A";
     if (i == 3) return "本体";
     if (i < 0 || i >= 3) return "-";
     return SDK::坐标链表[i].名字;
@@ -1408,22 +1409,52 @@ static int 三链投票(uint64_t 实体, unsigned* X, unsigned* Z) {
 //   不是相邻的 8 字节对），避免分两次读拼出半新半旧的坐标。
 static int 用二计 = 0, 二失败计 = 0, 二链不符计 = 0;
 
+// ==================== v48：二 对象的四份读数（一次读 40 字节）====================
+// 二 对象里有两组坐标副本，v43 实测在人机局两两相等：
+//   组A = +0x2C(X) / +0x34(Z)     组B = +0x44(X) / +0x4C(Z)
+// v47 实测联机局会出现「同一槽在两值间交替」（稳压涨、瞬移不涨），
+// 所以必须能把四份值同时打出来，判别交替是「同一字段双缓冲」还是「两组字段不同步」。
+// 从 二+0x28 一次读 40 字节（到 +0x50），四份值同帧同源，不会拼出半新半旧。
+typedef struct { int A, B, C, D; bool 有; } 二十四;
+
+static 二十四 读二四(uint64_t 二) {
+    二十四 r; r.A = r.B = r.C = r.D = 0; r.有 = false;
+    if (!IsValidAddr(二)) return r;
+    unsigned char 快照[40];
+    if (!readMemory(二 + 0x28, 快照, sizeof(快照))) return r;
+    memcpy(&r.A, 快照 + 0x04, 4);   // 二 + 0x2C
+    memcpy(&r.B, 快照 + 0x0C, 4);   // 二 + 0x34
+    memcpy(&r.C, 快照 + 0x1C, 4);   // 二 + 0x44
+    memcpy(&r.D, 快照 + 0x24, 4);   // 二 + 0x4C
+    r.有 = true;
+    return r;
+}
+
+static bool 组可用(int x, int z) {
+    if (!坐标在界内(x) || !坐标在界内(z)) return false;
+    if (x == 0 && z == 0) return false;      // 未初始化
+    return true;
+}
+
+// 兼容旧调用（我方自检）：优先组B（v46 验证过的偏移），不行用组A
 static int 读英雄坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
     if (!IsValidAddr(实体)) return 0;
     const uint64_t 一 = vm_read<uint64_t>(实体 + 0xa8);
     if (!IsValidAddr(一)) return 0;
     const uint64_t 二 = vm_read<uint64_t>(一 + 0x10);
     if (!IsValidAddr(二)) return 0;
-    unsigned char 快照[16];
-    if (!readMemory(二 + 0x44, 快照, sizeof(快照))) return 0;
-    int x = 0, z = 0;
-    memcpy(&x, 快照, 4);        // 二 + 0x44
-    memcpy(&z, 快照 + 8, 4);    // 二 + 0x4C
-    if (!坐标在界内(x) || !坐标在界内(z)) return 0;
-    if (x == 0 && z == 0) return 0;          // 未初始化
-    *X = (unsigned)x; *Z = (unsigned)z;
-    return 1;
+    二十四 r = 读二四(二);
+    if (!r.有) return 0;
+    if (组可用(r.C, r.D)) { *X = (unsigned)r.C; *Z = (unsigned)r.D; return 1; }
+    if (组可用(r.A, r.B)) { *X = (unsigned)r.A; *Z = (unsigned)r.B; return 1; }
+    return 0;
 }
+
+// v48 槽级状态：单源锁定
+//   槽组 0 = 还没定（首次两组合法时按组B优先），1 = 锁组A，2 = 锁组B
+//   槽锁 = 该槽已经成功用二读出过坐标，从此不再退回链读（消除两源交替）
+static int      槽组[24] = {0};
+static bool     槽锁[24] = {false};
 
 // 读实体坐标：返回 0..2 = 采用的链号，3 = 本体直读，4 = 二+0x44（v46 主路径），-1 = 读不到
 static unsigned 上次直X = 0, 上次直Z = 0;
@@ -1434,23 +1465,48 @@ static int 读实体坐标(int k, uint64_t 实体, unsigned* X, unsigned* Z) {
     bool 直有 = 直接读坐标(实体, &dx, &dz) != 0;
     上次直X = dx; 上次直Z = dz; 上次直有 = 直有;
 
-    // v46 主路径：二 + 0x44 / + 0x4C。读不到才退回链读，保证画面上不会因为一次脏读掉框。
-    unsigned bx = 0, bz = 0;
-    if (读英雄坐标(实体, &bx, &bz)) {
-        用二计++;
-        if (k >= 0 && k < 24) {
-            // 与链读做同帧对照，只记差异，不参与输出（链读是 v45 之前的主路径，留作回归证据）
-            unsigned kx = 0, kz = 0;
-            if (读坐标某链(实体, SDK::坐标链表[1], &kx, &kz)) {
-                double gx = (double)(int)bx - (double)(int)kx;
-                double gz = (double)(int)bz - (double)(int)kz;
-                if (gx * gx + gz * gz > 5000.0 * 5000.0) 二链不符计++;
-            }
-        }
-        *X = bx; *Z = bz;
-        return 4;
+    // ---- v48 主路径：二 对象，单源锁定 ----
+    uint64_t 二 = 0;
+    if (IsValidAddr(实体)) {
+        const uint64_t 一 = vm_read<uint64_t>(实体 + 0xa8);
+        if (IsValidAddr(一)) 二 = vm_read<uint64_t>(一 + 0x10);
     }
-    if (k >= 0 && k < 24) 二失败计++;
+    if (IsValidAddr(二)) {
+        const 二十四 r = 读二四(二);
+        const bool okA = r.有 && 组可用(r.A, r.B);
+        const bool okB = r.有 && 组可用(r.C, r.D);
+        const bool 是槽 = (k >= 0 && k < 24);
+
+        int 用 = -1;                       // 0 = 组A(+0x2C)，1 = 组B(+0x44)
+        if (是槽 && 槽组[k] == 1 && okA) 用 = 0;
+        else if (是槽 && 槽组[k] == 2 && okB) 用 = 1;
+        if (用 < 0) {                      // 还没定，或锁定组当帧越界 → 兜底
+            if (okB) 用 = 1;
+            else if (okA) 用 = 0;
+            if (用 >= 0 && 是槽 && 槽组[k] == 0) 槽组[k] = 用 + 1;
+        }
+        if (用 >= 0) {
+            用二计++;
+            if (是槽) 槽锁[k] = true;
+            *X = (unsigned)(用 == 0 ? r.A : r.C);
+            *Z = (unsigned)(用 == 0 ? r.B : r.D);
+            if (二链不符计 < 200000 && 是槽) {
+                unsigned kx = 0, kz = 0;
+                if (读坐标某链(实体, SDK::坐标链表[1], &kx, &kz)) {
+                    double gx = (double)(int)*X - (double)(int)kx;
+                    double gz = (double)(int)*Z - (double)(int)kz;
+                    if (gx * gx + gz * gz > 5000.0 * 5000.0) 二链不符计++;
+                }
+            }
+            return (用 == 0) ? 5 : 4;
+        }
+    }
+    if (k >= 0 && k < 24) {
+        二失败计++;
+        // v48 关键修复：已经锁定单源的槽，这一帧读不到就不画（返回 -1），
+        // 绝不退回链读 —— 同一个槽在两套数据源之间交替，正是「前后跳」的来源。
+        if (槽锁[k]) return -1;
+    }
 
     if (k < 0 || k >= 24) {              // 非槽位调用（标定取样）：直读优先
         if (直有) { *X = dx; *Z = dz; return 3; }
@@ -2268,7 +2324,7 @@ static void 我方自检(uint64_t 数组, int 数量, const float* 矩阵, float
 // 另加一条对照：野怪用 +0x2B8 读出来一直是真坐标（v24 起用小地图 20 点标定过），
 //   把野怪的 0x2B8 与 野怪的二+0x44 并排打出来，就能判断 +0x44 到底是不是位置字段。
 static int 轨迹帧 = 0, 轨迹计 = 0;
-static void 指针轨迹(uint64_t 数组, int 数量) {
+static void __attribute__((unused)) 指针轨迹(uint64_t 数组, int 数量) {
     if (轨迹计 >= 400) return;
     if (++轨迹帧 < 6) return;               // 约 10Hz
     轨迹帧 = 0;
@@ -2289,7 +2345,7 @@ static void 指针轨迹(uint64_t 数组, int 数量) {
 }
 
 static int 对照帧 = 0, 对照计 = 0;
-static void 野怪对照(void) {
+static void __attribute__((unused)) 野怪对照(void) {
     if (对照计 >= 12) return;
     if (++对照帧 < 20) return;
     对照帧 = 0;
@@ -2321,6 +2377,45 @@ static void 野怪对照(void) {
         位 += snprintf(串 + 位, sizeof(串) - 位, "[%d]2B8(%d,%d)二44(%d,%d) ", i, x, z, bx, bz);
     }
     日志("野怪对照 第%d次 %s", 对照计, 串);
+}
+
+// ==================== v48：跳变帧四份读数 + 整局快照 ====================
+// v47 的 400 行上限只覆盖了开局 5 秒，恰好错过了「跳」爆发的时段（07:50:30 之后）。
+// 这两个探针改成「按事件打 + 定期快照 + 上限拉高」，覆盖整局：
+//   跳四值：每次世界跳变（>3000）打一行，把 二 的四份值同帧列出，
+//           看交替的两组数是「同一字段双缓冲」还是「组A/组B 不同步」。
+//   整局快照：每 5 秒打 10 槽的 阵/组A/组B，用来确认哪一组在连续变化。
+static int 跳探计 = 0;
+static void 跳变四值(int k, uint64_t 实体, unsigned 原X, unsigned 原Z, double 距) {
+    if (跳探计 >= 240) return;
+    if (k < 0 || k >= 24) return;
+    uint64_t 一 = vm_read<uint64_t>(实体 + 0xa8);
+    uint64_t 二 = IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0;
+    const 二十四 r = 读二四(二);
+    跳探计++;
+    日志("跳四值 k=%d 阵=%d 距%.0f 用(%d,%d) 组A(%d,%d) 组B(%d,%d) 锁组=%d 锁源=%d 二=%llx",
+         k, vm_read<int>(实体 + 52), 距, (int)原X, (int)原Z,
+         r.A, r.B, r.C, r.D, 槽组[k], 槽锁[k] ? 1 : 0, (unsigned long long)二);
+}
+
+static int 快照帧 = 0, 快照计 = 0;
+static void 整局快照(uint64_t 数组, int 数量) {
+    if (快照计 >= 900) return;
+    if (++快照帧 < 300) return;               // 约 5 秒一次
+    快照帧 = 0;
+    ++快照计;
+    char 串[900] = {0};
+    int 位 = 0;
+    for (int k = 0; k < 数量 && k < 12 && 位 < 820; ++k) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (!IsValidAddr(e)) continue;
+        uint64_t 一 = vm_read<uint64_t>(e + 0xa8);
+        uint64_t 二 = IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0;
+        const 二十四 r = 读二四(二);
+        位 += snprintf(串 + 位, sizeof(串) - 位, "k%d/阵%d/%d,%d|%d,%d ", k,
+                       vm_read<int>(e + 52), r.A, r.B, r.C, r.D);
+    }
+    日志("快照 %d n=%d %s", 快照计, 数量, 串);
 }
 
 // ==================== v39：锁定实体逐帧坐标序列 ====================
@@ -3217,7 +3312,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v47 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v48 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -3410,9 +3505,9 @@ void Draw::StartBooks() {
     全槽对比(数组, 数量, 矩阵, 屏.x, 屏.y);
     // v46：我方英雄自检（相机跟人走 = 免费真值，用来判定 二+0x44 是否真的可用）
     我方自检(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
-    // v47：两跳指针轨迹（看 二 是否在换地址）+ 野怪已知真值对照（看 +0x44 是否位置字段）
-    指针轨迹(数组, 数量);
-    野怪对照();
+    // v48：整局快照（每 5 秒 10 槽 阵/组A/组B）。v47 的两跳轨迹 400 行已打满、
+    // 只覆盖开局 5 秒、且恰好错过抖动时段，停用；野怪对照每次都「根无效」，也停用。
+    整局快照(数组, 数量);
 
     for (int k = 0; k < 数量 && k < 24; ++k) {
         uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * k);
@@ -3679,12 +3774,21 @@ void Draw::StartBooks() {
                              k, (int)槽世X[k], (int)槽世Z[k],
                              (int)原X, (int)原Z, 距, 链名(链));
                     if (世界跳计 <= 8) 记链中间(k, 实体);
+                    跳变四值(k, 实体, 原X, 原Z, 距);   // v48：同帧四份读数
                 }
                 // v38：滤波输出后的帧间位移（真正画到屏幕上的量）
                 long long ox = (long long)(int)样X - (long long)(int)槽出X[k];
                 long long oz = (long long)(int)样Z - (long long)(int)槽出Z[k];
                 double 出距 = sqrt((double)ox * ox + (double)oz * oz);
                 if (出距 > 槽出最大跳[k]) 槽出最大跳[k] = 出距;
+            }
+            // v48：槽位换了实体就重置单源锁 —— 新实体重新评估用组A还是组B，
+            // 但不允许「同一个实体在两套源之间来回切」（那正是跳的来源）。
+            if (槽世键[k] != 0 && 槽世键[k] != 实体) {
+                槽锁[k] = false;
+                槽组[k] = 0;
+                槽稳有[k] = false;       // 顺带清掉 v39 门控的旧基准，避免新实体被旧位置压住
+                离群连[k] = 0;
             }
             槽世键[k] = 实体; 槽世X[k] = 原X; 槽世Z[k] = 原Z;
             槽出X[k] = 样X; 槽出Z[k] = 样Z;
