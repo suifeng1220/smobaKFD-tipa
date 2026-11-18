@@ -25,10 +25,6 @@ extern "C" {
 #endif
 void KernelLoggerSetHandler(void (^handler)(NSString *line));
 void KernelLogLine(const char *line);
-// v29：任务端口自检（1=就绪 0=有进程但拿不到端口 -1=没找到游戏）
-// 替代 [DOJailbreaker run] —— 后者是 Dopamine 内核 exploit，在已打补丁/已越狱的内核上
-// 重复执行会 panic 重启。
-int SLK初始化任务端口(void);
 #ifdef __cplusplus
 }
 #endif
@@ -2534,12 +2530,8 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
         [s->_terminal appendLog:[NSString stringWithFormat:@"开始初始化 · 校验 %d 项偏移", SDK::偏移项数]];
 
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            // v29：不再调用 [DOJailbreaker run]。改用任务端口自检：
-            // task_for_pid 拿到端口就够用了（HUD 的数据本来就全走 vm_read_overwrite），
-            // 全程用户态，不会碰内核原语。
-            const int r = SLK初始化任务端口();
-            if (r == 1) ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess = YES;
-            const BOOL ok = (r == 1);
+            [DOJailbreaker.sharedInstance run];
+            BOOL ok = ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess;
             dispatch_async(dispatch_get_main_queue(), ^{
                 __strong typeof(weakSelf) strong = weakSelf;
                 if (!strong) return;
@@ -2550,19 +2542,13 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
                 [strong->_heroCard setStatusText:(ok ? @"内核已就绪" : @"内核未加载")
                                              sub:SLK_偏移摘要(ok)
                                             live:ok];
-                if (r == 1) {
-                    [strong->_terminal appendLog:@"初始化成功 · 任务端口就绪（未执行内核 exploit）"];
-                } else if (r == 0) {
-                    [strong->_terminal appendLog:@"初始化失败 · task_for_pid 被拒（签名缺 platform-application）"];
-                } else {
-                    [strong->_terminal appendLog:@"初始化失败 · 没找到游戏进程，先进对局再点"];
-                }
+                [strong->_terminal appendLog:(ok ? @"内核初始化成功 · 已就绪" : @"内核初始化失败")];
                 if (ok) {
                     [SLKDoneAlert showIn:strong.view];
                     UINotificationFeedbackGenerator *g = [[UINotificationFeedbackGenerator alloc] init];
                     [g notificationOccurred:UINotificationFeedbackTypeSuccess];
                 } else {
-                    [strong slk_showToast:(r == -1 ? @"请先进入对局" : @"端口自检失败，请重试")];
+                    [strong slk_showToast:@"初始化失败，请重试"];
                 }
             });
         });

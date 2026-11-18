@@ -33,13 +33,6 @@ void KernelLogLine(const char *line);
 // 于是所有开关都表现为"点了没反应"。
 // 现在面板和绘制层同进程直连（改内存变量 + NSUserDefaults 持久化），文件只当旧配置兼容。
 extern "C" {
-    // v30 点按回城：HID 回调把每一次"按下"喂进来，只旁听
-    void  SLK回城点按(float x, float y, int 阶段, int 手指数);
-    void  SLK回城标定开始(void);
-    int   SLK回城标定在(void);
-    float SLK回城半径(void);
-    void  SLK设回城半径(float r);
-
     void  SLCfg写开关(const char* 键, bool 值);
     void  SLCfg写数值(const char* 键, float 值);
     bool  SLCfg读开关(const char* 键);
@@ -140,7 +133,7 @@ static UIColor *SL色(CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
 
 static const CGFloat SL球直径  = 56.0f;
 static const CGFloat SL面板宽  = 496.0f;
-static const CGFloat SL面板高  = 524.0f;   // v30：页3 再加「回城提示」卡（标定 + 半径），430 装不下
+static const CGFloat SL面板高  = 430.0f;   // 微调页加位置XY后需要更高
 static const CGFloat SL顶栏高  = 46.0f;
 static const CGFloat SL侧栏宽  = 96.0f;
 static const CGFloat SL行高    = 32.0f;
@@ -1067,7 +1060,6 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
     SL确保开关(@"mappos_on", NO);
     SL确保开关(@"skillpos_on", 已有配置[@"skillX"] != nil || 已有配置[@"skillY"] != nil);
     SL确保开关(@"monsteroff_on", NO);
-    SL确保开关(@"recalltap", YES);     // v30 点按回城默认开
 
     const CGFloat 首行 = 20.0f;
     const CGFloat 行距 = 23.0f;
@@ -1144,26 +1136,6 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
         if (!SL读开关(@"skillpos_on")) SL写开关(@"skillpos_on", YES);
     };
     [self 加控件:CD_y 卡片:卡C 第几行:2 页:3 行高:行距 首行:首行];
-
-    // ---- 回城提示（v30）：点一下回城按钮就提示，不读游戏内存 ----
-    // 之前四个版本都在扫内存找 8 秒读条（v25 浮点 / v26 慢变 / v27 倒数 / v28 子链），
-    // 全部 0 命中；dump.cs 事后证明战斗实体是原生 C++，不在 C# 层。
-    // 现在换成确定性信号：标定一次回城按钮位置，之后手指一按就亮横幅。
-    CGFloat 卡Dy = 卡Cy + 卡C高 + 6.0f;
-    CGFloat 卡D高 = 首行 + 行距 * 3.0f + 4.0f;
-    UIView *卡D = [self 加卡片:@"回城提示" y:卡Dy 高:卡D高 页:3];
-    [self 加控件:[[SL开关行 alloc] initWithTitle:@"按下即提示" key:@"recalltap"]
-          卡片:卡D 第几行:0 页:3 行高:行距 首行:首行];
-    SL按钮行 *标定 = [[SL按钮行 alloc] initWithTitle:@"回城按钮位置" 按钮:@"标定"];
-    标定.点按回调 = ^(SL控件 *控件, CGPoint 点) {
-        SLK回城标定开始();
-        SL日志(@"回城: 进入标定，请去点游戏里的回城按钮");
-    };
-    [self 加控件:标定 卡片:卡D 第几行:1 页:3 行高:行距 首行:首行];
-    SL滑条行 *半径 = [[SL滑条行 alloc] initWithTitle:@"热区半径" key:@"recalltapR"
-                                               最小:20.0f 最大:120.0f 缺省:64.0f 格式:@"%.0f"];
-    半径.值变更回调 = ^(float 值) { SLK设回城半径(值); };
-    [self 加控件:半径 卡片:卡D 第几行:2 页:3 行高:行距 首行:首行];
 }
 
 - (void)更新直播提示:(BOOL)开 {
@@ -1900,10 +1872,6 @@ extern "C" {
 #endif
 
 bool SLBall触摸(float x, float y, int 阶段, int 路径数) {
-    // v30：先"旁听"这一下触摸（回城按钮热区判定）。它只读坐标、不返回任何东西，
-    // 所以后面所有分发逻辑完全不受影响。
-    SLK回城点按(x, y, 阶段, 路径数);
-
     SLBall *球 = [SLBall share];
     CGPoint 点 = CGPointMake(x, y);
     if ([NSThread isMainThread]) {
