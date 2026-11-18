@@ -140,7 +140,7 @@ static UIColor *SL色(CGFloat r, CGFloat g, CGFloat b, CGFloat a) {
 
 static const CGFloat SL球直径  = 56.0f;
 static const CGFloat SL面板宽  = 496.0f;
-static const CGFloat SL面板高  = 524.0f;   // v30：页3 再加「回城提示」卡（标定 + 半径），430 装不下
+static const CGFloat SL面板高  = 548.0f;   // v31：页3 卡D 加「实体普查」行，524 → 548
 static const CGFloat SL顶栏高  = 46.0f;
 static const CGFloat SL侧栏宽  = 96.0f;
 static const CGFloat SL行高    = 32.0f;
@@ -1068,6 +1068,7 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
     SL确保开关(@"skillpos_on", 已有配置[@"skillX"] != nil || 已有配置[@"skillY"] != nil);
     SL确保开关(@"monsteroff_on", NO);
     SL确保开关(@"recalltap", YES);     // v30 点按回城默认开
+    SL确保开关(@"probe", YES);         // v31 实体普查默认开（第一局就要出日志）
 
     const CGFloat 首行 = 20.0f;
     const CGFloat 行距 = 23.0f;
@@ -1150,7 +1151,7 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
     // 全部 0 命中；dump.cs 事后证明战斗实体是原生 C++，不在 C# 层。
     // 现在换成确定性信号：标定一次回城按钮位置，之后手指一按就亮横幅。
     CGFloat 卡Dy = 卡Cy + 卡C高 + 6.0f;
-    CGFloat 卡D高 = 首行 + 行距 * 3.0f + 4.0f;
+    CGFloat 卡D高 = 首行 + 行距 * 4.0f + 4.0f;
     UIView *卡D = [self 加卡片:@"回城提示" y:卡Dy 高:卡D高 页:3];
     [self 加控件:[[SL开关行 alloc] initWithTitle:@"按下即提示" key:@"recalltap"]
           卡片:卡D 第几行:0 页:3 行高:行距 首行:首行];
@@ -1164,6 +1165,11 @@ typedef void (^SL控件回调)(SL控件 *控件, CGPoint 局部点);
                                                最小:20.0f 最大:120.0f 缺省:64.0f 格式:@"%.0f"];
     半径.值变更回调 = ^(float 值) { SLK设回城半径(值); };
     [self 加控件:半径 卡片:卡D 第几行:2 页:3 行高:行距 首行:首行];
+
+    // v31：实体普查。打开后每 3 秒往日志打一次「这局客户端有几个 actor、
+    // 敌方 5 个的坐标在不在」。这是判断「迷雾里的敌人到底有没有下发」的唯一硬办法。
+    [self 加控件:[[SL开关行 alloc] initWithTitle:@"实体普查" key:@"probe"]
+          卡片:卡D 第几行:3 页:3 行高:行距 首行:首行];
 }
 
 - (void)更新直播提示:(BOOL)开 {
