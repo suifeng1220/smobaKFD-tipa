@@ -115,10 +115,6 @@ static bool  cfg_recalltap = true;         // 点按回城提示总开关（默�
 static float cfg_recalltapX = 0.0f;        // 回城按钮中心 X（逻辑点；0 = 还没标定）
 static float cfg_recalltapY = 0.0f;        // 回城按钮中心 Y
 static float cfg_recalltapR = 64.0f;       // 热区半径（默认给宽一点，宁大勿小：宁可偶尔误报也别点了没反应）
-
-// v31 实体普查：把「这一局客户端到底有几个 actor」打出来。
-// 这是唯一能证明「迷雾里的敌人在不在内存里」的办法 —— 猜没有意义，数一遍就有了。
-static bool  cfg_probe = true;
 static double 回城按下时刻 = 0.0;          // CACurrentMediaTime()；0 = 当前不在回城
 static bool   回城标定中 = false;          // 面板点了"标定"后，下一次按下即写入热区
 static const double 回城读条秒 = 8.0;      // 王者回城读条 8 秒
@@ -161,7 +157,6 @@ static SL键项 键表[] = {
     { "recalltapX",      &cfg_recalltapX,      true  },
     { "recalltapY",      &cfg_recalltapY,      true  },
     { "recalltapR",      &cfg_recalltapR,      true  },
-    { "probe",           &cfg_probe,           false },
     { "mapalign",        &cfg_mapalign,        false },
     { "camprobe",        &cfg_camprobe,        false },
     { "mapsize_on",      &cfg_mapsize_on,      false },
@@ -762,11 +757,6 @@ static void 读配置() {
     cfg_monsteroff_on = 读布尔(cfg, @"monsteroff_on");
     cfg_mapalign = 读布尔(cfg, @"mapalign");
     cfg_recall = 读布尔(cfg, @"recall");
-    {
-        // 普查默认开：plist 里没这个键时也要跑，否则第一次装机永远不出日志。
-        id v = [cfg objectForKey:@"probe"];
-        cfg_probe = v ? [v boolValue] : true;
-    }
     cfg_camprobe = 读布尔(cfg, @"camprobe");
     cfg_monsterOffX   = 读浮点(cfg, @"monsterOffX", 0.0f);
     cfg_monsterOffY   = 读浮点(cfg, @"monsterOffY", 0.0f);
@@ -1409,56 +1399,6 @@ static int 读回城来源(uint64_t 实体) {
     // 最外层兜底：实体+360 本身就是状态字（指针低 32 位不可能恰好等于 1，误报可忽略）
     if (vm_read<int>(实体 + SDK::回城对象) == 1) return 2;
     return 0;
-}
-
-// ==================== v31 实体普查 ====================
-// 只回答一个问题：这一局客户端手里到底有几个 actor，敌人的坐标在不在里面。
-// dump 里的证据是双向的：
-//   NtfSetActorVisible = 929、Event_ActorVisibleToHostPlayerChange = 26、
-//   ActorVisibleEventParam { visible, meshVisible } —— 「可见性」是 actor 上的属性，
-//   说明对象本身是存在的（不然不需要 meshVisible 这种细分）；
-//   但 MOBA 也完全可能在服务器侧直接裁掉视野外单位。
-// 谁赢不能靠猜，数一遍就知道：
-//   汇总里 阵1≈5 且 阵2≈5、敌方 5 个坐标都在   → 全量下发，敌方回城可做
-//   敌方只有 1~2 个、其余读不到坐标           → 服务器裁剪，敌方回城只能看小地图
-static double 上次普查 = 0.0;
-
-static void 实体普查(uint64_t 数组, int 数量, int 我方阵营) {
-    const double 现时 = CACurrentMediaTime();
-    if (现时 - 上次普查 < 3.0) return;
-    上次普查 = 现时;
-
-    int 阵计数[8] = {0};
-    int 好 = 0, 有坐标 = 0, 打我方 = 0, 打敌方 = 0;
-    const int 总 = 数量 > 60 ? 60 : 数量;
-    日志("普查 n=%d 我阵=%d", 数量, 我方阵营);
-
-    for (int k = 0; k < 总; ++k) {
-        uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * k);
-        if (!IsValidAddr(实体)) continue;
-        ++好;
-
-        const int 阵 = vm_read<int>(实体 + 52);
-        if (阵 >= 0 && 阵 <= 7) 阵计数[阵]++;
-
-        unsigned X = 0, Z = 0;
-        const int 链 = 读实体坐标(实体, &X, &Z);
-        const bool 坐标好 = (链 >= 0 && X != 1000000);
-        if (坐标好) ++有坐标;
-        if (!坐标好) continue;
-
-        const int hp = 读血量当前(实体), 上 = 读血量上限(实体);
-        const long long id = vm_read<long long>(实体 + 40);
-        if (阵 == 我方阵营) {
-            if (打我方++ < 6)
-                日志("  我[%02d] 阵=%d id=%lld hp=%d/%d 坐标=%d,%d", k, 阵, id, hp, 上, (int)X, (int)Z);
-        } else {
-            if (打敌方++ < 6)
-                日志("  敌[%02d] 阵=%d id=%lld hp=%d/%d 坐标=%d,%d", k, 阵, id, hp, 上, (int)X, (int)Z);
-        }
-    }
-    日志("普查 汇总 有效=%d 有坐标=%d 阵0=%d 阵1=%d 阵2=%d 阵3=%d",
-         好, 有坐标, 阵计数[0], 阵计数[1], 阵计数[2], 阵计数[3]);
 }
 
 // ==================== v28 倒数扫描 ====================
@@ -2280,7 +2220,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v31 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v30 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -2361,8 +2301,6 @@ void Draw::StartBooks() {
     } else {
         我方阵营 = 矩阵[0] <= 0.0f ? 2 : 1;
     }
-
-    if (cfg_probe) 实体普查(数组, 数量, (int)我方阵营);
 
     if (!cfg_draw) return;
 
