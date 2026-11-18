@@ -1627,7 +1627,7 @@ static void 稳定坐标(int k, unsigned* X, unsigned* Z) {
 #define 扫范围   0x2000
 #define 扫词数   (扫范围 / 4)
 #define 扫对象数 4
-#define 扫最多帧 1200
+#define 扫最多帧 400      // 每 3 帧采一次 → 400 次采样 ≈ 20 秒
 
 struct 偏移统 {
     int 上值;
@@ -1690,6 +1690,11 @@ static void 坐标自标定(uint64_t 实体) {
     }
     if (扫键 != 实体) return;                  // 只看锁定的那一个
     if (扫帧 >= 扫最多帧) { 输出扫描结果(); 扫毕 = true; return; }
+
+    // 每 3 帧扫一次：4 个对象 × 8KB 每帧扫会让 syscall 涨到 7680/s，掉帧。
+    // 采样率 20Hz 足够看出帧间平滑度。
+    static int 扫调计 = 0;
+    if (扫调计++ % 3 != 0) return;
 
     for (int o = 0; o < 扫对象数; ++o) {
         uint64_t 址 = 扫对象址[o];
