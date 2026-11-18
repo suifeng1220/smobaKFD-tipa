@@ -1210,17 +1210,27 @@ static bool 链步(uint64_t* p, uint64_t off) {
 }
 
 // 读坐标值：int 直读，或 float×1000 兜底
+// ===== v35：一次快照读，修「头像闪过来闪过去」=====
+// 旧写法是 X、Z 各来一次 vm_read（两次独立的 vm_read_overwrite 系统调用）。
+// 两次之间隔着几十微秒到几百微秒，游戏正好在这中间更新了实体坐标，
+// 就会读到「新的 X + 旧的 Z」——一个根本不存在的点。英雄斜着走的时候，
+// 这个点和真实点正好在对角线上，于是头像就在两点之间来回跳，就是「闪过来闪过去」。
+// 一次读 12 字节（X@0、Z@8），保证 X 和 Z 来自同一帧快照。
 static bool 读坐标值(uint64_t 坐标址, unsigned* X, unsigned* Z) {
     if (!IsValidAddr(坐标址)) return false;
-    int ix = vm_read<int>(坐标址);
-    int iz = vm_read<int>(坐标址 + 8);
+    unsigned char 快照[12];
+    if (!readMemory(坐标址, 快照, sizeof(快照))) return false;
+    int ix = 0, iz = 0;
+    memcpy(&ix, 快照, 4);
+    memcpy(&iz, 快照 + 8, 4);
     if (坐标合理(ix) && 坐标合理(iz) && (ix || iz)) {
         *X = (unsigned)ix;
         *Z = (unsigned)iz;
         return true;
     }
-    float fx = vm_read<float>(坐标址);
-    float fz = vm_read<float>(坐标址 + 8);
+    float fx = 0.0f, fz = 0.0f;
+    memcpy(&fx, 快照, 4);
+    memcpy(&fz, 快照 + 8, 4);
     if (isfinite(fx) && isfinite(fz) && fx > -400.0f && fx < 400.0f && fz > -400.0f && fz < 400.0f
         && (fabsf(fx) > 0.001f || fabsf(fz) > 0.001f)) {
         *X = (unsigned)(int)(fx * 1000.0f);
@@ -2286,7 +2296,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v34 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v35 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
