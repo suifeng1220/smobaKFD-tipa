@@ -2052,6 +2052,160 @@ static void 坐标自标定(int k, uint64_t 实体, const float* 矩阵, float �
     }
 }
 
+// ==================== v44：对象图探针（只读、只打印，不参与绘制）====================
+// v43 的扫描把坐标定到了「二」（二 = *(*(实体+0xa8)+0x10)）：
+//   对象2 只有 4 个变化字，且两两相等：+0x2C=+0x44、+0x34=+0x4C，量级 ±47672；
+//   投影 屏滑=399/400、屏最大跳=15px。其它三个对象（实体 / 一 / 三）的候选值都是
+//   564 / 21613 / 3832 这种量级，不是世界坐标。
+// 还差三件事没有测过，这一版只测它们，不改任何绘制与坐标逻辑：
+//   ① 「三」到底是什么。三 = *(二+0x0)。若它是类级指针（isa / vtable），10 个英雄的
+//      「三」会高度重复 —— v36 日志里 k=4 与 k=5 的「三」已经是同一个指针。这里直接统计去重。
+//   ② 实体 / 一 / 二 / 三 的 q0..q7，看是否同构（同类对象的 q0 相同）。
+//   ③ 我方英雄的二+0x44 / +0x4C 投影后是否落在屏幕中心：相机跟着我走，这是免费真值，
+//      能同时裁决「偏移对不对」和「投影宽高对不对」，不需要任何外部数据。
+static int      图探阶段 = 0;
+static int      图探帧 = 0;
+static int      图探样 = 0;
+static uint64_t 图探友 = 0;
+
+static uint64_t 图解一(uint64_t 实体) { return IsValidAddr(实体) ? vm_read<uint64_t>(实体 + 0xa8) : 0; }
+static uint64_t 图解二(uint64_t 一)   { return IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0; }
+static uint64_t 图解三(uint64_t 二)   { return IsValidAddr(二) ? vm_read<uint64_t>(二 + 0x0) : 0; }
+
+static void 图打印对象(uint64_t 址, const char* 名, int 槽) {
+    if (!IsValidAddr(址)) {
+        日志("图 %s 槽%d 址=%llx 无效", 名, 槽, (unsigned long long)址);
+        return;
+    }
+    uint64_t q[8] = {0};
+    if (!readMemory(址, q, sizeof(q))) {
+        日志("图 %s 槽%d 址=%llx 读失败", 名, 槽, (unsigned long long)址);
+        return;
+    }
+    char 串[440] = {0};
+    int 位 = 0;
+    for (int i = 0; i < 8 && 位 < 400; ++i)
+        位 += snprintf(串 + 位, sizeof(串) - 位, "%llx ", (unsigned long long)q[i]);
+    日志("图 %s 槽%d 址=%llx q0..7= %s", 名, 槽, (unsigned long long)址, 串);
+}
+
+// 打印「二」里的四个候选字，并把两组分别投影，看谁落在屏幕中心
+static void 图报坐标(uint64_t 二, const char* 名, int 槽, const float* 矩阵, float 宽, float 高) {
+    if (!IsValidAddr(二)) {
+        日志("图坐标 %s 槽%d 二无效", 名, 槽);
+        return;
+    }
+    const unsigned 偏[4] = { 0x2C, 0x34, 0x44, 0x4C };
+    int 值[4] = {0};
+    {
+        char 串[300] = {0};
+        int 位 = 0;
+        for (int i = 0; i < 4 && 位 < 260; ++i) {
+            值[i] = vm_read<int>(二 + 偏[i]);
+            位 += snprintf(串 + 位, sizeof(串) - 位, "+0x%X=%d ", 偏[i], 值[i]);
+        }
+        日志("图坐标 %s 槽%d %s", 名, 槽, 串);
+    }
+    // 两组：+0x44/+0x4C（v43 屏最大跳 15px）与 +0x2C/+0x34（v43 屏最大跳 172px）
+    static const char* 组名[2] = { "+44/+4C", "+2C/+34" };
+    const float 中X = 宽 * 0.5f, 中Y = 高 * 0.5f;
+    for (int g = 0; g < 2; ++g) {
+        int wx = (g == 0) ? 值[2] : 值[0];
+        int wz = (g == 0) ? 值[3] : 值[1];
+        float sx = 0.0f, sy = 0.0f;
+        bool 成 = 投影(矩阵, wx, wz, &sx, &sy, 宽, 高);
+        float dx = sx - 中X, dy = sy - 中Y;
+        bool 屏内 = 成 && sx >= 0.0f && sx <= 宽 && sy >= 0.0f && sy <= 高;
+        日志("图投影 %s 槽%d %s 世(%d,%d) 成=%d 屏(%.0f,%.0f) 距心%.0f 屏内=%d 中(%.0f,%.0f)",
+             名, 槽, 组名[g], wx, wz, 成 ? 1 : 0, sx, sy,
+             sqrtf(dx * dx + dy * dy), 屏内 ? 1 : 0, 中X, 中Y);
+    }
+}
+
+static void 对象图探针(uint64_t 数组, int 数量, const float* 矩阵, float 宽, float 高, unsigned 我方阵营) {
+    if (图探阶段 >= 2) return;
+    if (++图探帧 < 180) return;                 // 开局 3 秒内实体还没到齐
+
+    if (图探阶段 == 0) {
+        uint64_t 三表[24] = {0};
+        int 有效 = 0, 去重 = 0, 三非零 = 0;
+        uint64_t 敌 = 0;
+        int 敌槽 = -1, 友槽 = -1;
+
+        for (int k = 0; k < 数量 && k < 24; ++k) {
+            uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+            if (!IsValidAddr(e)) continue;
+            ++有效;
+            三表[k] = 图解三(图解二(图解一(e)));
+            int 阵 = 读阵营(e);
+            if (友槽 < 0 && 阵 == (int)我方阵营) 友槽 = k;
+            if (敌槽 < 0 && 阵 != (int)我方阵营) { 敌 = e; 敌槽 = k; }
+        }
+        for (int i = 0; i < 数量 && i < 24; ++i) {
+            if (!三表[i]) continue;
+            ++三非零;
+            bool 见过 = false;
+            for (int j = 0; j < i; ++j) if (三表[j] == 三表[i]) { 见过 = true; break; }
+            if (!见过) ++去重;
+        }
+        {
+            char 串[420] = {0};
+            int 位 = 0;
+            for (int i = 0; i < 数量 && i < 24 && 位 < 380; ++i)
+                if (三表[i]) 位 += snprintf(串 + 位, sizeof(串) - 位, "k%d=%llx ", i, (unsigned long long)三表[i]);
+            日志("图G0 我方阵营=%u 有效槽=%d 三非零=%d 三去重=%d %s",
+                 我方阵营, 有效, 三非零, 去重, 串);
+        }
+
+        if (敌槽 >= 0) {
+            uint64_t 一 = 图解一(敌), 二 = 图解二(一), 三 = 图解三(二);
+            日志("图G0 敌 槽%d 实体=%llx 阵=%d", 敌槽, (unsigned long long)敌, 读阵营(敌));
+            图打印对象(敌, "实体", 敌槽);
+            图打印对象(一, "一", 敌槽);
+            图打印对象(二, "二", 敌槽);
+            图打印对象(三, "三", 敌槽);
+            图报坐标(二, "敌二", 敌槽, 矩阵, 宽, 高);
+        } else {
+            日志("图G0 没有找到敌方槽（我方阵营=%u）", 我方阵营);
+        }
+
+        if (友槽 >= 0) {
+            uint64_t e = vm_read<uint64_t>(数组 + 24ULL * 友槽);
+            uint64_t 一 = 图解一(e), 二 = 图解二(一), 三 = 图解三(二);
+            图探友 = e;
+            日志("图G0 友 槽%d 实体=%llx 阵=%d", 友槽, (unsigned long long)e, 读阵营(e));
+            图打印对象(一, "一", 友槽);
+            图打印对象(二, "二", 友槽);
+            图打印对象(三, "三", 友槽);
+            图报坐标(二, "友二", 友槽, 矩阵, 宽, 高);
+        } else {
+            日志("图G0 没有找到我方槽（我方阵营=%u）", 我方阵营);
+        }
+        图探阶段 = 1;
+        图探帧 = 0;
+        return;
+    }
+
+    // 阶段1：每秒一次、连续 6 次，追我方英雄的投影落点
+    if (图探帧 < 45) return;
+    图探帧 = 0;
+    int 友槽 = -1;
+    for (int k = 0; k < 数量 && k < 24; ++k) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (!IsValidAddr(e)) continue;
+        if (读阵营(e) == (int)我方阵营) { 友槽 = k; 图探友 = e; break; }
+    }
+    if (友槽 < 0) {
+        日志("图G1 第%d次 找不到我方槽", 图探样 + 1);
+    } else {
+        图报坐标(图解二(图解一(图探友)), "友二", 友槽, 矩阵, 宽, 高);
+    }
+    if (++图探样 >= 6) {
+        图探阶段 = 2;
+        日志("图探 完成 6 次取样");
+    }
+}
+
 // ==================== v39：锁定实体逐帧坐标序列 ====================
 // 扫描候选表要 20 秒才出，先打 200 帧原始序列，肉眼就能看出「交替」的周期，
 // 以及交替两组值里哪一组在连续。
@@ -2946,7 +3100,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v43 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v44 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -3134,6 +3288,9 @@ void Draw::StartBooks() {
     static int 本拍浮点行 = 0;                 // 浮点单独限额，免得读条时把整数行挤没
     const bool 做差分 = cfg_recall && (CACurrentMediaTime() - 上次差分 > 0.2);
     if (做差分) { 上次差分 = CACurrentMediaTime(); 本拍行数 = 0; 本拍浮点行 = 0; }
+
+    // v44：对象图探针（纯读、纯打印，不改绘制；开局第 3 秒起跑一次，之后 1Hz 追 6 次）
+    对象图探针(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
 
     for (int k = 0; k < 数量 && k < 24; ++k) {
         uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * k);
