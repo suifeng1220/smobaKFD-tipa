@@ -106,6 +106,18 @@ static bool cfg_mappos_on = false;         // 地图位置可调(XY)：开 → �
 static bool cfg_skillpos_on = false;       // CD 位置可调(XY)：开 → 用 skillX/skillY；关 → 内置默认 11/27
 static bool cfg_mapalign = false;          // 小地图对齐辅助：画四角括号 + 中心十字
 static bool cfg_recall = false;            // 敌方回城提示：屏幕顶部横幅
+// ---- v30 点按回城：自己的回城，按下即提示 ----
+// 前面四个版本都在游戏内存里找"8 秒读条计时器"，全是 0 命中。dump.cs 事后证明
+// 战斗实体是原生 C++ 结构、不在 C# 层，所以那条路本来就找不到。
+// 换一个确定性的信号：回城按钮位置固定，HUD 的全局触摸回调能看见每一次按下。
+// 标定一次热区，按下那一刻就是"正在回城"的起点，完全不需要游戏内存。
+static bool  cfg_recalltap = true;         // 点按回城提示总开关（默认开，标定完就生效）
+static float cfg_recalltapX = 0.0f;        // 回城按钮中心 X（逻辑点；0 = 还没标定）
+static float cfg_recalltapY = 0.0f;        // 回城按钮中心 Y
+static float cfg_recalltapR = 64.0f;       // 热区半径（默认给宽一点，宁大勿小：宁可偶尔误报也别点了没反应）
+static double 回城按下时刻 = 0.0;          // CACurrentMediaTime()；0 = 当前不在回城
+static bool   回城标定中 = false;          // 面板点了"标定"后，下一次按下即写入热区
+static const double 回城读条秒 = 8.0;      // 王者回城读条 8 秒
 static bool cfg_camprobe = false;          // 相机探测（只在日志里输出，找小地图相机用）
 static bool cfg_monsteroff_on = false;     // 野怪点位对齐微调
 static float cfg_monsterOffX = 0.0f;       // 野怪点左/右偏移（逻辑点）
@@ -141,6 +153,10 @@ static SL键项 键表[] = {
     { "fov_on",          &cfg_fov_on,          false },
     { "status",          &cfg_status,          false },
     { "recall",          &cfg_recall,          false },
+    { "recalltap",       &cfg_recalltap,       false },
+    { "recalltapX",      &cfg_recalltapX,      true  },
+    { "recalltapY",      &cfg_recalltapY,      true  },
+    { "recalltapR",      &cfg_recalltapR,      true  },
     { "mapalign",        &cfg_mapalign,        false },
     { "camprobe",        &cfg_camprobe,        false },
     { "mapsize_on",      &cfg_mapsize_on,      false },
@@ -1846,26 +1862,61 @@ static uint64_t 全盘扫(uint64_t* 基址出, mach_port_t* 端口出, char* 名
     return 结果;
 }
 
+// ==================== v29 任务端口就绪探针 ====================
+// 用户实测：点「初始化内核」→ [DOJailbreaker run] → 手机直接重启。
+// 原因很明确 —— DOJailbreaker 里那套是 Dopamine 的内核 exploit（physreadbuf/phystokv/
+// pmap/ttep + PPL 绕过）。在已经打过补丁或已经越狱的内核上再跑一遍，PTE 原语必被打烂，
+// panic 重启是唯一结局。
+// 而 HUD 的数据实际来自 task_for_pid + vm_read_overwrite：只要 TrollStore 签名的
+// platform-application 在，这条用户态路线一直通（历史日志每次都是「task_for_pid 成功」，
+// 相反「内核自检」永远是 ❌ kread 异常）。所以从 v29 起彻底不碰内核。
+static bool SLK任务端口就绪(void) {
+    if (游戏pid <= 1) {
+        pid_t pid = sysctl精确找pid("smoba");
+        if (pid <= 1) pid = sysctl模糊找pid();
+        if (pid > 1) 游戏pid = pid;
+    }
+    if (游戏pid <= 1) return false;
+    return 取任务端口(游戏pid) != 0;
+}
+
 static bool getbbz() {
     DOJailbreaker* jb = DOJailbreaker.sharedInstance;
     if (!jb.isSuccess) {
-        if (模块基址 || 游戏pid > 1) {
-            日志("内核已清除 → 作废 pid=%d 模块=0x%llx", 游戏pid, 模块基址);
-            模块基址 = 0;
-            游戏pid = -1;
-            当前链 = -1;
-            释放任务端口();
+        // v29：不再要求跑过内核 exploit。任务端口能拿到就算就绪，
+        // 而且是每帧自动重试 —— 所以"先开面板后进游戏"也不会死锁。
+        if (SLK任务端口就绪()) {
+            jb.isSuccess = YES;   // 仅当"已就绪"标志用，不代表内核原语可用
+            日志("就绪（任务端口模式）pid=%d · 未执行内核 exploit", 游戏pid);
+        } else {
+            if (模块基址 || 游戏pid > 1) {
+                日志("任务端口失效 → 作废 pid=%d 模块=0x%llx", 游戏pid, 模块基址);
+                模块基址 = 0;
+                游戏pid = -1;
+                当前链 = -1;
+                释放任务端口();
+            }
+            状态文字 = "等待游戏";
+            return false;
         }
-        状态文字 = "等待内核";
-        return false;
     }
-    // 内核通路自检（最多 5 秒一次）：确认 kread 真能读到内核内存、allproc 符号已解析
+    // v29：内核自检只在 kread 真的解析出 kernel base 时才跑。
+    // 原来无条件每 5 秒调一次，日志里永远刷三行 ❌（base=0x0 allproc=0x0），
+    // 既没有信息量，又是一堆无意义的内核读调用。
     {
         static double 上次自检时刻 = 0;
+        static bool 已报过缺失 = false;
         double 现在 = CACurrentMediaTime();
         if (现在 - 上次自检时刻 > 5.0) {
             上次自检时刻 = 现在;
-            内核自检();
+            const bool 内核可用 = IsKernelAddr(gSystemInfo.kernelConstant.base) ||
+                                  IsKernelAddr(gSystemInfo.kernelConstant.staticBase);
+            if (内核可用) {
+                内核自检();
+            } else if (!已报过缺失) {
+                已报过缺失 = true;
+                日志("内核通路未加载 · 走任务端口模式（功能不受影响）");
+            }
         }
     }
     // 已有基址：校验 MachO
@@ -2169,7 +2220,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v28 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v30 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -2191,9 +2242,11 @@ void Draw::StartBooks() {
         上次找进程推进 = now;
     }
 
-    if (![[DOJailbreaker sharedInstance] isSuccess]) {
-        状态浮层(1, "内核未就绪");
-        底部文字(屏, "等待内核");
+    // v30：不再以「内核 exploit 是否成功」为开关。任务端口能用就算就绪，
+    // 这样面板不会一直卡在"等待内核"，也不需要点那个会 panic 的初始化按钮。
+    if (![[DOJailbreaker sharedInstance] isSuccess] && !SLK任务端口就绪()) {
+        状态浮层(1, "未连接游戏");
+        底部文字(屏, "等待进入对局");
         return;
     }
     if (!模块基址) {
@@ -2786,6 +2839,60 @@ void Draw::StartBooks() {
         }
     }
 
+    // ==================== v30 点按回城（自己的）====================
+    // 用户原话："我要的是它点回城按键的时候就提示正在回城，而不是它回到泉水了"。
+    // 所以这里不看游戏内存、不看坐标瞬移，只看"手指有没有按在回城按钮上"。
+    // 按下那一刻横幅立刻亮，数字从 8.0 往下走；到 0 自动收掉（被打断也不影响，
+    // 最多多挂不到 1 秒）。
+    {
+        const double 此刻 = CACurrentMediaTime();
+        if (回城标定中) {
+            // 标定提示：屏幕中部偏上，黄色闪烁。放这里是因为它必须一眼看见，
+            // 同时又不能盖住顶部敌方横幅和底部技能栏。
+            const float 闪 = 0.55f + 0.45f * (0.5f + 0.5f * sinf((float)此刻 * 8.0f));
+            const float 宽 = 320.0f * 缩放;
+            const float 高 = 26.0f * 缩放;
+            const float 左 = 屏.x * 0.5f - 宽 * 0.5f;
+            const float 顶 = 屏.y * 0.5f - 150.0f * 缩放;
+            画实心矩形(0xD0101418, 左, 顶, 宽, 高);
+            画框(((ImU32)(200.0f * 闪) << 24) | 0x0000D0FF, 左, 顶, 宽, 高, 1.6f * 缩放);
+            画文字(屏.x * 0.5f, 顶 + 高 * 0.5f, "标定中：点一下游戏里的回城按钮",
+                   0xFFFFFFFF, true, true, 10.5f * 缩放);
+        } else if (cfg_recalltap && 回城按下时刻 > 0.0) {
+            const double 已过 = 此刻 - 回城按下时刻;
+            if (已过 >= 回城读条秒 + 0.3) {
+                回城按下时刻 = 0.0;            // 读条结束，横幅自动收掉
+            } else {
+                float 剩 = (float)(回城读条秒 - 已过);
+                if (剩 < 0.0f) 剩 = 0.0f;
+                const float 比 = 剩 / (float)回城读条秒;
+                const float 宽 = 186.0f * 缩放;
+                const float 高 = 34.0f *缩放;
+                const float 左 = 屏.x * 0.5f - 宽 * 0.5f;
+                const float 顶 = 62.0f * 缩放;
+                // 越接近结束越急：前 5 秒青，后 3 秒转黄，最后 1 秒转红
+                float R = 0.35f, G = 0.95f, B = 0.95f;
+                if (剩 < 3.0f) { R = 1.0f; G = 0.86f; B = 0.35f; }
+                if (剩 < 1.0f) { R = 1.0f; G = 0.36f; B = 0.30f; }
+                const float 闪 = 0.55f + 0.45f * (0.5f + 0.5f * sinf((float)此刻 * 7.0f));
+                const ImU32 描 = ((ImU32)(120.0f + 135.0f * 闪) << 24) |
+                                 ((ImU32)(B * 255.0f) << 16) | ((ImU32)(G * 255.0f) << 8) |
+                                 (ImU32)(R * 255.0f);
+                画实心矩形(0xC8101216, 左, 顶, 宽, 高);
+                画框(描, 左, 顶, 宽, 高, 1.8f * 缩放);
+                // 底部进度条：剩多少剩下多少，比读数字更直观
+                画实心矩形(0x50FFFFFF, 左 + 3.0f * 缩放, 顶 + 高 - 5.0f * 缩放,
+                                 (宽 - 6.0f * 缩放) * 比, 2.5f * 缩放);
+                char 文[64];
+                snprintf(文, sizeof(文), "正在回城  %.1f", 剩);
+                画文字(屏.x * 0.5f, 顶 + 高 * 0.5f - 2.0f * 缩放, 文,
+                       ((ImU32)0xFF000000) | ((ImU32)(B * 255.0f) << 16) |
+                       ((ImU32)(G * 255.0f) << 8) | (ImU32)(R * 255.0f),
+                       true, true, 12.0f * 缩放);
+            }
+        }
+    }
+
     // ==================== 敌方回城提示 ====================
     // 屏幕顶部居中的横幅：谁在回城、几个，一眼能看到；边框红度脉动，抓眼角。
     if (cfg_recall) {
@@ -2908,3 +3015,88 @@ static float clamp01(float v) {
 }
 
 @end
+
+// ==================== v29 对外接口：初始化（任务端口模式） ====================
+// 返回值：1=就绪  0=有 pid 但拿不到任务端口  -1=没找到游戏进程
+// 全程不调用 [DOJailbreaker run]，因此不会再有内核 exploit 导致的 panic 重启。
+
+// ==================== v30 点按回城：对外接口 ====================
+// 由 SLBall触摸() 在 HID 回调里调用，只旁听、不改任何分发行为。
+// 阶段：0=按下 1=移动 3=抬起（数值与 UITouchPhase 对齐）
+extern "C" void SLK回城点按(float x, float y, int 阶段, int 手指数) {
+    // 手指滑走了 = 这次点击变成拖动（拖技能/滑视野），把读条收掉，
+    // 否则会挂着一条"正在回城"的假横幅直到 8 秒走完。
+    if (阶段 == 1) {
+        if (回城按下时刻 > 0.0 && (cfg_recalltapX > 0.0f || cfg_recalltapY > 0.0f)) {
+            const float dx = x - cfg_recalltapX;
+            const float dy = y - cfg_recalltapY;
+            const float 宽限 = cfg_recalltapR * 3.0f;
+            if (dx * dx + dy * dy > 宽限 * 宽限) 回城按下时刻 = 0.0;
+        }
+        return;
+    }
+    if (阶段 != 0) return;                       // 只认"按下"这一帧
+    if (手指数 > 1) return;                      // 多指（开镜/移动+技能）不参与
+
+    if (回城标定中) {
+        回城标定中 = false;
+        cfg_recalltapX = x;
+        cfg_recalltapY = y;
+        cfg_recalltap = true;
+        SLCfg写开关("recalltap", true);
+        SLCfg写数值("recalltapX", x);
+        SLCfg写数值("recalltapY", y);
+        回城按下时刻 = 0.0;
+        日志("回城标定完成 x=%.1f y=%.1f 半径=%.0f（以后按这里就提示）",
+             x, y, cfg_recalltapR);
+        return;
+    }
+    if (!cfg_recalltap) return;
+    if (cfg_recalltapX <= 0.0f && cfg_recalltapY <= 0.0f) return;   // 还没标定过
+
+    const float dx = x - cfg_recalltapX;
+    const float dy = y - cfg_recalltapY;
+    const float 半径 = cfg_recalltapR > 8.0f ? cfg_recalltapR : 64.0f;
+    if (dx * dx + dy * dy > 半径 * 半径) return;
+
+    回城按下时刻 = CACurrentMediaTime();
+    日志("回城按下 x=%.0f y=%.0f → 横幅亮起，倒计时 %.0fs",
+         x, y, 回城读条秒);
+}
+
+extern "C" void SLK回城标定开始(void) {
+    回城标定中 = true;
+    回城按下时刻 = 0.0;
+    日志("回城标定开始：请在游戏里点一下回城按钮");
+}
+
+extern "C" int SLK回城标定在(void) {
+    return 回城标定中 ? 1 : 0;
+}
+
+// 面板画热区半径滑条用
+extern "C" float SLK回城半径(void) { return cfg_recalltapR; }
+extern "C" void SLK设回城半径(float r) {
+    if (r < 20.0f) r = 20.0f;
+    if (r > 120.0f) r = 120.0f;
+    cfg_recalltapR = r;
+    SLCfg写数值("recalltapR", r);
+}
+
+extern "C" int SLK初始化任务端口(void) {
+    if (游戏pid <= 1) {
+        pid_t pid = sysctl精确找pid("smoba");
+        if (pid <= 1) pid = sysctl模糊找pid();
+        if (pid > 1) 游戏pid = pid;
+    }
+    if (游戏pid <= 1) {
+        日志("端口自检: 没找到 smoba 进程（先进对局再点初始化）");
+        return -1;
+    }
+    if (!取任务端口(游戏pid)) {
+        日志("端口自检: task_for_pid(%d) 失败 —— 检查签名是否带 platform-application", 游戏pid);
+        return 0;
+    }
+    日志("端口自检: 成功 pid=%d 任务端口就绪 · 未执行内核 exploit", 游戏pid);
+    return 1;
+}
