@@ -13,6 +13,7 @@
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <cstring>
+#include <cstdio>
 #include "BBZGui.h"
 #include "游戏/SDK.h"
 
@@ -2459,6 +2460,11 @@ static void 我方自检(uint64_t 数组, int 数量, const float* 矩阵, float
 //   ⇒ 联机对局里 实体 → +0xa8 → +0x10 这条链指的不再是「位置组件」，
 //     而 v43 在人机局实测这条链「投=400/400、屏滑=399/400、屏最大跳=15px」是完美坐标。
 //     这就是「离线人机正常、一进联机就开始跳」的真正机制：链指错了对象，不是值在跳。
+// v55 修正 v54 的判据（实测发现）：
+//   v54 用「加载期采样基准 ±200px」，但两局采到的基准差 322px ——
+//   联机局 (1454,614)、离线局 (1128,1062)，采样时镜头还没落到跟随位，基准本身是错的。
+//   离线局 15 分钟坐标全程正确时，「我」恒定投在 (1395,740)（±30px）。
+//   所以 v55 改成硬编码比例带 px∈宽[0.44,0.56]、py∈高[0.50,0.70]，不采任何样。
 // v54 换一个绝对判据，彻底不用「位移」：
 //   相机第三人称跟随我 ⇒ 我永远投在屏幕上同一个像素位置。
 //   加载期 二 还准（就是 v43 那次实测），先用它把这个像素位置量出来（24 次平均），
@@ -2483,6 +2489,24 @@ static bool  锚基有 = false;
 static uint64_t 锚我 = 0;
 static bool     锚有初 = false;
 
+// ---------------- v55 新增 ----------------
+// 锚真v：加载期第一次见到的「二」的 vtable。这是唯一的结构差异来源 ——
+//   联机局（_ab_v54.log）里它在 23:25:16~23:29:11 之间换了 8 次：
+//     2c6e17f88 → 2c6e104e0 → 2c6e19810 → 2c6ac0c88
+//     → 2c67133a0 → 2c64cc910 → 2c64d35b0 → 2c64de848，间隔 25~35 秒；
+//   离线局（_ab_off.log，16 分钟）里它从头到尾只有一个 2ce5a5be8。
+//   同期 本体(118b06b28)/一(118b036d8)/三(118b02ba0) 两局都全程不变。
+static uint64_t 锚真v = 0;
+// 锁二址：加载期锁定的「一+0x10」地址。整局盯住它，区分两种可能：
+//   地址不变但 vtable 变 → 那块内存被释放后原地重建（use-after-free）；
+//   地址本身变了      → 一+0x10 换绑到了别的对象。
+static uint64_t 锁二址 = 0;
+// 跨距表：X 与 Z 的内存间距。已知副本都是 8，但别的组件不一定，
+// v54 只试了 4/8，这里把 0x10/0x20 也带上，免得漏掉「被别的字段隔开」的坐标对。
+static const int 锚跨表[4] = {4, 8, 0x10, 0x20};
+#define 锚跨数 4
+static unsigned char 锚跨记[锚层数][锚格];   // 每格最后命中的跨距，榜上打出来
+
 // 与 投影() 同式，省掉 isfinite 和重复的 /1000，扫描里要跑十几万次
 static inline bool 锚投(const float* m, int X, int Z, float 宽, float 高,
                         float* px, float* py) {
@@ -2505,6 +2529,21 @@ static inline bool 锚基上(float px, float py) {
            py > 锚基Y - 锚容 && py < 锚基Y + 锚容;
 }
 
+// ============ v55：判据换成硬编码屏幕带 ============
+// v54 用「加载期采样基准 ±200px」，两局实测证明这个基准根本不能当尺子：
+//   联机局采到 (1454,614)，离线局采到 (1128,1062) —— 同一个我在两个位置差 322px。
+//   原因是采样发生在加载期，那时镜头还没落到第三人称跟随位。
+// 而 _ab_off.log（离线局 15 分钟、坐标全程正确）里，「我」的投影稳稳落在
+//   px 1363~1424（宽 2796 的 0.488~0.509）、py 724~816（高 1290 的 0.561~0.633），
+//   全程波动只有 ±30px。这就是第三人称相机的跟随点。
+// 所以判据不采任何样，直接用比例带：px∈[0.44,0.56]、py∈[0.50,0.70]。
+//   随机命中率 0.12×0.20 = 2.4%，而真位置字段接近 100%，榜上一眼分得开。
+//   带宽比实测范围（±30px）宽了 4~5 倍，专门留给联机时镜头可能的不同。
+static inline bool 锚带上(float px, float py, float 宽, float 高) {
+    return px > 宽 * 0.44f && px < 宽 * 0.56f &&
+           py > 高 * 0.50f && py < 高 * 0.70f;
+}
+
 static void 锚照(const char* 名, bool 有, int X, int Z,
                  const float* m, float 宽, float 高) {
     if (!有) { 日志("锚照 %s 无值", 名); return; }
@@ -2515,6 +2554,32 @@ static void 锚照(const char* 名, bool 有, int X, int Z,
     }
     日志("锚照 %s 值=(%d,%d) 投=(%.0f,%.0f) 距基=(%.1f,%.1f) %s",
          名, X, Z, px, py, px - 锚基X, py - 锚基Y, 锚基上(px, py) ? "命中" : "偏");
+}
+
+// ---- v55：在「一」里找还活着的正确类型对象 ----
+// 二 被池回收后有两种可能：
+//   ① 位置组件彻底被释放 → 一 里不会再有 vtable == 锚真v 的引用；
+//   ② 只是 一+0x10 换了指向，组件本身还活着 → 一 里能找到别的引用。
+// 扫 一 的所有 8 字节位置，挑 vtable 恰好等于锚真v 的，把它的 +0x2c/+0x34 打出来。
+// 找到且坐标正常 → v56 直接改读那一处，问题结束；一条都没有 → 这层可以彻底排掉。
+static void 一内找活(uint64_t 一址) {
+    if (!IsValidAddr(一址) || !锚真v) return;
+    int 长 = 0x8000;
+    while (长 >= 0x800 && !readMemory(一址, 锚扫今, 长)) 长 /= 2;
+    if (长 < 0x800) { 日志("找活 读不到一 长=%d", 长); return; }
+    int 条 = 0;
+    for (int o = 0; o + 8 <= 长 && 条 < 6; o += 8) {
+        uint64_t p = 0;
+        memcpy(&p, 锚扫今 + o, 8);
+        if (!IsValidAddr(p)) continue;
+        if (vm_read<uint64_t>(p) != 锚真v) continue;
+        int x = 0, z = 0;
+        if (!readMemory(p + 0x2c, &x, 4)) continue;
+        if (!readMemory(p + 0x34, &z, 4)) continue;
+        日志("找活 一+0x%x -> %llx 坐标=(%d,%d)", o, (unsigned long long)p, x, z);
+        ++条;
+    }
+    if (条 == 0) 日志("找活 一 内无 vtable=%llx 的引用", (unsigned long long)锚真v);
 }
 
 static void 锚榜(const uint64_t* 层址, const float* m, float 宽, float 高) {
@@ -2529,6 +2594,17 @@ static void 锚榜(const uint64_t* 层址, const float* m, float 宽, float 高)
         日志("锚层 vtable 本=%llx 一=%llx 二=%llx 三=%llx 样本=%d",
              (unsigned long long)本, (unsigned long long)一v,
              (unsigned long long)二v, (unsigned long long)三v, 锚扫样);
+    }
+
+    // ①b 盯住加载期锁定的 二 地址 —— 这是区分「原地重建」和「换绑」的唯一办法
+    if (锁二址) {
+        const uint64_t v = vm_read<uint64_t>(锁二址);
+        int x = 0, z = 0;
+        readMemory(锁二址 + 0x2c, &x, 4);
+        readMemory(锁二址 + 0x34, &z, 4);
+        日志("锁二址 %llx v=%llx %s 坐标=(%d,%d)",
+             (unsigned long long)锁二址, (unsigned long long)v,
+             (v == 锚真v) ? "同" : "异", x, z);
     }
 
     // ② 三组对照
@@ -2567,17 +2643,55 @@ static void 锚榜(const uint64_t* 层址, const float* m, float 宽, float 高)
                 readMemory(层址[t] + 最好 * 4, &甲, 4);
                 readMemory(层址[t] + 最好 * 4 + 4, &乙4, 4);
                 readMemory(层址[t] + 最好 * 4 + 8, &乙8, 4);
-                日志("锚 %s %s 次=%d/%d +0x%x 值4=(%d,%d) 值8=(%d,%d)",
+                日志("锚 %s %s 次=%d/%d +0x%x 跨=%d 值4=(%d,%d) 值8=(%d,%d)",
                      锚层名[t], md == 0 ? "int" : (md == 1 ? "f米" : "f毫米"),
-                     次, 锚扫样层[t], 最好 * 4, 甲, 乙4, 甲, 乙8);
+                     次, 锚扫样层[t], 最好 * 4,
+                     md == 0 ? 锚跨表[锚跨记[t][最好] & 3] : 0,
+                     甲, 乙4, 甲, 乙8);
             }
         }
     }
 }
 
 static void 锚扫描(uint64_t 数组, int 数量, const float* m, float 宽, float 高, unsigned 我方) {
-    if (锚扫报 >= 150) return;
+    if (锚扫报 >= 400) return;                    // 一局最多扫 33 分钟，别中途断
     if (++锚扫帧 % 6 != 0) return;               // 约 10Hz
+
+    // ---- v55：每槽 vtable + 坐标。联机/离线两局唯一的差异就在这里 ----
+    // 联机局里 二 的 vtable 每 25~35 秒换一个（池回收后原地重建），
+    // 离线局 16 分钟只有一个值。所以这一行是「有没有被抢」的直接指示。
+    {
+        static double 上槽表 = 0.0;
+        const double 现s = CACurrentMediaTime();
+        if (现s - 上槽表 >= 5.0) {
+            上槽表 = 现s;
+            char 行[640];
+            int 位 = 0;
+            int 异 = 0, 共 = 0;
+            行[0] = 0;
+            for (int k = 0; k < 数量 && k < 10; ++k) {
+                uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+                if (!IsValidAddr(e)) continue;
+                const uint64_t 一k = vm_read<uint64_t>(e + 0xa8);
+                if (!IsValidAddr(一k)) continue;
+                const uint64_t 二k = vm_read<uint64_t>(一k + 0x10);
+                if (!IsValidAddr(二k)) continue;
+                const uint64_t v = vm_read<uint64_t>(二k);
+                if (锚真v == 0) 锚真v = v;
+                ++共;
+                const bool 同 = (v == 锚真v);
+                if (!同) ++异;
+                int x = 0, z = 0;
+                readMemory(二k + 0x2c, &x, 4);
+                readMemory(二k + 0x34, &z, 4);
+                if (位 < (int)sizeof(行) - 48)
+                    位 += snprintf(行 + 位, sizeof(行) - 位, "k%d%s(%d,%d) ",
+                                  k, 同 ? "同" : "异", x, z);
+            }
+            日志("槽表 真v=%llx 异=%d/%d %s",
+                 (unsigned long long)锚真v, 异, 共, 行);
+        }
+    }
 
     // ---- 锁「我」：加载期 二 还准，取投在屏幕中心 250px 内、离得最近的我方实体 ----
     if (!IsValidAddr(锚我)) {
@@ -2597,7 +2711,12 @@ static void 锚扫描(uint64_t 数组, int 数量, const float* m, float 宽, fl
         }
         if (IsValidAddr(锚我) && !锚有初) {
             锚有初 = true;
-            日志("锚 锁定我 实体=%llx 槽=%d", (unsigned long long)锚我, 我槽);
+            const uint64_t 一锁 = vm_read<uint64_t>(锚我 + 0xa8);
+            if (IsValidAddr(一锁)) 锁二址 = vm_read<uint64_t>(一锁 + 0x10);
+            if (IsValidAddr(锁二址)) 锚真v = vm_read<uint64_t>(锁二址);
+            日志("锚 锁定我 实体=%llx 槽=%d 锁二址=%llx 真v=%llx",
+                 (unsigned long long)锚我, 我槽,
+                 (unsigned long long)锁二址, (unsigned long long)锚真v);
         }
         return;                                   // 锁定这一拍不扫
     }
@@ -2641,15 +2760,18 @@ static void 锚扫描(uint64_t 数组, int 数量, const float* m, float 宽, fl
         int 甲 = 0;
         memcpy(&甲, 锚扫今 + o, 4);
         if (甲 != 0 && 甲 > -103500 && 甲 < 103500) {
-            for (int 跳 = 1; 跳 <= 2; ++跳) {
+            for (int 跨 = 0; 跨 < 锚跨数; ++跨) {
+                const int 距 = 锚跨表[跨];
+                if (o + 距 + 4 > 长) break;
                 int 乙 = 0;
-                memcpy(&乙, 锚扫今 + o + 跳 * 4, 4);
+                memcpy(&乙, 锚扫今 + o + 距, 4);
                 if (乙 == 0 || 乙 <= -103500 || 乙 >= 103500) continue;
                 float px = 0.0f, py = 0.0f;
                 if (!锚投(m, 甲, 乙, 宽, 高, &px, &py)) continue;
-                if (!锚基上(px, py)) continue;
+                if (!锚带上(px, py, 宽, 高)) continue;
                 const int 格 = o / 4;
                 if (锚扫计[t][0][格] < 65535) ++锚扫计[t][0][格];
+                锚跨记[t][格] = (unsigned char)跨;
             }
         }
         // ---- float 解释：米（×1000）/ 毫米（×1）----
@@ -2660,15 +2782,17 @@ static void 锚扫描(uint64_t 数组, int 数量, const float* m, float 宽, fl
             const float 倍 = (md == 1) ? 1000.0f : 1.0f;
             const float 甲f = fa * 倍;
             if (!(甲f > -103500.0f && 甲f < 103500.0f)) continue;
-            for (int 跳 = 1; 跳 <= 2; ++跳) {
+            for (int 跨 = 0; 跨 < 锚跨数; ++跨) {
+                const int 距f = 锚跨表[跨];
+                if (o + 距f + 4 > 长) break;
                 float fb = 0.0f;
-                memcpy(&fb, 锚扫今 + o + 跳 * 4, 4);
+                memcpy(&fb, 锚扫今 + o + 距f, 4);
                 if (!isfinite(fb) || fb == 0.0f) continue;
                 const float 乙f = fb * 倍;
                 if (!(乙f > -103500.0f && 乙f < 103500.0f)) continue;
                 float px = 0.0f, py = 0.0f;
                 if (!锚投(m, (int)甲f, (int)乙f, 宽, 高, &px, &py)) continue;
-                if (!锚基上(px, py)) continue;
+                if (!锚带上(px, py, 宽, 高)) continue;
                 const int 格 = o / 4;
                 if (锚扫计[t][md][格] < 65535) ++锚扫计[t][md][格];
             }
@@ -2678,6 +2802,17 @@ static void 锚扫描(uint64_t 数组, int 数量, const float* m, float 宽, fl
     static double 上锚榜 = 0.0;
     const double 现 = CACurrentMediaTime();
     if (现 - 上锚榜 >= 5.0) { 上锚榜 = 现; 锚榜(层址, m, 宽, 高); }
+
+    // ---- v55：一 里找还活着的正确类型对象（每 10 秒一次）----
+    // 放在扫描之后调用：它会覆盖 锚扫今，而扫描循环已经跑完了。
+    {
+        static double 上找活 = 0.0;
+        const double 现f = CACurrentMediaTime();
+        if (锚真v && 现f - 上找活 >= 10.0) {
+            上找活 = 现f;
+            一内找活(一);
+        }
+    }
 }
 
 // ==================== v47：两跳指针轨迹 + 野怪已知真值对照 ====================
@@ -4086,7 +4221,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v54 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v55 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
