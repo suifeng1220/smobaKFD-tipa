@@ -2589,7 +2589,7 @@ static void 整局快照(uint64_t 数组, int 数量) {
 static unsigned char 猎人缓冲[0x4000];
 static int 猎人计 = 0;
 static int 猎人X层 = -1, 猎人X偏 = -1, 猎人Z层 = -1, 猎人Z偏 = -1;
-static void 坐标猎人(uint64_t 数组, int 数量, const float* 矩阵, float 宽, float 高, unsigned 我方) {
+static void __attribute__((unused)) 坐标猎人(uint64_t 数组, int 数量, const float* 矩阵, float 宽, float 高, unsigned 我方) {
     if (猎人计 >= 60) return;
     static double 上次 = 0.0;
     const double 现时 = CACurrentMediaTime();
@@ -2664,6 +2664,152 @@ static void 坐标猎人(uint64_t 数组, int 数量, const float* 矩阵, float
         日志("猎人 %d 反查 %s+0x%x / %s+0x%x → %s",
              猎人计, 层名[猎人X层], 猎人X偏,
              (猎人Z层 >= 0 ? 层名[猎人Z层] : "?"), 猎人Z偏, s2);
+    }
+}
+
+// ==================== v51：猎人2（扩范围 + 三种解释 + 邻域变化）====================
+// v50 实测（_ab_v50.log）：
+//   ① 命中 9 处，全部是「同一对坐标的副本」：
+//      本体+0x278/+0x280、一+0x970/+0x978、二+0x2c/+0x34、二+0x44/+0x4c（间距都是 8 字节）
+//   ② 但反查行当场给出反证：本体+0x278/+0x280 在 20:40:25~20:41:30 共 65 秒里
+//      k0(-53416,-56414) k1(53395,56435) k2(-53911,-53939) k3(57668,55750)
+//      k4(55757,57652) k5(56368,53358) k7(-55764,-57574) k8(54045,54045) 一字未变 ——
+//      这些正是加载期 20:16:06「坐标对照」里那批常量 → 本体 0x278 是出生点，不是实时位置。
+//   ③ 20:40:55 起我方真值开始变（-57673,-55764 → -41914,-33369 → -28307,-3208 …），
+//      命中的 9 处只剩 二+0x2c/+0x34/+0x44/+0x4c 四个 ——
+//      说明「实时位置」只在二对象里，实体本体里只有出生点。
+//   ④ 但 二 是共享池（v49 已证），且同一帧内读两次值都不同：
+//      跳四值 k=1 用(12942,13440) 组A(12758,13272) 组B(12942,13440) —— 锁组=1 却用上了组B，
+//      说明判定组A可用时读到的是越界垃圾、打印时重读又变回界内，一帧内被改写多次。
+// 于是 v51 补两件测量（仍不改绘制）：
+//   A. 把扫描范围从 0x4000/0x2000/0x2000 扩到 0x8000/0x6000/0x3000，
+//      并且不只认 int32 精确相等，同时认 float（毫米）与 float（米）三种解释 ——
+//      v50 只认 int32，若实体里存的是浮点，就会 0 命中。
+//   B. 邻域变化：每 5 秒对每槽读一遍本体 0x8000，只打印「变了、界内、单步幅度 50~6000」
+//      的偏移。不管单位是什么，实时位置一定在这个集合里 —— 这能把范围从 32KB 缩到几个偏移。
+static inline float 绝对值f(float x) { return x < 0.0f ? -x : x; }
+static unsigned char 猎2缓冲[0x8000];
+static int 猎2计 = 0;
+static int 猎2X层 = -1, 猎2X偏 = -1, 猎2X型 = 0, 猎2Z层 = -1, 猎2Z偏 = -1, 猎2Z型 = 0;
+static void 坐标猎人2(uint64_t 数组, int 数量, const float* 矩阵, float 宽, float 高, unsigned 我方) {
+    if (猎2计 >= 40) return;
+    static double 上次 = 0.0;
+    const double 现时 = CACurrentMediaTime();
+    if (现时 - 上次 < 8.0) return;
+    上次 = 现时;
+    ++猎2计;
+
+    const float 中X = 宽 * 0.5f, 中Y = 高 * 0.5f;
+    int 我槽 = -1; double 我距 = 1e9; int 真X = 0, 真Z = 0; uint64_t 我实体 = 0;
+    for (int k = 0; k < 数量 && k < 24; ++k) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (!IsValidAddr(e)) continue;
+        if ((unsigned)vm_read<int>(e + 52) != 我方) continue;
+        uint64_t 二 = 图解二(图解一(e));
+        if (!IsValidAddr(二)) continue;
+        const 二十四 r = 读二四(二);
+        int x, z;
+        if (组可用(r.A, r.B)) { x = r.A; z = r.B; }
+        else if (组可用(r.C, r.D)) { x = r.C; z = r.D; }
+        else continue;
+        float sx = 0.0f, sy = 0.0f;
+        if (!投影(矩阵, x, z, &sx, &sy, 宽, 高)) continue;
+        double 距 = sqrt((double)(sx - 中X) * (sx - 中X) + (double)(sy - 中Y) * (sy - 中Y));
+        if (距 < 我距) { 我距 = 距; 我槽 = k; 真X = x; 真Z = z; 我实体 = e; }
+    }
+    if (我槽 < 0 || 我距 > 400.0) {
+        日志("猎2 %d 无真值(我槽=%d 距心%.0f)", 猎2计, 我槽, 我距);
+        return;
+    }
+
+    const uint64_t 一 = 图解一(我实体);
+    const uint64_t 二 = 图解二(一);
+    const uint64_t 对象[3] = { 我实体, 一, 二 };
+    const int      长[3]   = { 0x8000, 0x6000, 0x3000 };
+    const char*    层名[3] = { "本体", "一", "二" };
+
+    char 串[820] = {0}; int 位 = 0, 命中 = 0;
+    for (int t = 0; t < 3; ++t) {
+        if (!IsValidAddr(对象[t])) continue;
+        int 实长 = 长[t];
+        while (实长 >= 0x400 && !readMemory(对象[t], 猎2缓冲, 实长)) 实长 /= 2;   // 跨页读不到就降档，别整层丢掉
+        if (实长 < 0x400) continue;
+        for (int o = 0; o + 4 <= 实长 && 命中 < 14; o += 4) {
+            int v; memcpy(&v, 猎2缓冲 + o, 4);
+            float f; memcpy(&f, &v, 4);
+            char 型[16] = {0};
+            bool 是X = false, 是Z = false;
+            // ① int32 精确相等（v50 用的就是这一条）
+            if (v > -500 && v < 500) {
+                // 落到 ±500 内的一律不认 int，交给浮点解释，避免 0 / 小值巧合
+            } else if (v == 真X) {
+                是X = true; snprintf(型, sizeof(型), "i");
+            } else if (v == 真Z) {
+                是Z = true; snprintf(型, sizeof(型), "i");
+            }
+            // ② 浮点解释：毫米 float 与 米 float 两种都试
+            if (!是X && !是Z) {
+                if (绝对值f(f) > 500.0f && 绝对值f(f - (float)真X) < 0.6f) {
+                    是X = true; snprintf(型, sizeof(型), "f%.1f", (double)f);
+                } else if (绝对值f(f) > 500.0f && 绝对值f(f - (float)真Z) < 0.6f) {
+                    是Z = true; snprintf(型, sizeof(型), "f%.1f", (double)f);
+                } else if (绝对值f(f) > 0.5f && 绝对值f(f * 1000.0f - (float)真X) < 6.0f) {
+                    是X = true; snprintf(型, sizeof(型), "f%.2f", (double)f);
+                } else if (绝对值f(f) > 0.5f && 绝对值f(f * 1000.0f - (float)真Z) < 6.0f) {
+                    是Z = true; snprintf(型, sizeof(型), "f%.2f", (double)f);
+                }
+            }
+            if (!是X && !是Z) continue;
+            if (是X && 猎2X层 < 0) { 猎2X层 = t; 猎2X偏 = o; 猎2X型 = 型[0]; }
+            if (是Z && 猎2Z层 < 0) { 猎2Z层 = t; 猎2Z偏 = o; 猎2Z型 = 型[0]; }
+            位 += snprintf(串 + 位, sizeof(串) - 位, "%s+0x%x=%s%s ",
+                           层名[t], o, 型, 是X ? (是Z ? "(XZ)" : "(X)") : "(Z)");
+            ++命中;
+        }
+    }
+    日志("猎2 %d 我=k%d 真(%d,%d) 距心%.0f 命中%d: %s",
+         猎2计, 我槽, 真X, 真Z, 我距, 命中, 命中 ? 串 : "无");
+}
+
+// 邻域变化：不管单位是什么，实时位置一定「每帧在变且单步幅度小」。每 5 秒对比一次。
+static unsigned char 邻前[12][0x8000];
+static int  邻长[12] = {0};
+static bool 邻就绪[24] = {false};
+static int  邻计 = 0;
+static void 邻域变化(uint64_t 数组, int 数量) {
+    if (邻计 >= 100) return;
+    static double 上次 = 0.0;
+    const double 现时 = CACurrentMediaTime();
+    if (现时 - 上次 < 5.0) return;
+    上次 = 现时;
+    ++邻计;
+    for (int k = 0; k < 数量 && k < 12; ++k) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (!IsValidAddr(e)) { 邻就绪[k] = false; continue; }
+        int 实长 = 0x8000;
+        while (实长 >= 0x400 && !readMemory(e, 猎2缓冲, 实长)) 实长 /= 2;
+        if (实长 < 0x400) { 邻就绪[k] = false; continue; }
+        if (!邻就绪[k] || 邻长[k] != 实长) {
+            memcpy(邻前[k], 猎2缓冲, 实长);
+            邻长[k] = 实长;
+            邻就绪[k] = true;
+            continue;
+        }
+        char 串[560] = {0}; int 位 = 0, 条 = 0;
+        for (int o = 0; o + 4 <= 实长 && 条 < 6; o += 4) {
+            int a, b;
+            memcpy(&a, 邻前[k] + o, 4);
+            memcpy(&b, 猎2缓冲 + o, 4);
+            if (a == b) continue;
+            if (b <= -110000 || b >= 110000) continue;
+            long long d = (long long)b - (long long)a;
+            if (d < 0) d = -d;
+            if (d < 50 || d > 6000) continue;
+            位 += snprintf(串 + 位, sizeof(串) - 位, "+0x%x %d->%d ", o, a, b);
+            ++条;
+        }
+        memcpy(邻前[k], 猎2缓冲, 实长);
+        日志("邻 %d k=%d 阵=%d 变%d: %s", 邻计, k, vm_read<int>(e + 52), 条, 条 ? 串 : "无");
     }
 }
 
@@ -2917,8 +3063,8 @@ static bool 读相机矩阵(uint64_t 模块, uint64_t 相机偏移, float* 矩�
     if (!readMemory(d + 296, 快照, sizeof(快照))) return false;
     memcpy(矩阵, 快照, sizeof(快照));
     for (int i = 0; i < 16; ++i)
-        if (!isfinite(矩阵[i]) || fabsf(矩阵[i]) > 10000000.0f) return false;
-    if (fabsf(矩阵[0]) > 0.000001f && fabsf(矩阵[5]) > 0.000001f && fabsf(矩阵[15]) > 0.000001f) {
+        if (!isfinite(矩阵[i]) || 绝对值f(矩阵[i]) > 10000000.0f) return false;
+    if (绝对值f(矩阵[0]) > 0.000001f && 绝对值f(矩阵[5]) > 0.000001f && 绝对值f(矩阵[15]) > 0.000001f) {
         相机节点 = d;
         return true;
     }
@@ -2995,10 +3141,10 @@ static void 相机探测(uint64_t 模块) {
             bool 正常 = true;
             for (int k = 0; k < 16; ++k) {
                 m[k] = vm_read<float>(d + 296 + 4ULL * k);
-                if (!isfinite(m[k]) || fabsf(m[k]) > 10000000.0f) { 正常 = false; break; }
+                if (!isfinite(m[k]) || 绝对值f(m[k]) > 10000000.0f) { 正常 = false; break; }
             }
             if (!正常) continue;
-            bool 正交 = fabsf(m[11]) < 0.0001f && fabsf(m[15] - 1.0f) < 0.0001f;
+            bool 正交 = 绝对值f(m[11]) < 0.0001f && 绝对值f(m[15] - 1.0f) < 0.0001f;
             日志("  [%d.%d] b=0x%llx c=0x%llx d=0x%llx m11=%.4f m15=%.4f 列长=%.3f %s",
                  r, i, b, c, d, m[11], m[15], 矩阵列长(m), 正交 ? "正交★" : "透视");
             // 视口候选：Unity 的 Camera.rect 是 4 个 0..1 的 float，在物体附近扫一遍
@@ -3041,7 +3187,7 @@ static bool 写视距(float fov) {
         }
         return false;
     }
-    if (fabsf(当前 - 目标) < 0.0005f) return true;
+    if (绝对值f(当前 - 目标) < 0.0005f) return true;
     bool ok = writeMemory(视距地址, &目标, 4);
     static double 上次写日志 = 0;
     double now = CACurrentMediaTime();
@@ -3097,8 +3243,8 @@ static bool 视距自校准(const float* 矩阵, float fov) {
                 float v = vm_read<float>(址径);
                 if (!isfinite(v)) continue;
                 bool 像度 = false;
-                if (目标度 <= 6.0f || fabsf(v - 目标度) > 目标度 * 0.03f) {
-                    if (fabsf(v - 当前fov) > 当前fov * 0.03f) continue;
+                if (目标度 <= 6.0f || 绝对值f(v - 目标度) > 目标度 * 0.03f) {
+                    if (绝对值f(v - 当前fov) > 当前fov * 0.03f) continue;
                 } else {
                     像度 = true;
                 }
@@ -3120,7 +3266,7 @@ static bool 视距自校准(const float* 矩阵, float fov) {
         float 期望 = 1.0f / tanf(fov * 0.5f);
         float 列长 = 矩阵列长(矩阵);
         bool 命中 = false;
-        if (期望 > 0.05f) 命中 = (fabsf(列长 - 期望) / 期望) < 0.08f;
+        if (期望 > 0.05f) 命中 = (绝对值f(列长 - 期望) / 期望) < 0.08f;
         if (命中 && i >= 0) {
             锁定视距址 = 校准候选址[i];
             视距地址 = 锁定视距址;
@@ -3147,7 +3293,7 @@ static bool 视距自校准(const float* 矩阵, float fov) {
                 校准候选索引++;
                 return false;
             }
-            if (isfinite(原值) && fabsf(原值 - 校准候选值[i]) > 0.001f)
+            if (isfinite(原值) && 绝对值f(原值 - 校准候选值[i]) > 0.001f)
                 校准候选值[i] = 原值;
             校准候选索引++;
             校准等待时间 = now;
@@ -3561,7 +3707,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v50 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v51 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -3618,7 +3764,7 @@ void Draw::StartBooks() {
     {
         if (上矩阵有) {
             for (int i = 0; i < 16; ++i) {
-                float d = fabsf(矩阵[i] - 上矩阵[i]);
+                float d = 绝对值f(矩阵[i] - 上矩阵[i]);
                 if (d > 矩阵最大变[i]) 矩阵最大变[i] = d;
             }
         }
@@ -3757,8 +3903,10 @@ void Draw::StartBooks() {
     // v48：整局快照（每 5 秒 10 槽 阵/组A/组B）。v47 的两跳轨迹 400 行已打满、
     // 只覆盖开局 5 秒、且恰好错过抖动时段，停用；野怪对照每次都「根无效」，也停用。
     整局快照(数组, 数量);
-    // v50：坐标猎人 —— 拿「我」的真坐标去 实体/一/二 三层反查偏移，命中后立刻同偏移验敌方
-    坐标猎人(数组, 数量, 矩阵, 屏.x, 屏.y, (unsigned)我方阵营);
+    // v51：猎人2（扩范围 + int32/float 三解释）+ 邻域变化（只报「变了、界内、单步 50~6000」的偏移）
+    // v50 的坐标猎人已给出结论（本体 0x278 是出生点），本版不再调用，函数保留备查。
+    坐标猎人2(数组, 数量, 矩阵, 屏.x, 屏.y, (unsigned)我方阵营);
+    邻域变化(数组, 数量);
 
     // v49：帧级诊断的帧号 / 毫秒推进，以及上一帧打标记的环 dump。
     // 放在逐槽循环外，保证一轮所有槽处理完才推进一帧 —— 环里的「相邻帧」是真正的相邻绘制帧。
@@ -4139,10 +4287,10 @@ void Draw::StartBooks() {
         const bool 学到回城 = (回城位偏移 >= 0) &&
             (回城位是倒数
                  ? (回城位是浮点
-                        ? (fabsf(vm_read<float>(实体 + 回城位偏移)) > 0.5f)
+                        ? (绝对值f(vm_read<float>(实体 + 回城位偏移)) > 0.5f)
                         : (vm_read<int>(实体 + 回城位偏移) >= 50 &&
                            vm_read<int>(实体 + 回城位偏移) < 30000))
-                 : (回城位是浮点 ? (fabsf(vm_read<float>(实体 + 回城位偏移)) > 0.5f)
+                 : (回城位是浮点 ? (绝对值f(vm_read<float>(实体 + 回城位偏移)) > 0.5f)
                                  : (vm_read<int>(实体 + 回城位偏移) == 回城位值)));
         bool 在回城 = 学到回城 || 回城来源 != 0;
         if (在回城 && 回城数 < 5) 回城英雄[回城数++] = 英雄ID;
