@@ -1436,7 +1436,7 @@ static bool 组可用(int x, int z) {
     return true;
 }
 
-// 兼容旧调用（我方自检）：优先组B（v46 验证过的偏移），不行用组A
+// 兼容旧调用（我方自检）：优先组A，不行用组B
 static int 读英雄坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
     if (!IsValidAddr(实体)) return 0;
     const uint64_t 一 = vm_read<uint64_t>(实体 + 0xa8);
@@ -1445,8 +1445,8 @@ static int 读英雄坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
     if (!IsValidAddr(二)) return 0;
     二十四 r = 读二四(二);
     if (!r.有) return 0;
-    if (组可用(r.C, r.D)) { *X = (unsigned)r.C; *Z = (unsigned)r.D; return 1; }
     if (组可用(r.A, r.B)) { *X = (unsigned)r.A; *Z = (unsigned)r.B; return 1; }
+    if (组可用(r.C, r.D)) { *X = (unsigned)r.C; *Z = (unsigned)r.D; return 1; }
     return 0;
 }
 
@@ -1455,6 +1455,12 @@ static int 读英雄坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
 //   槽锁 = 该槽已经成功用二读出过坐标，从此不再退回链读（消除两源交替）
 static int      槽组[24] = {0};
 static bool     槽锁[24] = {false};
+
+// v48b：两组各记一份「帧间跳变（>3000）次数」。同一实体的两组副本里，
+// 谁在跳、谁连续，用这两个计数一眼判定，不再靠推断。
+static int      槽A跳[24] = {0}, 槽B跳[24] = {0};
+static int      槽A上X[24] = {0}, 槽A上Z[24] = {0}, 槽B上X[24] = {0}, 槽B上Z[24] = {0};
+static unsigned char 槽上态[24] = {0};   // bit0 = 上帧组A合法，bit1 = 上帧组B合法
 
 // 读实体坐标：返回 0..2 = 采用的链号，3 = 本体直读，4 = 二+0x44（v46 主路径），-1 = 读不到
 static unsigned 上次直X = 0, 上次直Z = 0;
@@ -1477,12 +1483,40 @@ static int 读实体坐标(int k, uint64_t 实体, unsigned* X, unsigned* Z) {
         const bool okB = r.有 && 组可用(r.C, r.D);
         const bool 是槽 = (k >= 0 && k < 24);
 
+        // v48b：两组各自统计帧间跳变（>3000）。只看「上一帧也合法」的相邻对，
+        // 避免把 0→真值 的初始化误算成跳。
+        if (是槽 && r.有) {
+            if (okA) {
+                if (槽上态[k] & 1) {
+                    long long ax = (long long)r.A - 槽A上X[k];
+                    long long az = (long long)r.B - 槽A上Z[k];
+                    if (ax * ax + az * az > 3000LL * 3000LL) 槽A跳[k]++;
+                }
+                槽A上X[k] = r.A; 槽A上Z[k] = r.B; 槽上态[k] |= 1;
+            }
+            if (okB) {
+                if (槽上态[k] & 2) {
+                    long long bx = (long long)r.C - 槽B上X[k];
+                    long long bz = (long long)r.D - 槽B上Z[k];
+                    if (bx * bx + bz * bz > 3000LL * 3000LL) 槽B跳[k]++;
+                }
+                槽B上X[k] = r.C; 槽B上Z[k] = r.D; 槽上态[k] |= 2;
+            }
+        }
+
         int 用 = -1;                       // 0 = 组A(+0x2C)，1 = 组B(+0x44)
+        // v48b：改成组A 优先。依据 _ab_v47c.log（19:09:04~19:09:31）：
+        //   k=3 走「二」时，读数在 真位置 ↔ 原点附近小值 之间交替，且每秒 20~40 次：
+        //     (-47528,28776) → (1029,644) → (-47057,27600) → (404,1170) → (3475,-34847) …
+        //   交替的一侧恒在 ±6000 内（(1029,644)/(404,1170)/(676,1420)/(-1063,-1216)），
+        //   另一侧是 ±5 万的真实世界坐标。这批小数出自组B(+0x44/+0x4C) 的读数（轨迹 v(...) 即组B）。
+        //   组A(+0x2C/+0x34) 至今没有被单独观测过，因此改用它，并同时统计两组的帧间跳变次数，
+        //   谁稳就用谁 —— 由 快照 行的 A跳=/B跳= 直接判定，不靠推断。
         if (是槽 && 槽组[k] == 1 && okA) 用 = 0;
         else if (是槽 && 槽组[k] == 2 && okB) 用 = 1;
         if (用 < 0) {                      // 还没定，或锁定组当帧越界 → 兜底
-            if (okB) 用 = 1;
-            else if (okA) 用 = 0;
+            if (okA) 用 = 0;
+            else if (okB) 用 = 1;
             if (用 >= 0 && 是槽 && 槽组[k] == 0) 槽组[k] = 用 + 1;
         }
         if (用 >= 0) {
@@ -2415,7 +2449,12 @@ static void 整局快照(uint64_t 数组, int 数量) {
         位 += snprintf(串 + 位, sizeof(串) - 位, "k%d/阵%d/%d,%d|%d,%d ", k,
                        vm_read<int>(e + 52), r.A, r.B, r.C, r.D);
     }
-    日志("快照 %d n=%d %s", 快照计, 数量, 串);
+    int 跳A = 0, 跳B = 0;
+    for (int k = 0; k < 24; ++k) {
+        跳A += 槽A跳[k]; 跳B += 槽B跳[k];
+        槽A跳[k] = 0; 槽B跳[k] = 0;
+    }
+    日志("快照 %d n=%d A跳=%d B跳=%d %s", 快照计, 数量, 跳A, 跳B, 串);
 }
 
 // ==================== v39：锁定实体逐帧坐标序列 ====================
@@ -3312,7 +3351,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v48 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v48b 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -3787,6 +3826,7 @@ void Draw::StartBooks() {
             if (槽世键[k] != 0 && 槽世键[k] != 实体) {
                 槽锁[k] = false;
                 槽组[k] = 0;
+                槽上态[k] = 0;           // 换人就重开两组比较，别拿上一个实体的值当基准
                 槽稳有[k] = false;       // 顺带清掉 v39 门控的旧基准，避免新实体被旧位置压住
                 离群连[k] = 0;
             }
