@@ -2465,7 +2465,7 @@ static unsigned char  锚今[0x10000];
 static unsigned char  锚前[锚层数][0x10000];
 static int            锚前长[锚层数] = {0};
 static uint64_t       锚我 = 0;
-static int            锚帧 = 0, 锚报 = 0;
+static int            锚帧 = 0, 锚报 = 0, 锚样 = 0;
 static int            锚上心X = 0, 锚上心Z = 0;
 static bool           锚上心有 = false;
 static bool           锚有初 = false;
@@ -2486,30 +2486,31 @@ static bool 屏心世界(const float* m, int* 出X, int* 出Z) {
 }
 
 static void 锚汇总(const uint64_t* 层址, int 心X, int 心Z, int 我槽) {
+    int 上次 = 65536, 已打 = -1;   // 每组合取前两名，用「上次次数」做上限
     ++锚报;
-    char 串[420] = {0};
-    int 位 = 0;
-    位 += snprintf(串 + 位, sizeof(串) - 位, "锚心 %d 我=k%d 心=(%d,%d) Δ=(%d,%d)",
-                   锚报, 我槽, 心X, 心Z, 心X - 锚上心X, 心Z - 锚上心Z);
+    日志("锚心 %d 我=k%d 心=(%d,%d) Δ=(%d,%d) 样本=%d",
+         锚报, 我槽, 心X, 心Z, 心X - 锚上心X, 心Z - 锚上心Z, 锚样);
     for (int t = 0; t < 锚层数; ++t) {
         if (!IsValidAddr(层址[t])) continue;
         for (int ax = 0; ax < 2; ++ax) {
             for (int md = 0; md < 3; ++md) {
-                int 最好 = -1, 次 = 0;
-                for (int o = 0; o < 锚格; ++o) {
-                    const int v = (int)锚计[t][ax][md][o];
-                    if (v > 次) { 次 = v; 最好 = o; }
+                for (int 序 = 0; 序 < 2; ++序) {
+                    int 最好 = -1, 次 = 0;
+                    for (int o = 0; o < 锚格; ++o) {
+                        const int v = (int)锚计[t][ax][md][o];
+                        if (v > 次 && v < (序 ? 上次 : 65536)) { 次 = v; 最好 = o; }
+                    }
+                    if (最好 < 0 || 次 < 10) break;
+                    上次 = 次; 已打 = 最好;
+                    int 现 = 0;
+                    readMemory(层址[t] + 最好 * 4, &现, 4);
+                    日志("锚 %s %s %s 次=%d/%d +0x%x 现=%d", 锚层名[t],
+                         ax ? "Z" : "X", md == 0 ? "int" : (md == 1 ? "f米" : "f毫米"),
+                         次, 锚样, 最好 * 4, 现);
                 }
-                if (最好 < 0 || 次 < 8) continue;
-                int 现 = 0;
-                readMemory(层址[t] + 最好 * 4, &现, 4);
-                日志("锚 %s %s %s 次=%d +0x%x 现=%d", 锚层名[t],
-                     ax ? "Z" : "X", md == 0 ? "int" : (md == 1 ? "f米" : "f毫米"),
-                     次, 最好 * 4, 现);
             }
         }
     }
-    日志("%s", 串);
 }
 
 static void 锚扫描(uint64_t 数组, int 数量, const float* 矩阵, float 宽, float 高, unsigned 我方) {
@@ -2543,6 +2544,7 @@ static void 锚扫描(uint64_t 数组, int 数量, const float* 矩阵, float �
     if (!屏心世界(矩阵, &心X, &心Z)) return;
 
     if (锚上心有) {
+        ++锚样;
         const long long dcx = (long long)心X - 锚上心X;
         const long long dcz = (long long)心Z - 锚上心Z;
         const uint64_t 一 = vm_read<uint64_t>(锚我 + 0xa8);
@@ -2566,7 +2568,7 @@ static void 锚扫描(uint64_t 数组, int 数量, const float* 矩阵, float �
                     const long long d = (long long)b - (long long)a;
                     const long long ad = d < 0 ? -d : d;
                     if (ad >= 20 && ad <= 6000) {
-                        const long long 容X = (long long)(ad * 0.15) + 30;
+                        const long long 容X = (long long)(ad * 0.45) + 80;   // 相机平滑插值 vs 字段 15Hz 步进，可能差一帧
                         if (dcx >= 20 || dcx <= -20) { if (d - dcx <= 容X && dcx - d <= 容X) { if (锚计[t][0][0][格] < 65535) 锚计[t][0][0][格]++; } }
                         if (dcz >= 20 || dcz <= -20) { if (d - dcz <= 容X && dcz - d <= 容X) { if (锚计[t][1][0][格] < 65535) 锚计[t][1][0][格]++; } }
                     }
@@ -2581,7 +2583,7 @@ static void 锚扫描(uint64_t 数组, int 数量, const float* 矩阵, float �
                             const double fd = vb - va;
                             const double af = fd < 0 ? -fd : fd;
                             if (af < 20.0 || af > 6000.0) continue;
-                            const double 容 = af * 0.15 + 30.0;
+                            const double 容 = af * 0.45 + 80.0;
                             if (dcx >= 20 || dcx <= -20) { const double g = fd - (double)dcx; if (g <= 容 && g >= -容) { if (锚计[t][0][1 + md][格] < 65535) 锚计[t][0][1 + md][格]++; } }
                             if (dcz >= 20 || dcz <= -20) { const double g = fd - (double)dcz; if (g <= 容 && g >= -容) { if (锚计[t][1][1 + md][格] < 65535) 锚计[t][1][1 + md][格]++; } }
                         }
