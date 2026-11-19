@@ -1632,12 +1632,12 @@ static inline bool 是好点(int x, int z) {
 static int 槽验(int k, int x, int z, unsigned* X, unsigned* Z) {
     bool 采 = false;
 
-    if (是好点(x) && 槽保有[k]) {
+    if (是好点(x, z) && 槽保有[k]) {
         const long long dx = (long long)x - 槽保X[k];
         const long long dz = (long long)z - 槽保Z[k];
         if (dx * dx + dz * dz <= 槽跳阈 * 槽跳阈) 采 = true;      // 接着上次走
     }
-    if (是好点(x) && !槽保有[k]) {
+    if (是好点(x, z) && !槽保有[k]) {
         // 首次：也要连续 8 帧稳定才算，避免开局把加载期的假值当基准
         if (x == 槽候X[k] && z == 槽候Z[k]) { if (槽候连[k] < 999) ++槽候连[k]; }
         else { 槽候X[k] = x; 槽候Z[k] = z; 槽候连[k] = 1; }
