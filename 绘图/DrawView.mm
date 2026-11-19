@@ -2568,6 +2568,33 @@ static void 整局快照(uint64_t 数组, int 数量) {
     日志("指针变 %d 二变=%d 一变=%d %s", 快照计, 二变总, 一变总, 针串);
 }
 
+// ==================== v52：四槽帧 —— 同帧 4 槽对照 ====================
+// 环 dump 每块只装 1 个槽，看不出「跳的这一帧别的槽是什么」。而这局最缺的正是同帧对照：
+// 21:49:30 f=2888 四个槽同时跳，但 4 块是分开 dump 的，无法确认「k1 跳后的新值
+// 是不是 k3 跳前的旧值」。本行每 3 帧把前 4 个有效槽的 二地址低 32 位 + A/B/C/D
+// 打在同一行，最多 400 行（约 20 秒），足够完整覆盖一次跳变前后。
+static int 四槽帧 = 0;
+static void 四槽行(uint64_t 数组, int 数量, unsigned 帧) {
+    if (四槽帧 >= 400) return;
+    if (帧 % 3 != 0) return;
+    char 串[700] = {0};
+    int 位 = 0, n = 0;
+    for (int k = 0; k < 数量 && n < 4 && 位 < 620; ++k) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (!IsValidAddr(e)) continue;
+        uint64_t 一 = vm_read<uint64_t>(e + 0xa8);
+        uint64_t 二 = IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0;
+        if (!IsValidAddr(二)) continue;
+        const 二十四 r = 读二四(二);
+        位 += snprintf(串 + 位, sizeof(串) - 位, "k%d/%x A(%d,%d) B(%d,%d) | ", k,
+                      (unsigned)(二 & 0xFFFFFFFF), r.A, r.B, r.C, r.D);
+        ++n;
+    }
+    if (n == 0) return;
+    ++四槽帧;
+    日志("四槽 f=%u %s", 帧, 串);
+}
+
 // ==================== v50：坐标猎人（真值反查）====================
 // v49 实测（_ab_v49.log，50 个环 dump × 40 帧 = 2000 个样本）：
 //   ① 指针变 二变=0 一变=0 整整 2000 个样本 —— 每个槽的「一」「二」地址整局一次没变
@@ -2691,7 +2718,7 @@ static inline float 绝对值f(float x) { return x < 0.0f ? -x : x; }
 static unsigned char 猎2缓冲[0x8000];
 static int 猎2计 = 0;
 static int 猎2X层 = -1, 猎2X偏 = -1, 猎2X型 = 0, 猎2Z层 = -1, 猎2Z偏 = -1, 猎2Z型 = 0;
-static void 坐标猎人2(uint64_t 数组, int 数量, const float* 矩阵, float 宽, float 高, unsigned 我方) {
+static void __attribute__((unused)) 坐标猎人2(uint64_t 数组, int 数量, const float* 矩阵, float 宽, float 高, unsigned 我方) {
     if (猎2计 >= 40) return;
     static double 上次 = 0.0;
     const double 现时 = CACurrentMediaTime();
@@ -2776,7 +2803,7 @@ static unsigned char 邻前[12][0x8000];
 static int  邻长[12] = {0};
 static bool 邻就绪[24] = {false};
 static int  邻计 = 0;
-static void 邻域变化(uint64_t 数组, int 数量) {
+static void __attribute__((unused)) 邻域变化(uint64_t 数组, int 数量) {
     if (邻计 >= 100) return;
     static double 上次 = 0.0;
     const double 现时 = CACurrentMediaTime();
@@ -2810,6 +2837,117 @@ static void 邻域变化(uint64_t 数组, int 数量) {
         }
         memcpy(邻前[k], 猎2缓冲, 实长);
         日志("邻 %d k=%d 阵=%d 变%d: %s", 邻计, k, vm_read<int>(e + 52), 条, 条 ? 串 : "无");
+    }
+}
+
+// ==================== v52：层邻 —— 逐帧扫 一/二/三 三层，找「每帧都在动」的坐标字段 ====================
+// 依据 _ab_v51.log（21:47:34~21:53 联机局）：
+//  (1) 21:49:01~21:49:26（快照 4~9）A 组与 B 组逐采样完全相同，k1 从 (53395,56435) 连续跑到
+//      (3741,3972)，五个采样点线性下降 —— 这是真位置，也正是打离线人机时的状态；
+//  (2) 21:49:30 f=2888 同一帧，k1/k3/k8/k6 四个槽同时跳，A≠B，B 从此冻结在分叉瞬间的值
+//      （k1 的 B=(2649,2586) 整局一动不动），A 每 34~40 帧整块换成另一个位置；
+//  (3) 环 dump 1480 个样本：k1 有 5 段「34 帧一字未变」、2 段「40 帧一字未变」，
+//      而 k3 有 9 段只有 3 帧 —— 假值卡住不动、真值每帧微动，这是可以用来自动判别的指纹；
+//  (4) 实体本体 0x8000 内没有任何「变了 + 界内 + 单步 50~6000」的 X/Z 联动（450 行全是
+//      每次 +76 的计时器和 ±1000 的方向分量）→ 本体里没有实时坐标；
+//  (5) 链中间：k5 的链读末址 2c1c55c40 = k3 的「二」2c1c55c14 + 0x2C，所以 21:49:56 两槽读出
+//      完全相同的 (56368,53358) 不是巧合 —— k5 二读失败退化到链读，正好读到 k3 的字段。
+// 缺口：v51 只扫了实体本体，没扫 一/二/三。而游戏能把人画得平滑，必然存在一个「每帧更新」的
+// 位置。本探针就去这三层里找它：只统计「变了 + 新旧都界内 + 单步 1~3000」的偏移，
+// 每 5 秒按命中次数出一张 top 榜。10Hz 采样，纯读，不参与绘制。
+#define 层邻层数 3
+static const int   层长表[层邻层数] = {0x6000, 0x3000, 0x2000};   // 一 / 二 / 三
+static const char* 层名表[层邻层数] = {"一", "二", "三"};
+#define 层邻半长 0x1800
+static unsigned short 层次[层邻层数][层邻半长];
+static int            层旧[层邻层数][层邻半长];
+static int            层新[层邻层数][层邻半长];
+static unsigned char  层今[0x6000];
+static unsigned char  层前[4][层邻层数][0x6000];
+static bool           层有前[4][层邻层数];
+static int            层实长[4][层邻层数];
+static unsigned       层上帧 = 0;
+static int            层轮数 = 0;
+static int            层汇总计 = 0;
+
+static void 层邻汇总(void) {
+    ++层汇总计;
+    for (int t = 0; t < 层邻层数; ++t) {
+        char 串[600] = {0};
+        int 位 = 0, 打 = 0;
+        bool 用过[层邻半长];
+        memset(用过, 0, sizeof(用过));
+        while (打 < 8) {
+            int 最好 = -1, 最次 = 0;
+            for (int o = 0; o < 层邻半长; ++o) {
+                if (用过[o]) continue;
+                if (层次[t][o] > 最次) { 最次 = 层次[t][o]; 最好 = o; }
+            }
+            if (最好 < 0) break;
+            用过[最好] = true;
+            位 += snprintf(串 + 位, sizeof(串) - 位, "+0x%x %d/%d %d->%d  ",
+                         最好 * 4, (int)层次[t][最好], 层轮数, 层旧[t][最好], 层新[t][最好]);
+            ++打;
+        }
+        日志("层频 %d %s %s", 层汇总计, 层名表[t], 打 ? 串 : "无");
+    }
+}
+
+static void 层邻(uint64_t 数组, int 数量) {
+    if (层上帧++ % 6 != 0) return;                 // 10Hz 采样
+    if (层汇总计 >= 400) return;
+
+    uint64_t 实体[4] = {0, 0, 0, 0};
+    int n = 0;
+    for (int k = 0; k < 数量 && n < 4; ++k) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (IsValidAddr(e)) 实体[n++] = e;
+    }
+    if (n == 0) return;
+    ++层轮数;
+
+    static double 上次汇总 = 0.0;
+    const double 现时 = CACurrentMediaTime();
+    if (现时 - 上次汇总 >= 5.0) {
+        上次汇总 = 现时;
+        层邻汇总();
+    }
+
+    for (int i = 0; i < n; ++i) {
+        uint64_t 一 = vm_read<uint64_t>(实体[i] + 0xa8);
+        if (!IsValidAddr(一)) continue;
+        uint64_t 二 = vm_read<uint64_t>(一 + 0x10);
+        uint64_t 三 = IsValidAddr(二) ? vm_read<uint64_t>(二 + 0x0) : 0;
+        uint64_t 层址[层邻层数] = {一, 二, 三};
+
+        for (int t = 0; t < 层邻层数; ++t) {
+            if (!IsValidAddr(层址[t])) continue;
+            int 实长 = 层长表[t];
+            while (实长 >= 0x400 && !readMemory(层址[t], 层今, 实长)) 实长 /= 2;
+            if (实长 < 0x400) continue;
+            if (!层有前[i][t] || 层实长[i][t] != 实长) {
+                memcpy(层前[i][t], 层今, 实长);
+                层实长[i][t] = 实长;
+                层有前[i][t] = true;
+                continue;
+            }
+            for (int o = 0; o + 4 <= 实长; o += 4) {
+                int a, b;
+                memcpy(&a, 层前[i][t] + o, 4);
+                memcpy(&b, 层今 + o, 4);
+                if (a == b) continue;
+                if (a <= -60000 || a >= 60000) continue;   // 两端都要像坐标
+                if (b <= -60000 || b >= 60000) continue;
+                if (a == 0 || b == 0) continue;             // 0 是初始化，不是位置
+                long long d = (long long)b - (long long)a;
+                if (d < 0) d = -d;
+                if (d < 1 || d > 3000) continue;            // 单步 1~3 米
+                const int 格 = o / 4;
+                if (层次[t][格] < 65535) 层次[t][格]++;
+                层旧[t][格] = a; 层新[t][格] = b;
+            }
+            memcpy(层前[i][t], 层今, 实长);
+        }
     }
 }
 
@@ -3707,7 +3845,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v51 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v52 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -3904,9 +4042,15 @@ void Draw::StartBooks() {
     // 只覆盖开局 5 秒、且恰好错过抖动时段，停用；野怪对照每次都「根无效」，也停用。
     整局快照(数组, 数量);
     // v51：猎人2（扩范围 + int32/float 三解释）+ 邻域变化（只报「变了、界内、单步 50~6000」的偏移）
-    // v50 的坐标猎人已给出结论（本体 0x278 是出生点），本版不再调用，函数保留备查。
-    坐标猎人2(数组, 数量, 矩阵, 屏.x, 屏.y, (unsigned)我方阵营);
-    邻域变化(数组, 数量);
+    // v52 停用：本体 0x8000 已扫完（450 行全是每次 +76 的计时器和 ±1000 的方向分量），
+    // 结论是本体里没有实时坐标，继续扫只是重复。函数保留备查。
+    // 坐标猎人2(数组, 数量, 矩阵, 屏.x, 屏.y, (unsigned)我方阵营);
+    // 邻域变化(数组, 数量);
+    // v52：改成扫 一/二/三 三层（本体里没有实时坐标，但那三层里被证实有坐标副本），
+    // 逐帧比「变了 + 新旧都界内 + 单步 1~3000」，每 5 秒出一张命中次数榜。
+    层邻(数组, 数量);
+    // v52：同帧 4 槽对照（每 3 帧一行，400 行封顶），用来判定「跳后的新值是否等于别的槽的旧值」。
+    四槽行(数组, 数量, 帧序);
 
     // v49：帧级诊断的帧号 / 毫秒推进，以及上一帧打标记的环 dump。
     // 放在逐槽循环外，保证一轮所有槽处理完才推进一帧 —— 环里的「相邻帧」是真正的相邻绘制帧。
