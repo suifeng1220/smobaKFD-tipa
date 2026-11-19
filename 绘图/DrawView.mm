@@ -2486,7 +2486,6 @@ static bool 屏心世界(const float* m, int* 出X, int* 出Z) {
 }
 
 static void 锚汇总(const uint64_t* 层址, int 心X, int 心Z, int 我槽) {
-    int 上次 = 65536, 已打 = -1;   // 每组合取前两名，用「上次次数」做上限
     ++锚报;
     日志("锚心 %d 我=k%d 心=(%d,%d) Δ=(%d,%d) 样本=%d",
          锚报, 我槽, 心X, 心Z, 心X - 锚上心X, 心Z - 锚上心Z, 锚样);
@@ -2494,6 +2493,7 @@ static void 锚汇总(const uint64_t* 层址, int 心X, int 心Z, int 我槽) {
         if (!IsValidAddr(层址[t])) continue;
         for (int ax = 0; ax < 2; ++ax) {
             for (int md = 0; md < 3; ++md) {
+                int 上次 = 65536;      // 每组合取前两名，用「上次次数」做上限
                 for (int 序 = 0; 序 < 2; ++序) {
                     int 最好 = -1, 次 = 0;
                     for (int o = 0; o < 锚格; ++o) {
@@ -2501,7 +2501,7 @@ static void 锚汇总(const uint64_t* 层址, int 心X, int 心Z, int 我槽) {
                         if (v > 次 && v < (序 ? 上次 : 65536)) { 次 = v; 最好 = o; }
                     }
                     if (最好 < 0 || 次 < 10) break;
-                    上次 = 次; 已打 = 最好;
+                    上次 = 次;
                     int 现 = 0;
                     readMemory(层址[t] + 最好 * 4, &现, 4);
                     日志("锚 %s %s %s 次=%d/%d +0x%x 现=%d", 锚层名[t],
