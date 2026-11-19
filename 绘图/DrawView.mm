@@ -1630,6 +1630,9 @@ static double    槽时[24] = {0};                  // 本槽上次采信的墙�
 static int       槽候X[24] = {0}, 槽候Z[24] = {0}, 槽候连[24] = {0};
 static int       槽换基计 = 0;
 static uint64_t  槽实[24] = {0};        // v59：本槽当前绑定的实体
+// v61 诊断：本槽当帧「二」对象的完整地址，供 坐标定位 扫描用
+static uint64_t  槽二址[24] = {0};
+static int       定位扫次 = 0;
 // v60：钳位平滑用
 static int       槽远连[24] = {0};      // 连续「超阈」帧数
 static int       槽远向X[24] = {0}, 槽远向Z[24] = {0};
@@ -1663,29 +1666,24 @@ static int 槽验(int k, uint64_t 实体, int x, int z, unsigned* X, unsigned* Z
             const long long dx = (long long)x - 槽保X[k];
             const long long dz = (long long)z - 槽保Z[k];
             const double 距 = sqrt((double)dx * dx + (double)dz * dz);
-            if (距 <= (double)槽跳阈) {          // 正常跑动：直接跟
+            if (距 <= 槽跟步) {                  // 正常跑动（离线实测 250~370/帧）：直接跟
                 槽保X[k] = x; 槽保Z[k] = z;
                 槽远连[k] = 0; 槽来回[k] = false;
             } else {
-                // 超阈：必须区分「真的换位置」和「换写入者的来回抖」
+                // 超步长：绝不允许一帧输出超过 槽跟步(400)。
+                // v60 的教训：_ab_v60.log 里我加的「连续 30 帧同向就一次搬过去」制造了 33 次换基，
+                // 输出跳幅最大 140406（v59 是 1901）—— 等于把 v59 压住的东西又亲手放出去了。
                 const bool 反 = (槽远连[k] > 0)
                     && ((long long)dx * 槽远向X[k] + (long long)dz * 槽远向Z[k] < 0);
                 if (反) 槽来回[k] = true;
                 槽远连[k] = 反 ? 1 : (槽远连[k] + 1);
                 槽远向X[k] = (int)dx; 槽远向Z[k] = (int)dz;
-                if (槽来回[k]) {
-                    // 来回抖（A/B 交替、换写入者）：原地钉住，一帧都不动 —— 「闪」的最短路径解
-                } else if (槽远连[k] >= 槽换基帧) {
-                    // 连续 30 帧同向远离 = 真换位置（复活/传送），一次搬过去
-                    槽保X[k] = x; 槽保Z[k] = z;
-                    槽远连[k] = 0;
-                    if (槽换基计 < 200) { ++槽换基计; 日志("换基 k=%d 值=(%d,%d)", k, x, z); }
-                } else {
-                    // 单向大位移：单帧最多挪 槽跟步(400) 世界单位，眼睛看不出来
+                if (!槽来回[k]) {                // 单向大位移：单帧只挪 槽跟步，眼睛看不出来
                     const double 比 = 槽跟步 / 距;
                     槽保X[k] += (int)((double)dx * 比);
                     槽保Z[k] += (int)((double)dz * 比);
                 }
+                // 槽来回 为真 = 读数在两点之间反复横跳 = 换写入者，原地钉住一帧都不动
             }
         }
         槽实[k] = 实体;
@@ -1726,6 +1724,7 @@ static int 读实体坐标(int k, uint64_t 实体, unsigned* X, unsigned* Z) {
     末次A = 末次B = 末次C = 末次D = 0;
     末次态 = 0;
     末次读到二 = IsValidAddr(二);
+    if (k >= 0 && k < 24) 槽二址[k] = 二;      // v61：留给 坐标定位 扫描
     if (IsValidAddr(二)) {
         const 二十四 r = 读二四(二);
         const bool okA = r.有 && 组可用(r.A, r.B);
@@ -4407,7 +4406,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v60 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v61 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -5314,6 +5313,43 @@ void Draw::StartBooks() {
             }
             日志("输出跳幅[0..9]= %s", 出串);
         }
+        // ==================== v61：坐标定位扫描 ====================
+        // 目的：直接找出「二 对象里哪个偏移才是真坐标」，不再靠猜。
+        // 依据：_ab_v60.log 的世界跳变 30 条全是 4~14 万的对角跳
+        //   （k7: (-36951,18060)→(50320,-26000) 距97763；k1: (56368,53358)→(2006,53358)），
+        //   说明 +0x2c/+0x34 这一对偏移在多帧之间属于不同单位 —— 必须换偏移，不能继续在
+        //   这一对上做滤波（滤波只能决定「画错」还是「不画」）。
+        // 做法：把「二」+0x00~+0x58 每 4 字节取一个 int，相邻 8 字节配成 (x,z)，
+        //   逐对投影到屏幕；落在屏幕内且离屏心 >150px 的，就是场上真实单位的位置
+        //   （屏心恒是我自己，必须排除，见 _ab_v59.log「锚照 二A 投=(1398,743) 命中」）。
+        if (在对局 && 定位扫次 < 20) {
+            ++定位扫次;
+            for (int k2 = 0; k2 < 10; ++k2) {
+                if (!槽二址[k2] || !IsValidAddr(槽二址[k2])) continue;
+                char 行[600] = {0};
+                int 位3 = 0;
+                for (int o = 0; o + 8 <= 0x60; o += 4) {
+                    int vx = 0, vz = 0;
+                    readMemory(槽二址[k2] + o, &vx, 4);
+                    readMemory(槽二址[k2] + o + 8, &vz, 4);
+                    if (vx < -70000 || vx > 70000) continue;
+                    if (vz < -70000 || vz > 70000) continue;
+                    if (vx == 0 && vz == 0) continue;
+                    float sx = 0, sy = 0;
+                    if (!投影(矩阵, vx, vz, &sx, &sy, 屏.x, 屏.y)) continue;
+                    if (sx < 0 || sy < 0 || sx > 屏.x || sy > 屏.y) continue;
+                    const float cxs = 屏.x * 0.5f, cys = 屏.y * 0.5f;
+                    const float ddx = sx - cxs, ddy = sy - cys;
+                    if (ddx * ddx + ddy * ddy < 150.0f * 150.0f) continue;   // 屏心 = 我自己
+                    if (位3 < 460)
+                        位3 += snprintf(行 + 位3, sizeof(行) - 位3, " +%02x(%d,%d)>%.0f,%.0f",
+                                        o, vx, vz, sx, sy);
+                }
+                日志("定位扫 k=%d 二=%llx 保=(%d,%d)%s%s", k2, (unsigned long long)槽二址[k2],
+                     槽保X[k2], 槽保Z[k2], 位3 > 0 ? "" : " 无屏内候选", 行);
+            }
+        }
+
         // 小地图标定：图矩形 / 缩放 / 前 3 个样本的 世界坐标 → 小图坐标
         日志("地图标定 图=%.1f/%.1f/%.1f 缩=%.2f 框=(%.0f,%.0f,%.0f)",
              cfg_mapX, cfg_mapY, cfg_mapSize, 缩放,
