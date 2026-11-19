@@ -2439,88 +2439,150 @@ static void 我方自检(uint64_t 数组, int 数量, const float* 矩阵, float
              敌数, 敌屏内, (敌近 > 1e8) ? -1.0 : 敌近);
 }
 
-// ==================== v53：屏心锚定扫描 ====================
-// 依据 v52 这局（_ab_v52.log 22:12:27~22:14:20）：
-//  ① 22:12:42~22:12:57 五槽一起线性移动（k3/k4 同值、k5/k8 同值，2~4 m/s），
-//     22:13:01 全部槽同一秒跳到别处（k1 -1688,1629→47774,-28095；k8 同值），
-//     从这一秒起 世界跳变 连续不断，跳幅 5 万~13 万。
-//  ② 同一秒之后连「我」(k6) 的 二 都投不到屏心：距心 40~97 → 2870 → 3216 → 21000…
-//     自检只能在 阵1 里挑离屏心最近的（k0/k2/k9），说明 二 这条链在对局里不再是位置。
-//     坐标对照 也一致：22:12:52 k4(2168,47645)、k5(48177,4867) 正常，22:13:02 起全乱。
-//  ③ 层频 显示 一/三 的前 8 名全是毫秒计时器（+0x4d8 每秒 +1100、单调不回头），
-//     二 只有 +0x2c/+0x34 与 +0x44/+0x4c 两对副本在动，且 +0x44 在 22:13:02 后冻结
-//     （命中数停在 405 不再增加）。所以「哪个偏移像坐标」已经判不出来。
-// 结论：不能再靠内存值本身挑字段。本版换一个与内存无关的真值来源 ——
-//   相机一直跟着我，屏幕中心对应的地面点就是我的世界位置，它只由矩阵决定。
-//   投影 = ((m0*x+m8*z+m12)/w, (m1*x+m9*z+m13)/w)，令两者为 0 解二元一次方程即可。
-//   然后拿这个点的「帧间位移」去 本体/一/二/三 四层里逐 4 字节找同位移的字段：
-//   谁的每一步位移都与屏心点相同，谁就是位置字段。位移比对不受单位、不受偏移常量影响。
+// ==================== v54：屏心投影锚定（替掉 v53 的位移判据）====================
+// v53 那套判据被这一局日志证伪（_ab_v53.log），不是「没命中」，是「判据本身错」：
+//  ① 榜上 X 和 Z 落在同一个偏移上双份计票：二 X 次=59/302 +0x2c、二 Z 次=78/302 +0x2c。
+//     真坐标的 X 和 Z 不可能共用一个偏移 —— 这说明计到的是噪声，不是坐标对。
+//  ② 只有 int 解释上榜，float 米 / float 毫米 一次都没中。
+//  ③ 拿「屏心世界点的帧间位移」当真值，本身就是错的：
+//     屏心点 = 我 + L×相机前向，相机一转向它就绕着我转，位移里混进了旋转项。
+//     实测 23:03:40 (2407,1656) → 23:03:45 (10117,9650)，5 秒算出来走 11 米；
+//     同一局 23:06:05~23:06:15 站着不动时连续三拍 Δ=(0,0)，说明相机不动它就不动 ——
+//     即它是「相机的点」，不是「我的位置」。
+// 这一局真正的发现（决定性，不需要再猜）：
+//   整局 快照 里 10 个槽的 二 组A/组B 全部是小数或计时器或乱码，没有一个是 ±5 万的世界值：
+//     k6(我) 732,786 → 1027,1030 → 1271,72 → -1083857384,859
+//     k0     1276,1261 全程一字不变（静态字段）
+//     k9     5811,8 → 22912,8（A 单调涨、每秒约 +1100 = 毫秒计时器）
+//     k2     403378440,403378440（X 与 Z 完全相等 —— 两个不相干字段被拼成一对）
+//   而同一个我，屏心反解出来的位置在 (-53416,-55081) ~ (42246,50929) 之间正常跑动。
+//   ⇒ 联机对局里 实体 → +0xa8 → +0x10 这条链指的不再是「位置组件」，
+//     而 v43 在人机局实测这条链「投=400/400、屏滑=399/400、屏最大跳=15px」是完美坐标。
+//     这就是「离线人机正常、一进联机就开始跳」的真正机制：链指错了对象，不是值在跳。
+// v54 换一个绝对判据，彻底不用「位移」：
+//   相机第三人称跟随我 ⇒ 我永远投在屏幕上同一个像素位置。
+//   加载期 二 还准（就是 v43 那次实测），先用它把这个像素位置量出来（24 次平均），
+//   之后整局拿这个位置当尺子：谁的投影落在基准 ±80px 内，谁就是我的位置字段。
+//   判据与位移、旋转、插值、帧率全无关，也不拿任何内存值当真值。
+// 三组对照放在同一行输出，互相钉死，防止我再一次自证：
+//   直读 0x2b8/0x2c0  → v37 实测英雄上是常量垃圾 (500,3213)，预期「偏」；
+//   出生点 0x278/0x280 → v50 实测 65 秒一字不变，预期「偏」；
+//   二 组A / 组B      → 人机局是完美坐标，这局若「偏」就直接证明链已指错对象。
+// 另外每张榜打 4 层 vtable：对象类型一换 vtable 立刻变，这是「指错对象」的铁证。
 #define 锚层数 4
-static const int   锚长表[锚层数] = {0x10000, 0x6000, 0x3000, 0x2000};
+static const int   锚长表[锚层数] = {0x40000, 0x8000, 0x4000, 0x4000};
 static const char* 锚层名[锚层数] = {"本体", "一", "二", "三"};
-#define 锚格 0x4000
-// [层][轴 0=X 1=Z][解释 0=int 1=float米 2=float毫米][偏移/4]
-static unsigned short 锚计[锚层数][2][3][锚格];
-static unsigned char  锚今[0x10000];
-static unsigned char  锚前[锚层数][0x10000];
-static int            锚前长[锚层数] = {0};
-static uint64_t       锚我 = 0;
-static int            锚帧 = 0, 锚报 = 0, 锚样 = 0;
-static int            锚上心X = 0, 锚上心Z = 0;
-static bool           锚上心有 = false;
-static bool           锚有初 = false;
+#define 锚格 0x10000                      // 0x40000 / 4
+static unsigned short 锚扫计[锚层数][3][锚格];
+static unsigned char  锚扫今[0x40000];
+static int   锚扫样 = 0, 锚扫报 = 0, 锚扫轮 = 0, 锚扫帧 = 0;
+static int   锚扫样层[锚层数] = {0};   // 轮转扫，每层样本要分开算，否则命中率虚低 4 倍
+static float 锚基X = 0.0f, 锚基Y = 0.0f;
+static int   锚基样 = 0, 锚基试 = 0;
+static bool  锚基有 = false;
+static uint64_t 锚我 = 0;
+static bool     锚有初 = false;
 
-// 屏幕中心对应的地面点（世界毫米）。纯数学，不读内存。
-static bool 屏心世界(const float* m, int* 出X, int* 出Z) {
-    const double a = m[0], b = m[8], c = m[12];
-    const double d = m[1], e = m[9], f = m[13];
-    const double det = a * e - b * d;
-    if (fabs(det) < 1e-12) return false;
-    const double x = (b * f - c * e) / det;
-    const double z = (c * d - a * f) / det;
-    if (!isfinite(x) || !isfinite(z)) return false;
-    if (x < -103.5 || x > 103.5 || z < -103.5 || z > 103.5) return false;
-    *出X = (int)(x * 1000.0);
-    *出Z = (int)(z * 1000.0);
+// 与 投影() 同式，省掉 isfinite 和重复的 /1000，扫描里要跑十几万次
+static inline bool 锚投(const float* m, int X, int Z, float 宽, float 高,
+                        float* px, float* py) {
+    const float x = (float)X * 0.001f, z = (float)Z * 0.001f;
+    const float w = m[2] * x + m[10] * z + m[14];
+    if (!(w > 0.001f)) return false;
+    const float inv = 1.0f / w;
+    *px = ((m[0] * x + m[8] * z + m[12]) * inv + 1.0f) * 宽 * 0.5f;
+    *py = (1.0f - (m[1] * x + m[9] * z + m[13]) * inv) * 高 * 0.5f;
     return true;
 }
 
-static void 锚汇总(const uint64_t* 层址, int 心X, int 心Z, int 我槽) {
-    ++锚报;
-    日志("锚心 %d 我=k%d 心=(%d,%d) Δ=(%d,%d) 样本=%d",
-         锚报, 我槽, 心X, 心Z, 心X - 锚上心X, 心Z - 锚上心Z, 锚样);
+// 容差 ±200px，不是 ±80：基准是加载期采的，那时相机更高更远，人物在屏幕上的
+// 位置和实战期可能差一两百像素。放宽不影响判断 —— 随机投影落进 400×400 区域的
+// 概率只有 (400/1290)×(400/2796)≈4.3%，而真位置字段的命中率接近 100%，
+// 榜上「次/样本」一看就分得开。噪声底 4%，命中率 >70% 才算数。
+#define 锚容 200.0f
+static inline bool 锚基上(float px, float py) {
+    return px > 锚基X - 锚容 && px < 锚基X + 锚容 &&
+           py > 锚基Y - 锚容 && py < 锚基Y + 锚容;
+}
+
+static void 锚照(const char* 名, bool 有, int X, int Z,
+                 const float* m, float 宽, float 高) {
+    if (!有) { 日志("锚照 %s 无值", 名); return; }
+    float px = 0.0f, py = 0.0f;
+    if (!锚投(m, X, Z, 宽, 高, &px, &py)) {
+        日志("锚照 %s 值=(%d,%d) w<=0 投不到", 名, X, Z);
+        return;
+    }
+    日志("锚照 %s 值=(%d,%d) 投=(%.0f,%.0f) 距基=(%.1f,%.1f) %s",
+         名, X, Z, px, py, px - 锚基X, py - 锚基Y, 锚基上(px, py) ? "命中" : "偏");
+}
+
+static void 锚榜(const uint64_t* 层址, const float* m, float 宽, float 高) {
+    ++锚扫报;
+
+    // ① 四层 vtable：指错对象 / 换类型，这里第一个看出来
+    {
+        const uint64_t 本 = vm_read<uint64_t>(层址[0]);
+        const uint64_t 一v = IsValidAddr(层址[1]) ? vm_read<uint64_t>(层址[1]) : 0;
+        const uint64_t 二v = IsValidAddr(层址[2]) ? vm_read<uint64_t>(层址[2]) : 0;
+        const uint64_t 三v = IsValidAddr(层址[3]) ? vm_read<uint64_t>(层址[3]) : 0;
+        日志("锚层 vtable 本=%llx 一=%llx 二=%llx 三=%llx 样本=%d",
+             (unsigned long long)本, (unsigned long long)一v,
+             (unsigned long long)二v, (unsigned long long)三v, 锚扫样);
+    }
+
+    // ② 三组对照
+    {
+        unsigned ux = 0, uz = 0;
+        const bool 直有 = 读坐标值(锚我 + SDK::坐标X, &ux, &uz);
+        锚照("直读0x2b8", 直有, (int)ux, (int)uz, m, 宽, 高);
+        int bx = 0, bz = 0;
+        if (readMemory(锚我 + 0x278, &bx, 4) && readMemory(锚我 + 0x280, &bz, 4))
+            锚照("出生点0x278", true, bx, bz, m, 宽, 高);
+        else 锚照("出生点0x278", false, 0, 0, m, 宽, 高);
+        const 二十四 r = 读二四(层址[2]);
+        if (r.有) {
+            锚照("二A(0x2c,0x34)", true, r.A, r.B, m, 宽, 高);
+            锚照("二B(0x44,0x4c)", true, r.C, r.D, m, 宽, 高);
+        } else {
+            锚照("二A(0x2c,0x34)", false, 0, 0, m, 宽, 高);
+            锚照("二B(0x44,0x4c)", false, 0, 0, m, 宽, 高);
+        }
+    }
+
+    // ③ 榜：每层每种解释取前 2 名。次/样本 接近 1 的那一项就是位置字段。
     for (int t = 0; t < 锚层数; ++t) {
         if (!IsValidAddr(层址[t])) continue;
-        for (int ax = 0; ax < 2; ++ax) {
-            for (int md = 0; md < 3; ++md) {
-                int 上次 = 65536;      // 每组合取前两名，用「上次次数」做上限
-                for (int 序 = 0; 序 < 2; ++序) {
-                    int 最好 = -1, 次 = 0;
-                    for (int o = 0; o < 锚格; ++o) {
-                        const int v = (int)锚计[t][ax][md][o];
-                        if (v > 次 && v < (序 ? 上次 : 65536)) { 次 = v; 最好 = o; }
-                    }
-                    if (最好 < 0 || 次 < 10) break;
-                    上次 = 次;
-                    int 现 = 0;
-                    readMemory(层址[t] + 最好 * 4, &现, 4);
-                    日志("锚 %s %s %s 次=%d/%d +0x%x 现=%d", 锚层名[t],
-                         ax ? "Z" : "X", md == 0 ? "int" : (md == 1 ? "f米" : "f毫米"),
-                         次, 锚样, 最好 * 4, 现);
+        for (int md = 0; md < 3; ++md) {
+            int 上次 = 65536;
+            for (int 序 = 0; 序 < 2; ++序) {
+                int 最好 = -1, 次 = 0;
+                for (int o = 0; o < 锚格; ++o) {
+                    const int v = (int)锚扫计[t][md][o];
+                    if (v > 次 && v < 上次) { 次 = v; 最好 = o; }
                 }
+                if (最好 < 0 || 次 < 12) break;
+                上次 = 次;
+                int 甲 = 0, 乙4 = 0, 乙8 = 0;
+                readMemory(层址[t] + 最好 * 4, &甲, 4);
+                readMemory(层址[t] + 最好 * 4 + 4, &乙4, 4);
+                readMemory(层址[t] + 最好 * 4 + 8, &乙8, 4);
+                日志("锚 %s %s 次=%d/%d +0x%x 值4=(%d,%d) 值8=(%d,%d)",
+                     锚层名[t], md == 0 ? "int" : (md == 1 ? "f米" : "f毫米"),
+                     次, 锚扫样层[t], 最好 * 4, 甲, 乙4, 甲, 乙8);
             }
         }
     }
 }
 
-static void 锚扫描(uint64_t 数组, int 数量, const float* 矩阵, float 宽, float 高, unsigned 我方) {
-    if (锚报 >= 150) return;
-    if (++锚帧 % 12 != 0) return;                 // 约 5Hz
+static void 锚扫描(uint64_t 数组, int 数量, const float* m, float 宽, float 高, unsigned 我方) {
+    if (锚扫报 >= 150) return;
+    if (++锚扫帧 % 6 != 0) return;               // 约 10Hz
 
-    int 我槽 = -1;
-    // 「我」只用一次命中就锁定：加载期 二 是准的，那时距心 40~97，抓住就不再换。
+    // ---- 锁「我」：加载期 二 还准，取投在屏幕中心 250px 内、离得最近的我方实体 ----
     if (!IsValidAddr(锚我)) {
         float 最小 = 1e18f;
+        int 我槽 = -1;
         for (int k = 0; k < 数量 && k < 12; ++k) {
             uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
             if (!IsValidAddr(e)) continue;
@@ -2528,76 +2590,94 @@ static void 锚扫描(uint64_t 数组, int 数量, const float* 矩阵, float �
             unsigned x = 0, z = 0;
             if (!读英雄坐标(e, &x, &z)) continue;
             float sx = 0, sy = 0;
-            if (!投影(矩阵, (int)x, (int)z, &sx, &sy, 宽, 高)) continue;
+            if (!投影(m, (int)x, (int)z, &sx, &sy, 宽, 高)) continue;
             const float dx = sx - 宽 * 0.5f, dy = sy - 高 * 0.5f;
             const float d = dx * dx + dy * dy;
             if (d < 250.0f * 250.0f && d < 最小) { 最小 = d; 我槽 = k; 锚我 = e; }
         }
-        if (IsValidAddr(锚我) && !锚有初) { 锚有初 = true; 日志("锚 锁定我 实体=%llx 槽=%d", 锚我, 我槽); }
-    } else {
-        for (int k = 0; k < 数量 && k < 12; ++k)
-            if (vm_read<uint64_t>(数组 + 24ULL * k) == 锚我) { 我槽 = k; break; }
-    }
-    if (!IsValidAddr(锚我)) return;
-
-    int 心X = 0, 心Z = 0;
-    if (!屏心世界(矩阵, &心X, &心Z)) return;
-
-    if (锚上心有) {
-        ++锚样;
-        const long long dcx = (long long)心X - 锚上心X;
-        const long long dcz = (long long)心Z - 锚上心Z;
-        const uint64_t 一 = vm_read<uint64_t>(锚我 + 0xa8);
-        uint64_t 二 = IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0;
-        uint64_t 三 = IsValidAddr(二) ? vm_read<uint64_t>(二 + 0x0) : 0;
-        const uint64_t 层址[锚层数] = {锚我, 一, 二, 三};
-
-        for (int t = 0; t < 锚层数; ++t) {
-            if (!IsValidAddr(层址[t])) continue;
-            int 实长 = 锚长表[t];
-            while (实长 >= 0x800 && !readMemory(层址[t], 锚今, 实长)) 实长 /= 2;
-            if (实长 < 0x800) continue;
-            if (锚前长[t] != 实长) { memcpy(锚前[t], 锚今, 实长); 锚前长[t] = 实长; continue; }
-
-            for (int o = 0; o + 4 <= 实长; o += 4) {
-                int a = 0, b = 0;
-                memcpy(&a, 锚前[t] + o, 4);
-                memcpy(&b, 锚今 + o, 4);
-                const int 格 = o / 4;
-                if (a != b) {
-                    const long long d = (long long)b - (long long)a;
-                    const long long ad = d < 0 ? -d : d;
-                    if (ad >= 20 && ad <= 6000) {
-                        const long long 容X = (long long)(ad * 0.45) + 80;   // 相机平滑插值 vs 字段 15Hz 步进，可能差一帧
-                        if (dcx >= 20 || dcx <= -20) { if (d - dcx <= 容X && dcx - d <= 容X) { if (锚计[t][0][0][格] < 65535) 锚计[t][0][0][格]++; } }
-                        if (dcz >= 20 || dcz <= -20) { if (d - dcz <= 容X && dcz - d <= 容X) { if (锚计[t][1][0][格] < 65535) 锚计[t][1][0][格]++; } }
-                    }
-                    float fa = 0.0f, fb = 0.0f;
-                    memcpy(&fa, 锚前[t] + o, 4);
-                    memcpy(&fb, 锚今 + o, 4);
-                    if (isfinite(fa) && isfinite(fb)) {
-                        for (int md = 0; md < 2; ++md) {
-                            const double 倍 = (md == 0) ? 1000.0 : 1.0;    // 米 / 毫米
-                            const double va = (double)fa * 倍, vb = (double)fb * 倍;
-                            if (va < -103500.0 || va > 103500.0 || vb < -103500.0 || vb > 103500.0) continue;
-                            const double fd = vb - va;
-                            const double af = fd < 0 ? -fd : fd;
-                            if (af < 20.0 || af > 6000.0) continue;
-                            const double 容 = af * 0.45 + 80.0;
-                            if (dcx >= 20 || dcx <= -20) { const double g = fd - (double)dcx; if (g <= 容 && g >= -容) { if (锚计[t][0][1 + md][格] < 65535) 锚计[t][0][1 + md][格]++; } }
-                            if (dcz >= 20 || dcz <= -20) { const double g = fd - (double)dcz; if (g <= 容 && g >= -容) { if (锚计[t][1][1 + md][格] < 65535) 锚计[t][1][1 + md][格]++; } }
-                        }
-                    }
-                }
-            }
-            memcpy(锚前[t], 锚今, 实长);
+        if (IsValidAddr(锚我) && !锚有初) {
+            锚有初 = true;
+            日志("锚 锁定我 实体=%llx 槽=%d", (unsigned long long)锚我, 我槽);
         }
-
-        static double 上汇总 = 0.0;
-        const double 现 = CACurrentMediaTime();
-        if (现 - 上汇总 >= 5.0) { 上汇总 = 现; 锚汇总(层址, 心X, 心Z, 我槽); }
+        return;                                   // 锁定这一拍不扫
     }
-    锚上心X = 心X; 锚上心Z = 心Z; 锚上心有 = true;
+
+    // ---- 基准：把我自己在屏幕上的像素位置量出来 ----
+    if (!锚基有) {
+        ++锚基试;
+        unsigned x = 0, z = 0;
+        float sx = 0, sy = 0;
+        if (读英雄坐标(锚我, &x, &z) && 投影(m, (int)x, (int)z, &sx, &sy, 宽, 高)) {
+            锚基X += sx; 锚基Y += sy; ++锚基样;
+        }
+        if (锚基样 >= 24) {
+            锚基X /= 24.0f; 锚基Y /= 24.0f; 锚基有 = true;
+            日志("锚基 (%.0f,%.0f) 采到 %d 次", 锚基X, 锚基Y, 锚基样);
+        } else if (锚基试 >= 60) {
+            锚基X = 宽 * 0.5f; 锚基Y = 高 * 0.6f; 锚基有 = true;
+            日志("锚基 采样失败(%d/%d) 退回屏心 (%.0f,%.0f)", 锚基样, 锚基试, 锚基X, 锚基Y);
+        }
+        return;
+    }
+
+    // ---- 四层轮转，每拍扫一层。绝对判据不需要相邻帧，轮转不丢信息 ----
+    uint64_t 层址[锚层数];
+    层址[0] = 锚我;
+    const uint64_t 一 = vm_read<uint64_t>(锚我 + 0xa8);
+    层址[1] = 一;
+    层址[2] = IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0;
+    层址[3] = IsValidAddr(层址[2]) ? vm_read<uint64_t>(层址[2]) : 0;
+
+    const int t = (锚扫轮++) % 锚层数;
+    if (!IsValidAddr(层址[t])) return;
+    int 长 = 锚长表[t];
+    while (长 >= 0x800 && !readMemory(层址[t], 锚扫今, 长)) 长 /= 2;
+    if (长 < 0x800) return;
+    ++锚扫样;
+    ++锚扫样层[t];
+
+    for (int o = 0; o + 12 <= 长; o += 4) {
+        // ---- int32 解释：X 与 Z 可能隔 4 或 8 字节（已知副本都是隔 8）----
+        int 甲 = 0;
+        memcpy(&甲, 锚扫今 + o, 4);
+        if (甲 != 0 && 甲 > -103500 && 甲 < 103500) {
+            for (int 跳 = 1; 跳 <= 2; ++跳) {
+                int 乙 = 0;
+                memcpy(&乙, 锚扫今 + o + 跳 * 4, 4);
+                if (乙 == 0 || 乙 <= -103500 || 乙 >= 103500) continue;
+                float px = 0.0f, py = 0.0f;
+                if (!锚投(m, 甲, 乙, 宽, 高, &px, &py)) continue;
+                if (!锚基上(px, py)) continue;
+                const int 格 = o / 4;
+                if (锚扫计[t][0][格] < 65535) ++锚扫计[t][0][格];
+            }
+        }
+        // ---- float 解释：米（×1000）/ 毫米（×1）----
+        float fa = 0.0f;
+        memcpy(&fa, 锚扫今 + o, 4);
+        if (!isfinite(fa) || fa == 0.0f) continue;
+        for (int md = 1; md <= 2; ++md) {
+            const float 倍 = (md == 1) ? 1000.0f : 1.0f;
+            const float 甲f = fa * 倍;
+            if (!(甲f > -103500.0f && 甲f < 103500.0f)) continue;
+            for (int 跳 = 1; 跳 <= 2; ++跳) {
+                float fb = 0.0f;
+                memcpy(&fb, 锚扫今 + o + 跳 * 4, 4);
+                if (!isfinite(fb) || fb == 0.0f) continue;
+                const float 乙f = fb * 倍;
+                if (!(乙f > -103500.0f && 乙f < 103500.0f)) continue;
+                float px = 0.0f, py = 0.0f;
+                if (!锚投(m, (int)甲f, (int)乙f, 宽, 高, &px, &py)) continue;
+                if (!锚基上(px, py)) continue;
+                const int 格 = o / 4;
+                if (锚扫计[t][md][格] < 65535) ++锚扫计[t][md][格];
+            }
+        }
+    }
+
+    static double 上锚榜 = 0.0;
+    const double 现 = CACurrentMediaTime();
+    if (现 - 上锚榜 >= 5.0) { 上锚榜 = 现; 锚榜(层址, m, 宽, 高); }
 }
 
 // ==================== v47：两跳指针轨迹 + 野怪已知真值对照 ====================
@@ -4006,7 +4086,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v53 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v54 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -4209,8 +4289,9 @@ void Draw::StartBooks() {
     // 邻域变化(数组, 数量);
     // v52：改成扫 一/二/三 三层（本体里没有实时坐标，但那三层里被证实有坐标副本），
     // 逐帧比「变了 + 新旧都界内 + 单步 1~3000」，每 5 秒出一张命中次数榜。
-    // v53：屏心锚定扫描 —— 用矩阵反解「屏幕中心地面点」的帧间位移，
-    // 去 本体/一/二/三 四层找同位移的字段（int / float 米 / float 毫米三种解释）。
+    // v54：屏心投影锚定 —— 相机跟随我 ⇒ 我恒投在屏幕同一像素位置。
+    // 加载期用「二」把这个位置量出来当基准，整局找投影落基准 ±80px 的字段。
+    // v53 的「屏心点位移」判据已废（它混了相机旋转项，见函数头注释）。
     // 层邻 停用：v52 已给出结论（一/三 前 8 名全是毫秒计时器，二 只有两对副本），函数保留备查。
     锚扫描(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
     // v52：同帧 4 槽对照（每 3 帧一行，400 行封顶），用来判定「跳后的新值是否等于别的槽的旧值」。
