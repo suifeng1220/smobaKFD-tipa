@@ -1416,17 +1416,23 @@ static int 用二计 = 0, 二失败计 = 0, 二链不符计 = 0;
 // v47 实测联机局会出现「同一槽在两值间交替」（稳压涨、瞬移不涨），
 // 所以必须能把四份值同时打出来，判别交替是「同一字段双缓冲」还是「两组字段不同步」。
 // 从 二+0x28 一次读 40 字节（到 +0x50），四份值同帧同源，不会拼出半新半旧。
-typedef struct { int A, B, C, D; bool 有; } 二十四;
+typedef struct { int A, B, C, D; bool 有; uint64_t 类; } 二十四;   // v56：类 = 二+0x00 的 vtable
 
 static 二十四 读二四(uint64_t 二) {
-    二十四 r; r.A = r.B = r.C = r.D = 0; r.有 = false;
+    二十四 r; r.A = r.B = r.C = r.D = 0; r.有 = false; r.类 = 0;
     if (!IsValidAddr(二)) return r;
-    unsigned char 快照[40];
-    if (!readMemory(二 + 0x28, 快照, sizeof(快照))) return r;
-    memcpy(&r.A, 快照 + 0x04, 4);   // 二 + 0x2C
-    memcpy(&r.B, 快照 + 0x0C, 4);   // 二 + 0x34
-    memcpy(&r.C, 快照 + 0x1C, 4);   // 二 + 0x44
-    memcpy(&r.D, 快照 + 0x24, 4);   // 二 + 0x4C
+    // v56：从 二+0 一次读 96 字节，把 vtable 和四份坐标一起拿到 ——
+    // 分开读会拼出「旧对象的坐标 + 新对象的 vtable」，校验就没意义了。
+    unsigned char 快照[96];
+    // 从 二+0 读到 +0x60，可能跨页；跨页就降档到刚好覆盖 +0x4C+4 的长度
+    if (!readMemory(二, 快照, sizeof(快照)) &&
+        !readMemory(二, 快照, 88) &&
+        !readMemory(二, 快照, 80)) return r;
+    memcpy(&r.类, 快照 + 0x00, 8);   // 二 + 0x00 = vtable（v54 实测就在这）
+    memcpy(&r.A, 快照 + 0x2C, 4);    // 二 + 0x2C
+    memcpy(&r.B, 快照 + 0x34, 4);    // 二 + 0x34
+    memcpy(&r.C, 快照 + 0x44, 4);    // 二 + 0x44
+    memcpy(&r.D, 快照 + 0x4C, 4);    // 二 + 0x4C
     r.有 = true;
     return r;
 }
@@ -1553,6 +1559,82 @@ static unsigned char 槽上态[24] = {0};   // bit0 = 上帧组A合法，bit1 = 
 static unsigned 上次直X = 0, 上次直Z = 0;
 static bool     上次直有 = false;
 
+// ==================== v56：vtable 校验 + 自愈（这一版改的是绘制主路径，不是探针）====================
+// 依据同一 APK 两局对照（联机 _ab_v54.log 23:23:45~，离线 _ab_off.log 23:31:09~ 共 16 分钟）：
+//   · 二 的地址两局都恒定，但 二 的 vtable 联机局换了 8 次（间隔 25~35 秒），离线局一个值不变；
+//   · 本/一/三 的 vtable 两局全程一模一样、从不变。
+//   ⇒ 二 所在那块内存被回收后原地重建成别的对象，我们还在用旧地址读 +0x2c/+0x34。
+//     这不是「值在跳」，是读到别人对象的字段（use-after-free），所以任何滤波/投票都治不了。
+// v56 的处理：
+//   1) 每帧把 二 的 vtable 和四份坐标一起读出来（同一次读，不会拼出新旧混杂）；
+//   2) vtable 与学习值相同 → 直接采用；
+//   3) vtable 变了 → 看新值是否与上一帧有效位置连续（帧间 <3000mm）。连续 = 池里换了实例但
+//      字段布局相同，接受并更新学习值（自愈）；不连续 = 读到别人字段 → 拒绝，保持上一帧位置；
+//   4) 保持最多 30 帧，超时该槽不画 —— 宁可这一帧不画，也不画在错的位置上；
+//   5) 首次锁定要连续 3 帧同一 vtable 才算学会，避免开局就学到乱对象。
+// 判据只用「人不会瞬移 3 米」这一个物理事实，不拿被怀疑的那个字段自己当真值。
+static unsigned  槽类[24] = {0};      // 学会的 二 vtable（低 32 位；同一进程内高位相同，够区分）
+static bool      槽类有[24] = {false};
+static unsigned  槽待类[24] = {0};    // 首次锁定前的候选
+static int       槽待连[24] = {0};
+static int       槽失[24] = {0};      // 连续拒绝帧数
+static int       槽保X[24] = {0}, 槽保Z[24] = {0};
+static bool      槽保有[24] = {false};
+static int       槽拒计 = 0, 槽保计 = 0, 槽自愈计 = 0, 槽锁类计 = 0;
+
+// 返回 1 = 采用（X/Z 已写），0 = 保持上一帧（X/Z 已写为保持值），-1 = 不画
+static int 槽验(int k, uint64_t 类, int x, int z, unsigned* X, unsigned* Z) {
+    const unsigned v = (unsigned)(类 & 0xFFFFFFFF);
+    bool 采 = false;
+
+    if (!槽类有[k]) {
+        if (槽待类[k] == v && v != 0) {
+            if (++槽待连[k] >= 3) {
+                槽类有[k] = true; 槽类[k] = v; 采 = true;
+                if (槽锁类计 < 60) { ++槽锁类计; 日志("类锁 k=%d 类=%x 值=(%d,%d)", k, v, x, z); }
+            }
+        } else {
+            槽待类[k] = v; 槽待连[k] = (v != 0) ? 1 : 0;
+        }
+    } else if (v == 槽类[k]) {
+        采 = true;
+    } else {
+        // vtable 变了：新值是否与上一帧有效位置连续？
+        if (槽保有[k]) {
+            const long long dx = (long long)x - 槽保X[k];
+            const long long dz = (long long)z - 槽保Z[k];
+            if (dx * dx + dz * dz < 3000LL * 3000LL) {
+                const unsigned 旧 = 槽类[k];
+                槽类[k] = v; 采 = true;                        // 自愈：接受新实例
+                if (槽自愈计 < 80) {
+                    ++槽自愈计;
+                    日志("类换 k=%d %x->%x 值=(%d,%d) 连续 沿用", k, 旧, v, x, z);
+                }
+            }
+        }
+    }
+
+    if (采) {
+        槽失[k] = 0;
+        槽保X[k] = x; 槽保Z[k] = z; 槽保有[k] = true;
+        *X = (unsigned)x; *Z = (unsigned)z;
+        return 1;
+    }
+
+    ++槽失[k];
+    if (槽拒计 < 3000) {
+        ++槽拒计;
+        日志("类拒 k=%d 类=%x≠%x 值=(%d,%d) 连=%d",
+             k, v, 槽类[k], x, z, 槽失[k]);
+    }
+    if (槽保有[k] && 槽失[k] <= 30) {
+        ++槽保计;
+        *X = (unsigned)槽保X[k]; *Z = (unsigned)槽保Z[k];
+        return 0;                                   // 保持 30 帧
+    }
+    return -1;                                      // 宁可不画，也不画错的位置
+}
+
 static int 读实体坐标(int k, uint64_t 实体, unsigned* X, unsigned* Z) {
     unsigned dx = 0, dz = 0;
     bool 直有 = 直接读坐标(实体, &dx, &dz) != 0;
@@ -1617,8 +1699,17 @@ static int 读实体坐标(int k, uint64_t 实体, unsigned* X, unsigned* Z) {
         if (用 >= 0) {
             用二计++;
             if (是槽) 槽锁[k] = true;
-            *X = (unsigned)(用 == 0 ? r.A : r.C);
-            *Z = (unsigned)(用 == 0 ? r.B : r.D);
+            const unsigned 新X = (unsigned)(用 == 0 ? r.A : r.C);
+            const unsigned 新Z = (unsigned)(用 == 0 ? r.B : r.D);
+            if (是槽) {
+                // v56：先过 vtable 校验。返回 0 = 保持上一帧（类不符但还在容忍帧数内），
+                // -1 = 这帧不画。绘制层只看 <0，所以 0 会照常用保持值画出来。
+                const int 判 = 槽验(k, r.类, (int)新X, (int)新Z, X, Z);
+                if (判 < 0) return -1;
+                if (判 == 0) return 6;
+            } else {
+                *X = 新X; *Z = 新Z;
+            }
             if (二链不符计 < 200000 && 是槽) {
                 unsigned kx = 0, kz = 0;
                 if (读坐标某链(实体, SDK::坐标链表[1], &kx, &kz)) {
@@ -2655,7 +2746,7 @@ static void 锚榜(const uint64_t* 层址, const float* m, float 宽, float 高)
 
 static void 锚扫描(uint64_t 数组, int 数量, const float* m, float 宽, float 高, unsigned 我方) {
     if (锚扫报 >= 400) return;                    // 一局最多扫 33 分钟，别中途断
-    if (++锚扫帧 % 6 != 0) return;               // 约 10Hz
+    if (++锚扫帧 % 60 != 0) return;              // v56: 降到约 1Hz —— 扫描只是留证据, 不能抢主路径
 
     // ---- v55：每槽 vtable + 坐标。联机/离线两局唯一的差异就在这里 ----
     // 联机局里 二 的 vtable 每 25~35 秒换一个（池回收后原地重建），
@@ -4221,7 +4312,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v55 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v56 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -4738,6 +4829,10 @@ void Draw::StartBooks() {
             if (槽世键[k] != 0 && 槽世键[k] != 实体) {
                 槽锁[k] = false;
                 槽组[k] = 0;
+                槽类有[k] = false; 槽类[k] = 0;      // v56：换实体 = vtable 学习结果作废
+                槽待类[k] = 0; 槽待连[k] = 0;
+                槽失[k] = 0;
+                槽保有[k] = false;
                 槽上态[k] = 0;           // 换人就重开两组比较，别拿上一个实体的值当基准
                 槽稳有[k] = false;       // 顺带清掉 v39 门控的旧基准，避免新实体被旧位置压住
                 离群连[k] = 0;
