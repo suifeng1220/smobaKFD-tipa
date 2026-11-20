@@ -1532,20 +1532,33 @@ static void 环dump(int k, unsigned 跳帧) {
     }
 }
 
+// v70 前向声明（实现在下方 AM 区块）
+static inline int AM换算(float w);
+static bool AM坐标内部(uint64_t 实体, int* X, int* Z);
+
 // 兼容旧调用（我方自检）：优先组A，不行用组B
 static int 读英雄坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
     if (!IsValidAddr(实体)) return 0;
+    // v70：ActorManager 坐标链最优先
+    {
+        int ax = 0, az = 0;
+        if (AM坐标内部(实体, &ax, &az)) {
+            *X = (unsigned)ax;
+            *Z = (unsigned)az;
+            return 7;
+        }
+    }
     // v69：无雾坐标优先（原生注册表 pose 链，迷雾外也实时更新）
     {
         float wx = 0, wz = 0;
         if (无雾坐标(实体, &wx, &wz)) {
-            // 世界单位(±54.5) → 毫米级 int（×1000），与旧坐标同量纲
-            int mmx = (int)(wx * 1000.0f);
-            int mmz = (int)(wz * 1000.0f);
+            // v70：世界单位(±54.5) → 内部坐标(±103500)
+            int mmx = AM换算(wx);
+            int mmz = AM换算(wz);
             if ((mmx || mmz) && mmx > -120000 && mmx < 120000 && mmz > -120000 && mmz < 120000) {
                 *X = (unsigned)mmx;
                 *Z = (unsigned)mmz;
-                return 5;   // 5 = 无雾坐标（新）
+                return 5;   // 5 = 无雾坐标
             }
         }
     }
@@ -1742,7 +1755,16 @@ static int 槽验(int k, uint64_t 实体, int x, int z, unsigned* X, unsigned* Z
 }
 
 static int 读实体坐标(int k, uint64_t 实体, unsigned* X, unsigned* Z) {
-    // v69：无雾坐标优先（原生注册表 pose 链，迷雾外也实时更新）
+    // v70：ActorManager 坐标链最优先（Frida 实测确认，坐标逐帧更新）
+    {
+        int ax = 0, az = 0;
+        if (AM坐标内部(实体, &ax, &az)) {
+            *X = (unsigned)ax;
+            *Z = (unsigned)az;
+            return 7;   // 7 = ActorManager 坐标
+        }
+    }
+    // v69：无雾坐标（原生注册表 pose 链，迷雾外也实时更新）
     {
         float wx = 0, wz = 0;
         if (无雾坐标(实体, &wx, &wz)) {
@@ -1939,6 +1961,178 @@ static void 校验链() {
     unsigned x = 0, z = 0;
     if (链样点统计(数组, 数量, 当前链, &x, &z) < 2)
         链打分(数组, 数量);
+}
+
+// ==================== v70：ActorManager 坐标链（Frida 实测确认）====================
+// 2026-11-20 Frida + il2cpp 元数据实测，完整链路：
+//   UF_base + 0x2262b4a0  → ActorManager 实例指针（静态存储，RVA 稳定）
+//   实例+0x18             → HeroActors (TinyValueList)
+//   HeroActors+8          → 列表对象（内部条目数组）
+//   列表+16               = count（10 = 5v5 英雄）
+//   列表+32 + i*0x10      → (ActorLinker*, listId)
+//   ActorLinker+0x4C4     → position (float x,y,z) 世界坐标 ±54.5
+//   ActorLinker+0x4AC     → ObjID（干净小整数 7,11,18...）
+//   ActorLinker+0x505     → _logicVisible（1=可见 0=迷雾）
+//   ActorLinker+0x3B8     → ValueComponent（血量）
+// 坐标缩放：世界 ±54.5 → 内部 ±103500，系数 = 103500/109 ≈ 949.54
+//
+// 对比 v69 注册表 pose 链：链路短 5 倍，不需要 scale/pose/variant，
+// 直接读 3 个 float，且经采样验证坐标逐帧更新（id=36 每 1.5s 匀速 1.12 单位）。
+
+#define AM_INST_RVA     0x2262b4a0ULL    // ActorManager 实例指针在 UF 中的 RVA
+#define AM_IDX_OFF      0x18ULL          // ActorManager → HeroActors
+#define AM_LIST_OFF     0x08ULL          // HeroActors → 条目列表对象
+#define AM_COUNT_OFF    0x10ULL          // 列表 → count
+#define AM_ENTRY_BASE   0x20ULL          // 条目起始偏移
+#define AM_ENTRY_STRIDE 0x10ULL          // 条目步长 (ptr, u32)
+#define AM_LINKER_POS   0x4C4ULL         // ActorLinker → position (3×float)
+#define AM_LINKER_ID    0x4ACULL         // ActorLinker → ObjID
+#define AM_LINKER_VIS   0x505ULL         // ActorLinker → _logicVisible
+#define AM_MAX_HERO     16
+
+struct AM英雄 {
+    unsigned long long 连接器;   // ActorLinker*
+    unsigned           编号;     // ObjID
+    float              x, y, z;  // 世界坐标 ±54.5
+    unsigned char      可见;     // _logicVisible
+};
+
+static AM英雄  AM表[AM_MAX_HERO];
+static int     AM数 = 0;
+static bool    AM好 = false;
+static unsigned long long AM实例 = 0;
+static unsigned long long AM基址 = 0;
+static double  AM上次 = 0;
+static int     AM失败连 = 0;
+static char    AM诊[160] = "";
+
+// 世界坐标(±54.5) → 内部坐标(±103500)
+static inline int AM换算(float w) {
+    return (int)(w * (103500.0f / 109.0f));
+}
+
+// 刷新 ActorManager 英雄表（~2Hz 即可）
+static void AM刷新() {
+    AM好 = false;
+    if (!IsValidAddr(模块基址)) { strcpy(AM诊, "no base"); return; }
+    AM基址 = 模块基址;
+
+    // 读 ActorManager 实例
+    unsigned long long 实例 = vm_read<unsigned long long>(模块基址 + AM_INST_RVA);
+    if (!IsValidAddr(实例)) {
+        snprintf(AM诊, sizeof(AM诊), "inst@+%#llx=0", AM_INST_RVA);
+        AM失败连++;
+        return;
+    }
+    AM实例 = 实例;
+
+    // HeroActors
+    unsigned long long 英雄表 = vm_read<unsigned long long>(实例 + AM_IDX_OFF);
+    if (!IsValidAddr(英雄表)) { strcpy(AM诊, "no HeroActors"); AM失败连++; return; }
+
+    // 条目列表
+    unsigned long long 列表 = vm_read<unsigned long long>(英雄表 + AM_LIST_OFF);
+    if (!IsValidAddr(列表)) { strcpy(AM诊, "no list"); AM失败连++; return; }
+
+    unsigned 数量 = 0;
+    readMemory(列表 + AM_COUNT_OFF, &数量, 4);
+    if (数量 == 0 || 数量 > AM_MAX_HERO) {
+        snprintf(AM诊, sizeof(AM诊), "cnt=%u", 数量);
+        AM失败连++;
+        return;
+    }
+
+    int n = 0;
+    for (unsigned i = 0; i < 数量 && n < AM_MAX_HERO; i++) {
+        unsigned long long 条目 = 列表 + AM_ENTRY_BASE + (unsigned long long)i * AM_ENTRY_STRIDE;
+        unsigned long long 连接器 = vm_read<unsigned long long>(条目);
+        if (!IsValidAddr(连接器)) continue;
+
+        unsigned 编号 = 0;
+        float x = 0, y = 0, z = 0;
+        unsigned char 可见 = 0;
+        readMemory(连接器 + AM_LINKER_ID, &编号, 4);
+        readMemory(连接器 + AM_LINKER_POS, &x, 4);
+        readMemory(连接器 + AM_LINKER_POS + 4, &y, 4);
+        readMemory(连接器 + AM_LINKER_POS + 8, &z, 4);
+        readMemory(连接器 + AM_LINKER_VIS, &可见, 1);
+
+        // 校验：坐标在 ±60 范围内，编号非零
+        if (!编号 || !isfinite(x) || !isfinite(z) || x < -60 || x > 60 || z < -60 || z > 60) continue;
+
+        AM表[n].连接器 = 连接器;
+        AM表[n].编号 = 编号;
+        AM表[n].x = x; AM表[n].y = y; AM表[n].z = z;
+        AM表[n].可见 = 可见;
+        n++;
+    }
+
+    if (n < 5) {
+        snprintf(AM诊, sizeof(AM诊), "only %d/%u valid", n, 数量);
+        AM失败连++;
+        return;
+    }
+
+    AM数 = n;
+    AM好 = true;
+    AM失败连 = 0;
+    AM上次 = CACurrentMediaTime();
+    if (AM失败连 == 0 && (AM数 <= 3 || (n % 20) == 0))
+        日志("AM刷新 ok inst=%#llx cnt=%u valid=%d", 实例, 数量, n);
+}
+
+// 按实体指针找 ActorLinker 坐标（返回 true = 命中）
+// 出参 x,z 为世界坐标 float（±54.5）
+static bool AM坐标(uint64_t 实体, float* x, float* z) {
+    if (!AM数 || !IsValidAddr(实体)) return false;
+    // 30 秒内成功过就用缓存
+    if (!AM好 && (CACurrentMediaTime() - AM上次) > 30.0) return false;
+
+    // 策略 1：实体指针 == ActorLinker 指针
+    for (int i = 0; i < AM数; i++) {
+        if (AM表[i].连接器 == 实体) {
+            *x = AM表[i].x;
+            *z = AM表[i].z;
+            return true;
+        }
+    }
+
+    // 策略 2：实体+0x4AC == ObjID（实体本身是 ActorLinker）
+    unsigned id = 0;
+    readMemory(实体 + AM_LINKER_ID, &id, 4);
+    if (id && id < 2000000000u) {
+        for (int i = 0; i < AM数; i++) {
+            if (AM表[i].编号 == id) {
+                *x = AM表[i].x;
+                *z = AM表[i].z;
+                return true;
+            }
+        }
+    }
+
+    // 策略 3：实体+0x100 == ObjID（native actor）
+    id = 0;
+    readMemory(实体 + 0x100, &id, 4);
+    if (id && id < 2000000000u) {
+        for (int i = 0; i < AM数; i++) {
+            if (AM表[i].编号 == id) {
+                *x = AM表[i].x;
+                *z = AM表[i].z;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+// 对外接口：返回内部坐标（±103500），兼容旧调用
+static bool AM坐标内部(uint64_t 实体, int* X, int* Z) {
+    float wx = 0, wz = 0;
+    if (!AM坐标(实体, &wx, &wz)) return false;
+    *X = AM换算(wx);
+    *Z = AM换算(wz);
+    return true;
 }
 
 // ==================== v69：无雾坐标（原生注册表 pose 链）====================
@@ -5215,7 +5409,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v69 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v70 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -5297,6 +5491,22 @@ void Draw::StartBooks() {
         状态浮层(4, "实体数组无效");
         if (!在对局) 底部文字(屏, "等待进入对局");
         return;
+    }
+
+    // v70：ActorManager 坐标链刷新（2Hz）
+    {
+        static double 上次AM刷 = 0;
+        if (now - 上次AM刷 > 0.5) {
+            上次AM刷 = now;
+            AM刷新();
+        }
+        // 5 秒一次诊断
+        static double 上次AM诊 = 0;
+        if (now - 上次AM诊 > 5.0) {
+            上次AM诊 = now;
+            日志("AM诊 好=%d n=%d inst=%#llx [%s]",
+                 AM好 ? 1 : 0, AM数, AM实例, AM诊);
+        }
     }
 
     // v69：无雾坐标注册表刷新（2Hz）
