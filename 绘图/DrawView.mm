@@ -2925,7 +2925,7 @@ static void 找位扫(uint64_t 数组, int 数量, const float* m, float 宽, fl
                 if (!异) continue;
 
                 // v68: 诊断——通过①②的候选数（不加④之前）
-                { static int 过①② = 0; if (过①② < 40) { ++过①②;
+                { static int 过一二 = 0; if (过一二 < 40) { ++过一二;
                   日志("找位过①② 节=%s +0x%x 解=%d 通=%d/%d", 路名, o, 解, 通, 用); } }
 
                 // (4) 屏心锚定：至少一个实体投影落在屏心 150px 内
