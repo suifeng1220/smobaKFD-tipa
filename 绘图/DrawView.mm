@@ -2709,35 +2709,82 @@ static void 我方自检(uint64_t 数组, int 数量, const float* 矩阵, float
              敌数, 敌屏内, (敌近 > 1e8) ? -1.0 : 敌近);
 }
 
-// ==================== v66：跨实体互异判据 —— 找「每实体独立」的位置字段 ====================
-// 已成立的事实（不需要推断）：
-//   _ab_v64.log 快照 12/12 次，k1(二=c2b2c9e8) 与 k3(二=c29cc8a0) 是两个不同对象，
-//   组A(+0x2C/+0x34) 却完全相同，且随时间平滑变化
-//   ⇒ 组A 是「最近被某个实体写进去的共享暂存值」，不可能是「这个实体的位置」。
-//   用户实测「框从来没对准过人」与这条完全吻合：v39 起主路径读的就是组A。
+// ==================== v67：强化找位 —— 全指针可达 + float 解释 + 屏心锚定 ====================
+// v66 只扫固定 5 层、只做 int32 配对：真位置若在别的组件里（Transform 之类），
+// 或者真位置是 float Vector3，v66 一条都命中不了 —— 那等于白打一局。
 //
-// 判据不采样任何真值，只用三条必然性（任一不成立即淘汰）：
-//   ① 同一帧里，每个有效实体在该偏移都落在 ±60000、非 0、X≠Z；
-//   ② 同一帧里，不同实体的值互不相同（任意两值距离 > 2000）—— 共享值必然相等，直接出局；
-//   ③ 相隔 2.5 秒的两轮里，每个实体都有位移且 ≤ 6000 —— 冻结值出局。
-// 三条同时成立的位置字段，物理上只能是「每实体各自的世界坐标」。
+// v67 扫描范围：
+//   · 实体本体 0x0..0x800
+//   · 实体内 8 字节对齐、且在 >=3 个实体上都成立的指针偏移 p -> 对象 0x0..0x400
+//   · 已知链 二(0xa8->0x10) / 三(->0x0) 各 0x0..0x400
+// 解释三种：int32 对 / float 对 x1000 / float vec3 取 x,z x1000（统一成毫米级整数）。
 //
-// 另一行 `槽性` 回答「数组里装的到底是不是英雄」：阵营 + 血量当前/上限 + 数组总量。
-// 英雄血上限 ≥3000、小兵几百，这一行能直接判断框是不是画在小兵/野怪身上。
-#define 找位层数 5
+// 判据四条，任一不成立即淘汰：
+//   (1) 同帧每个实体都落在 +-60000、非 0、X!=Z        —— 垃圾/哨兵出局
+//   (2) 同帧不同实体互不相同（距离 >2000）            —— 共享暂存值出局（v39~v65 的根因）
+//   (3) 相隔 2.5 秒两轮每实体都有位移且 <=6000        —— 冻结值出局
+//   (4) 至少一个实体的投影距屏幕中心 < 150px          —— 相机跟随我 => 我恒投屏心
+//   (4) 不需要知道哪一槽是我，只要求「存在一个实体在屏心附近」；
+//       且只在样本里确实有我方实体时才作为硬条件，找不到我方时降级为仅记录。
 #define 找位体数 6
+#define 找位节点 25          // 0 = 本体；1..N = 实体+指针偏移；末尾两个 = 二 / 三
+#define 找位缓冲 0x400
 
+struct 找位路 { char 深; short o[3]; };
 static int 找位扫计 = 0;
 struct 找位槽 {
-    int 层; int 偏移; int 命中;
+    int 路; int 偏移; int 解释; int 命中;
     int 上X[找位体数], 上Z[找位体数];
     bool 上有[找位体数];
 };
 static 找位槽 找位表[16];
 static int 找位表数 = 0;
-static unsigned char 找位缓[找位体数][找位层数][0x800];
+static 找位路 找位路表[找位节点];
+static int 找位路数 = 0;
+static unsigned char 找位本[找位体数][0x800];
+static int 找位本长[找位体数];
+static unsigned char 找位缓[找位体数][找位节点][找位缓冲];
+static int 找位缓长[找位体数][找位节点];
 
 static inline bool 找位像(int v) { return v > -60000 && v < 60000 && v != 0; }
+
+static uint64_t 找位走(uint64_t 体, const 找位路& r) {
+    uint64_t a = 体;
+    for (int i = 0; i < r.深; ++i) {
+        a = vm_read<uint64_t>(a + (uint64_t)r.o[i]);
+        if (!IsValidAddr(a)) return 0;
+    }
+    return a;
+}
+
+static void 找位名(const 找位路& r, char* s, size_t n) {
+    if (r.深 == 0) { snprintf(s, n, "本"); return; }
+    if (r.深 == 2 && r.o[0] == 0xa8 && r.o[1] == 0x10) { snprintf(s, n, "二"); return; }
+    if (r.深 == 3 && r.o[0] == 0xa8 && r.o[1] == 0x10 && r.o[2] == 0x0) { snprintf(s, n, "三"); return; }
+    if (r.深 == 1) { snprintf(s, n, "+0x%x", r.o[0]); return; }
+    snprintf(s, n, "深%d", r.深);
+}
+
+// 从缓冲取 (X,Z)，统一为毫米级整数；float 按「米」解释 x1000
+static bool 找位取(int 解释, const unsigned char* b, int len, int o, int* X, int* Z) {
+    if (解释 == 0) {
+        if (o + 8 > len) return false;
+        int a, c;
+        memcpy(&a, b + o, 4); memcpy(&c, b + o + 4, 4);
+        *X = a; *Z = c;
+        return true;
+    }
+    const int 步 = (解释 == 1) ? 4 : 8;      // 1 = 浮点对 (o,o+4)；2 = vec3 (o,o+8)
+    if (o + 步 + 4 > len) return false;
+    float fa, fc;
+    memcpy(&fa, b + o, 4); memcpy(&fc, b + o + 步, 4);
+    if (fa != fa || fc != fc) return false;
+    if (fabsf(fa) < 0.5f || fabsf(fa) > 600.0f) return false;
+    if (fabsf(fc) < 0.5f || fabsf(fc) > 600.0f) return false;
+    *X = (int)lroundf(fa * 1000.0f);
+    *Z = (int)lroundf(fc * 1000.0f);
+    return true;
+}
 
 static void 槽性扫(uint64_t 数组, int 数量) {
     static double 上次 = 0.0;
@@ -2765,129 +2812,179 @@ static void 找位扫(uint64_t 数组, int 数量, const float* m, float 宽, fl
     上次 = 现;
     ++找位扫计;
 
-    static const int 层长[找位层数] = { 0x800, 0x400, 0x400, 0x400, 0x200 };
-    static const char* 层名[找位层数] = { "本", "一", "二", "三", "血" };
-
+    // ---- 选样：优先 3 个我方（相机跟随我 => 锚定真值必须在样本里），再补到 6 个 ----
     uint64_t 体[找位体数];
-    int 用 = 0, 我位 = -1;
+    int 用 = 0, 我数 = 0;
+    for (int k = 0; k < 数量 && k < 24 && 用 < 3; ++k) {
+        const uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (!IsValidAddr(e)) continue;
+        if (vm_read<int>(e + 52) == (int)我方) { 体[用++] = e; ++我数; }
+    }
     for (int k = 0; k < 数量 && k < 24 && 用 < 找位体数; ++k) {
         const uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
         if (!IsValidAddr(e)) continue;
-        体[用] = e;
-        if (我位 < 0 && vm_read<int>(e + 52) == (int)我方) 我位 = 用;
-        ++用;
+        bool 已 = false;
+        for (int i = 0; i < 用; ++i) if (体[i] == e) { 已 = true; break; }
+        if (已) continue;
+        体[用++] = e;
     }
     if (用 < 3) return;
 
-    int 长[找位体数][找位层数];
-    memset(长, 0, sizeof(长));
+    // ---- 先读本体缓冲（既做深度 0 的扫描对象，也用来发现指针路径）----
     for (int i = 0; i < 用; ++i) {
-        const uint64_t 一 = vm_read<uint64_t>(体[i] + 0xa8);
-        const uint64_t 二 = IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0;
-        const uint64_t 三 = IsValidAddr(二) ? vm_read<uint64_t>(二 + 0x0) : 0;
-        const uint64_t 血 = vm_read<uint64_t>(体[i] + 0x1d0);
-        uint64_t 址[找位层数] = { 体[i], 一, 二, 三, 血 };
-        for (int t = 0; t < 找位层数; ++t) {
-            if (!IsValidAddr(址[t])) continue;
-            int L = 层长[t];
-            while (L >= 0x100 && !readMemory(址[t], 找位缓[i][t], L)) L /= 2;
-            if (L >= 0x100) 长[i][t] = L;
+        int L = 0x800;
+        while (L >= 0x200 && !readMemory(体[i], 找位本[i], L)) L /= 2;
+        找位本长[i] = (L >= 0x200) ? L : 0;
+    }
+
+    // ---- 建路径表 ----
+    找位路数 = 0;
+    找位路表[找位路数].深 = 0; 找位路表[找位路数].o[0] = 0;
+    找位路表[找位路数].o[1] = 0; 找位路表[找位路数].o[2] = 0;
+    ++找位路数;
+    for (int p = 8; p + 8 <= 0x800 && 找位路数 < 找位节点 - 3; p += 8) {
+        int 有 = 0;
+        for (int i = 0; i < 用; ++i) {
+            if (找位本长[i] < p + 8) continue;
+            uint64_t v;
+            memcpy(&v, 找位本[i] + p, 8);
+            if (IsValidAddr(v)) ++有;
+        }
+        if (有 < 3) continue;
+        找位路表[找位路数].深 = 1;
+        找位路表[找位路数].o[0] = (short)p;
+        找位路表[找位路数].o[1] = 0;
+        找位路表[找位路数].o[2] = 0;
+        ++找位路数;
+    }
+    找位路表[找位路数].深 = 2;
+    找位路表[找位路数].o[0] = 0xa8; 找位路表[找位路数].o[1] = 0x10;
+    找位路表[找位路数].o[2] = 0;
+    ++找位路数;
+    找位路表[找位路数].深 = 3;
+    找位路表[找位路数].o[0] = 0xa8; 找位路表[找位路数].o[1] = 0x10;
+    找位路表[找位路数].o[2] = 0x0;
+    ++找位路数;
+
+    // ---- 读其它节点缓冲 ----
+    for (int t = 1; t < 找位路数; ++t) {
+        for (int i = 0; i < 用; ++i) {
+            找位缓长[i][t] = 0;
+            const uint64_t a = 找位走(体[i], 找位路表[t]);
+            if (!IsValidAddr(a)) continue;
+            int L = 找位缓冲;
+            while (L >= 0x100 && !readMemory(a, 找位缓[i][t], L)) L /= 2;
+            if (L >= 0x100) 找位缓长[i][t] = L;
         }
     }
 
-    for (int t = 0; t < 找位层数; ++t) {
-        int 限 = 0x800, 有效 = 0;
+    char 路名[24];
+    for (int t = 0; t < 找位路数; ++t) {
+        找位名(找位路表[t], 路名, sizeof(路名));
+
+        int 限 = 0x7FFFFFFF, 有效 = 0;
         for (int i = 0; i < 用; ++i) {
-            if (长[i][t] < 0x100) continue;
-            if (有效 == 0 || 长[i][t] < 限) 限 = 长[i][t];
+            const int L = (t == 0) ? 找位本长[i] : 找位缓长[i][t];
+            if (L < 0x100) continue;
+            if (L < 限) 限 = L;
             ++有效;
         }
         if (有效 < 3) continue;
         限 &= ~3;
 
         for (int o = 0; o + 8 <= 限; o += 4) {
-            int xs[找位体数], zs[找位体数];
-            bool ok[找位体数];
-            int 通 = 0;
-            for (int i = 0; i < 用; ++i) {
-                ok[i] = false;
-                if (长[i][t] < o + 8) continue;
-                int a = 0, b = 0;
-                memcpy(&a, 找位缓[i][t] + o, 4);
-                memcpy(&b, 找位缓[i][t] + o + 4, 4);
-                if (!找位像(a) || !找位像(b) || a == b) continue;
-                xs[i] = a; zs[i] = b; ok[i] = true; ++通;
-            }
-            if (通 < 3 || 通 < 有效) continue;       // 所有能读到该层的实体都必须通过
-
-            bool 异 = true;
-            for (int p = 0; p < 用 && 异; ++p) {
-                if (!ok[p]) continue;
-                for (int q = p + 1; q < 用; ++q) {
-                    if (!ok[q]) continue;
-                    const long long dx = (long long)xs[p] - xs[q];
-                    const long long dz = (long long)zs[p] - zs[q];
-                    if (dx * dx + dz * dz < 2000LL * 2000LL) { 异 = false; break; }
-                }
-            }
-            if (!异) continue;
-
-            int 位 = -1;
-            for (int q = 0; q < 找位表数; ++q)
-                if (找位表[q].层 == t && 找位表[q].偏移 == o) { 位 = q; break; }
-
-            if (位 < 0) {
-                // 表满时按命中数淘汰：第一轮假阳性会占位，必须让真正跨帧稳定的候选进得来
-                if (找位表数 >= 16) {
-                    int 最差 = 0;
-                    for (int q = 1; q < 16; ++q)
-                        if (找位表[q].命中 < 找位表[最差].命中) 最差 = q;
-                    if (找位表[最差].命中 >= 2) continue;
-                    位 = 最差;
-                } else {
-                    位 = 找位表数++;
-                }
-                找位槽& c = 找位表[位];
-                c.层 = t; c.偏移 = o; c.命中 = 1;
-                for (int i = 0; i < 找位体数; ++i) {
-                    c.上X[i] = ok[i] ? xs[i] : 0;
-                    c.上Z[i] = ok[i] ? zs[i] : 0;
-                    c.上有[i] = ok[i];
-                }
-                char 串[430]; int p2 = 0; 串[0] = 0;
-                for (int i = 0; i < 用 && p2 < 390; ++i)
-                    if (ok[i]) p2 += snprintf(串 + p2, sizeof(串) - p2, "%d:(%d,%d) ", i, xs[i], zs[i]);
-                日志("找位新 层=%s +0x%x 通=%d/%d 有效=%d 值 %s", 层名[t], o, 通, 用, 有效, 串);
-            } else {
-                找位槽& c = 找位表[位];
-                long long 远 = 0; int 动 = 0, 全 = 1;
+            for (int 解 = 0; 解 < 3; ++解) {
+                int xs[找位体数], zs[找位体数];
+                bool ok[找位体数];
+                int 通 = 0;
                 for (int i = 0; i < 用; ++i) {
-                    if (!ok[i] || !c.上有[i]) { 全 = 0; continue; }
-                    const long long dx = (long long)xs[i] - c.上X[i];
-                    const long long dz = (long long)zs[i] - c.上Z[i];
-                    const long long d2 = dx * dx + dz * dz;
-                    if (d2 > 远) 远 = d2;
-                    if (d2 > 0) ++动;
+                    ok[i] = false;
+                    const int L = (t == 0) ? 找位本长[i] : 找位缓长[i][t];
+                    if (L < 0x100) continue;
+                    const unsigned char* b = (t == 0) ? 找位本[i] : 找位缓[i][t];
+                    int a = 0, c = 0;
+                    if (!找位取(解, b, L, o, &a, &c)) continue;
+                    if (!找位像(a) || !找位像(c) || a == c) continue;
+                    xs[i] = a; zs[i] = c; ok[i] = true; ++通;
                 }
-                if (全 && 动 > 0 && 远 <= 6000LL * 6000LL) {
-                    ++c.命中;
-                    if (c.命中 == 3 || c.命中 == 6) {
-                        float 锚距 = -1.0f;
-                        if (我位 >= 0 && 我位 < 找位体数 && ok[我位]) {
-                            float sx = 0, sy = 0;
-                            if (投影(m, xs[我位], zs[我位], &sx, &sy, 宽, 高)) {
-                                const float dx = sx - 宽 * 0.5f, dy = sy - 高 * 0.5f;
-                                锚距 = sqrtf(dx * dx + dy * dy);
-                            }
-                        }
-                        日志("找位稳 层=%s +0x%x 命中=%d 通=%d/%d 最大位移=%.0f 锚距心=%.0f",
-                             层名[t], o, c.命中, 通, 用, sqrt((double)远), 锚距);
+                if (通 < 3 || 通 < 有效) continue;
+
+                bool 异 = true;
+                for (int p = 0; p < 用 && 异; ++p) {
+                    if (!ok[p]) continue;
+                    for (int q = p + 1; q < 用; ++q) {
+                        if (!ok[q]) continue;
+                        const long long dx = (long long)xs[p] - xs[q];
+                        const long long dz = (long long)zs[p] - zs[q];
+                        if (dx * dx + dz * dz < 2000LL * 2000LL) { 异 = false; break; }
                     }
                 }
-                for (int i = 0; i < 找位体数; ++i) {
-                    c.上X[i] = ok[i] ? xs[i] : c.上X[i];
-                    c.上Z[i] = ok[i] ? zs[i] : c.上Z[i];
-                    c.上有[i] = ok[i];
+                if (!异) continue;
+
+                // (4) 屏心锚定：至少一个实体投影落在屏心 150px 内
+                float 锚距 = 1e9f;
+                int 锚i = -1;
+                char 投串[300]; int 投位 = 0; 投串[0] = 0;
+                for (int i = 0; i < 用; ++i) {
+                    if (!ok[i]) continue;
+                    float sx = 0, sy = 0;
+                    if (!投影(m, xs[i], zs[i], &sx, &sy, 宽, 高)) continue;
+                    const float dx = sx - 宽 * 0.5f, dy = sy - 高 * 0.5f;
+                    const float d = sqrtf(dx * dx + dy * dy);
+                    if (投位 < (int)sizeof(投串) - 30)
+                        投位 += snprintf(投串 + 投位, sizeof(投串) - 投位, "(%.0f,%.0f)", sx, sy);
+                    if (d < 锚距) { 锚距 = d; 锚i = i; }
+                }
+                if (我数 > 0 && 锚距 >= 150.0f) continue;
+
+                int 位 = -1;
+                for (int q = 0; q < 找位表数; ++q)
+                    if (找位表[q].路 == t && 找位表[q].偏移 == o && 找位表[q].解释 == 解) { 位 = q; break; }
+
+                const char* 解名 = (解 == 0) ? "i32" : (解 == 1) ? "f32" : "v3";
+
+                if (位 < 0) {
+                    if (找位表数 >= 16) {
+                        int 最差 = 0;
+                        for (int q = 1; q < 16; ++q)
+                            if (找位表[q].命中 < 找位表[最差].命中) 最差 = q;
+                        if (找位表[最差].命中 >= 2) continue;
+                        位 = 最差;
+                    } else {
+                        位 = 找位表数++;
+                    }
+                    找位槽& c = 找位表[位];
+                    c.路 = t; c.偏移 = o; c.解释 = 解; c.命中 = 1;
+                    for (int i = 0; i < 找位体数; ++i) {
+                        c.上X[i] = ok[i] ? xs[i] : 0;
+                        c.上Z[i] = ok[i] ? zs[i] : 0;
+                        c.上有[i] = ok[i];
+                    }
+                    日志("找位新 节=%s +0x%x 解=%s 通=%d/%d 有效=%d 锚距心=%.0f 锚=%d 投%s",
+                         路名, o, 解名, 通, 用, 有效, 锚距, 锚i, 投串);
+                } else {
+                    找位槽& c = 找位表[位];
+                    long long 远 = 0; int 动 = 0, 全 = 1;
+                    for (int i = 0; i < 用; ++i) {
+                        if (!ok[i] || !c.上有[i]) { 全 = 0; continue; }
+                        const long long dx = (long long)xs[i] - c.上X[i];
+                        const long long dz = (long long)zs[i] - c.上Z[i];
+                        const long long d2 = dx * dx + dz * dz;
+                        if (d2 > 远) 远 = d2;
+                        if (d2 > 0) ++动;
+                    }
+                    if (全 && 动 > 0 && 远 <= 6000LL * 6000LL) {
+                        ++c.命中;
+                        if (c.命中 == 3 || c.命中 == 5) {
+                            日志("找位稳 节=%s +0x%x 解=%s 命中=%d 通=%d/%d 最大位移=%.0f 锚距心=%.0f 锚=%d 投%s",
+                                 路名, o, 解名, c.命中, 通, 用, sqrt((double)远), 锚距, 锚i, 投串);
+                        }
+                    }
+                    for (int i = 0; i < 找位体数; ++i) {
+                        c.上X[i] = ok[i] ? xs[i] : c.上X[i];
+                        c.上Z[i] = ok[i] ? zs[i] : c.上Z[i];
+                        c.上有[i] = ok[i];
+                    }
                 }
             }
         }
@@ -4714,7 +4811,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v66 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v67 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -4922,9 +5019,11 @@ void Draw::StartBooks() {
     // v53 的「屏心点位移」判据已废（它混了相机旋转项，见函数头注释）。
     // 层邻 停用：v52 已给出结论（一/三 前 8 名全是毫秒计时器，二 只有两对副本），函数保留备查。
     锚扫描(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
-    // v66：数组性质 + 跨实体互异判据（找每实体独立的位置字段）
-    槽性扫(数组, 数量);
-    找位扫(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
+    // v67：数组性质 + 全指针可达找位（仅对局中采样，避免加载期镜头未跟随时的假锚定）
+    if (在对局) {
+        槽性扫(数组, 数量);
+        找位扫(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
+    }
     // v52：同帧 4 槽对照（每 3 帧一行，400 行封顶），用来判定「跳后的新值是否等于别的槽的旧值」。
     四槽行(数组, 数量, 帧序);
 
