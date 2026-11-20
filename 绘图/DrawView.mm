@@ -2036,6 +2036,7 @@ static double   槽屏跳[24] = {0};      // 相邻两个「画出来的帧」�
 static float    槽屏X[24] = {0};       // 上一帧实际画到的屏幕位置
 static float    槽屏Y[24] = {0};
 static bool     槽屏有[24] = {0};
+static unsigned 槽屏末帧[24] = {0};    // v66：该槽最后一次真的画出来的帧号（判「框位」新鲜度）
 // v34 诊断：直接量世界坐标的帧间位移。上一版只在小图坐标上设 40pt 阈值，
 // 地图放大到 200pt 之后，世界坐标抖 1 万单位才折 19pt —— 正好漏检。
 // 这里不设阈值地记录「本窗口最大世界位移」，抖动幅度一目了然。
@@ -2706,6 +2707,191 @@ static void 我方自检(uint64_t 数组, int 数量, const float* 矩阵, float
         日志("自检 我=k%d 阵=%u 二(%d,%d) 距心=%.0f 屏内=%d | 敌=%d 屏内=%d 最近距心=%.0f",
              我槽, 我方, 我X, 我Z, (我槽 >= 0) ? 我距 : -1.0, 我屏 ? 1 : 0,
              敌数, 敌屏内, (敌近 > 1e8) ? -1.0 : 敌近);
+}
+
+// ==================== v66：跨实体互异判据 —— 找「每实体独立」的位置字段 ====================
+// 已成立的事实（不需要推断）：
+//   _ab_v64.log 快照 12/12 次，k1(二=c2b2c9e8) 与 k3(二=c29cc8a0) 是两个不同对象，
+//   组A(+0x2C/+0x34) 却完全相同，且随时间平滑变化
+//   ⇒ 组A 是「最近被某个实体写进去的共享暂存值」，不可能是「这个实体的位置」。
+//   用户实测「框从来没对准过人」与这条完全吻合：v39 起主路径读的就是组A。
+//
+// 判据不采样任何真值，只用三条必然性（任一不成立即淘汰）：
+//   ① 同一帧里，每个有效实体在该偏移都落在 ±60000、非 0、X≠Z；
+//   ② 同一帧里，不同实体的值互不相同（任意两值距离 > 2000）—— 共享值必然相等，直接出局；
+//   ③ 相隔 2.5 秒的两轮里，每个实体都有位移且 ≤ 6000 —— 冻结值出局。
+// 三条同时成立的位置字段，物理上只能是「每实体各自的世界坐标」。
+//
+// 另一行 `槽性` 回答「数组里装的到底是不是英雄」：阵营 + 血量当前/上限 + 数组总量。
+// 英雄血上限 ≥3000、小兵几百，这一行能直接判断框是不是画在小兵/野怪身上。
+#define 找位层数 5
+#define 找位体数 6
+
+static int 找位扫计 = 0;
+struct 找位槽 {
+    int 层; int 偏移; int 命中;
+    int 上X[找位体数], 上Z[找位体数];
+    bool 上有[找位体数];
+};
+static 找位槽 找位表[16];
+static int 找位表数 = 0;
+static unsigned char 找位缓[找位体数][找位层数][0x800];
+
+static inline bool 找位像(int v) { return v > -60000 && v < 60000 && v != 0; }
+
+static void 槽性扫(uint64_t 数组, int 数量) {
+    static double 上次 = 0.0;
+    const double 现 = CACurrentMediaTime();
+    if (现 - 上次 < 5.0) return;
+    上次 = 现;
+    char 串[760]; int p = 0; 串[0] = 0;
+    for (int k = 0; k < 数量 && k < 12 && p < 680; ++k) {
+        const uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (!IsValidAddr(e)) continue;
+        const int 阵 = vm_read<int>(e + 52);
+        const uint64_t 血 = vm_read<uint64_t>(e + 0x1d0);
+        int 当 = -1, 上 = -1;
+        if (IsValidAddr(血)) { 当 = vm_read<int>(血 + 0xc0); 上 = vm_read<int>(血 + 0xc8); }
+        p += snprintf(串 + p, sizeof(串) - p, "k%d阵%d血%d/%d ", k, 阵, 当, 上);
+    }
+    日志("槽性 n=%d %s", 数量, 串);
+}
+
+static void 找位扫(uint64_t 数组, int 数量, const float* m, float 宽, float 高, unsigned 我方) {
+    if (找位扫计 >= 12) return;
+    static double 上次 = 0.0;
+    const double 现 = CACurrentMediaTime();
+    if (现 - 上次 < 2.5) return;
+    上次 = 现;
+    ++找位扫计;
+
+    static const int 层长[找位层数] = { 0x800, 0x400, 0x400, 0x400, 0x200 };
+    static const char* 层名[找位层数] = { "本", "一", "二", "三", "血" };
+
+    uint64_t 体[找位体数];
+    int 用 = 0, 我位 = -1;
+    for (int k = 0; k < 数量 && k < 24 && 用 < 找位体数; ++k) {
+        const uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (!IsValidAddr(e)) continue;
+        体[用] = e;
+        if (我位 < 0 && vm_read<int>(e + 52) == (int)我方) 我位 = 用;
+        ++用;
+    }
+    if (用 < 3) return;
+
+    int 长[找位体数][找位层数];
+    memset(长, 0, sizeof(长));
+    for (int i = 0; i < 用; ++i) {
+        const uint64_t 一 = vm_read<uint64_t>(体[i] + 0xa8);
+        const uint64_t 二 = IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0;
+        const uint64_t 三 = IsValidAddr(二) ? vm_read<uint64_t>(二 + 0x0) : 0;
+        const uint64_t 血 = vm_read<uint64_t>(体[i] + 0x1d0);
+        uint64_t 址[找位层数] = { 体[i], 一, 二, 三, 血 };
+        for (int t = 0; t < 找位层数; ++t) {
+            if (!IsValidAddr(址[t])) continue;
+            int L = 层长[t];
+            while (L >= 0x100 && !readMemory(址[t], 找位缓[i][t], L)) L /= 2;
+            if (L >= 0x100) 长[i][t] = L;
+        }
+    }
+
+    for (int t = 0; t < 找位层数; ++t) {
+        int 限 = 0x800, 有效 = 0;
+        for (int i = 0; i < 用; ++i) {
+            if (长[i][t] < 0x100) continue;
+            if (有效 == 0 || 长[i][t] < 限) 限 = 长[i][t];
+            ++有效;
+        }
+        if (有效 < 3) continue;
+        限 &= ~3;
+
+        for (int o = 0; o + 8 <= 限; o += 4) {
+            int xs[找位体数], zs[找位体数];
+            bool ok[找位体数];
+            int 通 = 0;
+            for (int i = 0; i < 用; ++i) {
+                ok[i] = false;
+                if (长[i][t] < o + 8) continue;
+                int a = 0, b = 0;
+                memcpy(&a, 找位缓[i][t] + o, 4);
+                memcpy(&b, 找位缓[i][t] + o + 4, 4);
+                if (!找位像(a) || !找位像(b) || a == b) continue;
+                xs[i] = a; zs[i] = b; ok[i] = true; ++通;
+            }
+            if (通 < 3 || 通 < 有效) continue;       // 所有能读到该层的实体都必须通过
+
+            bool 异 = true;
+            for (int p = 0; p < 用 && 异; ++p) {
+                if (!ok[p]) continue;
+                for (int q = p + 1; q < 用; ++q) {
+                    if (!ok[q]) continue;
+                    const long long dx = (long long)xs[p] - xs[q];
+                    const long long dz = (long long)zs[p] - zs[q];
+                    if (dx * dx + dz * dz < 2000LL * 2000LL) { 异 = false; break; }
+                }
+            }
+            if (!异) continue;
+
+            int 位 = -1;
+            for (int q = 0; q < 找位表数; ++q)
+                if (找位表[q].层 == t && 找位表[q].偏移 == o) { 位 = q; break; }
+
+            if (位 < 0) {
+                // 表满时按命中数淘汰：第一轮假阳性会占位，必须让真正跨帧稳定的候选进得来
+                if (找位表数 >= 16) {
+                    int 最差 = 0;
+                    for (int q = 1; q < 16; ++q)
+                        if (找位表[q].命中 < 找位表[最差].命中) 最差 = q;
+                    if (找位表[最差].命中 >= 2) continue;
+                    位 = 最差;
+                } else {
+                    位 = 找位表数++;
+                }
+                找位槽& c = 找位表[位];
+                c.层 = t; c.偏移 = o; c.命中 = 1;
+                for (int i = 0; i < 找位体数; ++i) {
+                    c.上X[i] = ok[i] ? xs[i] : 0;
+                    c.上Z[i] = ok[i] ? zs[i] : 0;
+                    c.上有[i] = ok[i];
+                }
+                char 串[430]; int p2 = 0; 串[0] = 0;
+                for (int i = 0; i < 用 && p2 < 390; ++i)
+                    if (ok[i]) p2 += snprintf(串 + p2, sizeof(串) - p2, "%d:(%d,%d) ", i, xs[i], zs[i]);
+                日志("找位新 层=%s +0x%x 通=%d/%d 有效=%d 值 %s", 层名[t], o, 通, 用, 有效, 串);
+            } else {
+                找位槽& c = 找位表[位];
+                long long 远 = 0; int 动 = 0, 全 = 1;
+                for (int i = 0; i < 用; ++i) {
+                    if (!ok[i] || !c.上有[i]) { 全 = 0; continue; }
+                    const long long dx = (long long)xs[i] - c.上X[i];
+                    const long long dz = (long long)zs[i] - c.上Z[i];
+                    const long long d2 = dx * dx + dz * dz;
+                    if (d2 > 远) 远 = d2;
+                    if (d2 > 0) ++动;
+                }
+                if (全 && 动 > 0 && 远 <= 6000LL * 6000LL) {
+                    ++c.命中;
+                    if (c.命中 == 3 || c.命中 == 6) {
+                        float 锚距 = -1.0f;
+                        if (我位 >= 0 && 我位 < 找位体数 && ok[我位]) {
+                            float sx = 0, sy = 0;
+                            if (投影(m, xs[我位], zs[我位], &sx, &sy, 宽, 高)) {
+                                const float dx = sx - 宽 * 0.5f, dy = sy - 高 * 0.5f;
+                                锚距 = sqrtf(dx * dx + dy * dy);
+                            }
+                        }
+                        日志("找位稳 层=%s +0x%x 命中=%d 通=%d/%d 最大位移=%.0f 锚距心=%.0f",
+                             层名[t], o, c.命中, 通, 用, sqrt((double)远), 锚距);
+                    }
+                }
+                for (int i = 0; i < 找位体数; ++i) {
+                    c.上X[i] = ok[i] ? xs[i] : c.上X[i];
+                    c.上Z[i] = ok[i] ? zs[i] : c.上Z[i];
+                    c.上有[i] = ok[i];
+                }
+            }
+        }
+    }
 }
 
 // ==================== v54：屏心投影锚定（替掉 v53 的位移判据）====================
@@ -4528,7 +4714,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v65 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v66 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -4736,6 +4922,9 @@ void Draw::StartBooks() {
     // v53 的「屏心点位移」判据已废（它混了相机旋转项，见函数头注释）。
     // 层邻 停用：v52 已给出结论（一/三 前 8 名全是毫秒计时器，二 只有两对副本），函数保留备查。
     锚扫描(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
+    // v66：数组性质 + 跨实体互异判据（找每实体独立的位置字段）
+    槽性扫(数组, 数量);
+    找位扫(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
     // v52：同帧 4 槽对照（每 3 帧一行，400 行封顶），用来判定「跳后的新值是否等于别的槽的旧值」。
     四槽行(数组, 数量, 帧序);
 
@@ -5284,6 +5473,7 @@ void Draw::StartBooks() {
                     if (d > 槽屏跳[k]) 槽屏跳[k] = d;
                 }
                 槽屏X[k] = sx; 槽屏Y[k] = sy; 槽屏有[k] = true;
+                槽屏末帧[k] = 帧序;
             }
             float 框宽 = 40.0f * 缩放;
             float 框高 = 60.0f * 缩放;
@@ -5482,6 +5672,18 @@ void Draw::StartBooks() {
                 槽屏跳[i] = 0.0; 槽屏有[i] = false;
             }
             日志("画帧[0..9]= %s", 画串);
+        }
+        // v66：框位 —— 各槽最后一次真的画出来的屏幕像素坐标（0.5 秒内新鲜才打）。
+        // 这一行直接回答「框现在在屏幕的哪里」，不用再从世界坐标反推。
+        {
+            char 框串[460] = {0};
+            int 位6 = 0;
+            for (int i = 0; i < 10 && 位6 < 400; ++i) {
+                if (槽屏末帧[i] == 0 || 帧序 < 槽屏末帧[i] || 帧序 - 槽屏末帧[i] > 60) continue;
+                位6 += snprintf(框串 + 位6, sizeof(框串) - 位6, "%d:(%.0f,%.0f) ",
+                                i, 槽屏X[i], 槽屏Y[i]);
+            }
+            日志("框位 屏=%.0fx%.0f 心=(%.0f,%.0f) %s", 屏.x, 屏.y, 屏.x * 0.5f, 屏.y * 0.5f, 框串);
         }
         // ==================== v61：坐标定位扫描 ====================
         // 目的：直接找出「二 对象里哪个偏移才是真坐标」，不再靠猜。
