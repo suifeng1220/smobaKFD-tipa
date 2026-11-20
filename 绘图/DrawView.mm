@@ -1629,6 +1629,7 @@ static int       槽拒计 = 0, 槽保计 = 0;
 static double    槽时[24] = {0};                  // 本槽上次采信的墙钟时间，用来判「同帧」
 static int       槽候X[24] = {0}, 槽候Z[24] = {0}, 槽候连[24] = {0};
 static int       槽换基计 = 0;
+static int       两组合计 = 0;          // v62：两组副本互不印证、改取另一组的次数
 static uint64_t  槽实[24] = {0};        // v59：本槽当前绑定的实体
 // v61 诊断：本槽当帧「二」对象的完整地址，供 坐标定位 扫描用
 static uint64_t  槽二址[24] = {0};
@@ -1772,8 +1773,38 @@ static int 读实体坐标(int k, uint64_t 实体, unsigned* X, unsigned* Z) {
         if (用 >= 0) {
             用二计++;
             if (是槽) 槽锁[k] = true;
-            const unsigned 新X = (unsigned)(用 == 0 ? r.A : r.C);
-            const unsigned 新Z = (unsigned)(用 == 0 ? r.B : r.D);
+            int 新x = (int)(用 == 0 ? r.A : r.C);
+            int 新z = (int)(用 == 0 ? r.B : r.D);
+            // v62：两组副本互证。
+            // 依据 _ab_v60.log 的 指针变 行：整局 55 个窗口、12 个槽，二变=0 一变=0 ——
+            // 指针链一次都没换过对象。所以「读到别人」这个我用 v56~v61 反复解释的原因不存在，
+            // 同一对象同一布局下值能从一个真位置变成 (1,12)，只能是「这个字段此刻不是坐标」。
+            // 而 +0x2C/+0x34 与 +0x44/+0x4C 是同一个人相隔一帧的两次写入（离线实测差 237），
+            // 正常时两组必须互相印证；差值 >2000 就说明其中一组已经不是坐标：
+            //   07:47:26 k9  A=(1,12)        B=(26180,-47754)   ← A 是碎片，B 才是真值
+            //   07:43:06 k1  A=(53395,56435) B=(0,0)            ← B 还没写，A 是对的
+            // 互证不过就取「离上一帧输出更近」的那组，不再无条件 A 优先。
+            if (是槽 && okA && okB) {
+                const long long 差x = (long long)r.A - (long long)r.C;
+                const long long 差z = (long long)r.B - (long long)r.D;
+                if (差x * 差x + 差z * 差z > 2000LL * 2000LL) {
+                    bool 取B = false;
+                    if (槽保有[k]) {
+                        const long long ax = (long long)r.A - 槽保X[k], az = (long long)r.B - 槽保Z[k];
+                        const long long bx = (long long)r.C - 槽保X[k], bz = (long long)r.D - 槽保Z[k];
+                        取B = (bx * bx + bz * bz) < (ax * ax + az * az);
+                    }
+                    新x = 取B ? (int)r.C : (int)r.A;
+                    新z = 取B ? (int)r.D : (int)r.B;
+                    if (两组合计 < 400) {
+                        ++两组合计;
+                        日志("两组不符 k=%d A=(%d,%d) B=(%d,%d) → 取%s",
+                             k, r.A, r.B, r.C, r.D, 取B ? "B" : "A");
+                    }
+                }
+            }
+            const unsigned 新X = (unsigned)新x;
+            const unsigned 新Z = (unsigned)新z;
             if (是槽) {
                 // v58：先过槽验。返回 0 = 保持上一帧的最后有效位置，-1 = 这帧不画。
                 // 绘制层只看 <0，所以 0 会照常用保持值画出来。
@@ -3129,6 +3160,37 @@ static void 整局快照(uint64_t 数组, int 数量) {
     日志("指针变 %d 二变=%d 一变=%d %s", 快照计, 二变总, 一变总, 针串);
 }
 
+// ==================== v62：原始字节转储（不调阈值，直接看对象长什么样）====================
+// 为什么需要它：_ab_v60.log 的 指针变 行证明整局 二变=0 一变=0，指针链没换过对象；
+// 同一对象、同一布局，值却能从真位置变成 (1,12) 或 -1034009280，说明「这个偏移此刻是什么」
+// 才是问题所在。统计和阈值都回答不了「偏移 0x2C 里到底放的是不是坐标」——只有字节能。
+// 一次转储 = 实体/一/二/三 各 0x200 字节，每个槽 4 次、间隔 3 秒，够看出哪些 4 字节在动。
+static int 原始dump次[24] = {0};
+static void 原始dump(int k, uint64_t 实体) {
+    if (k < 0 || k >= 24) return;
+    if (原始dump次[k] >= 4) return;
+    if (帧序 == 0 || (帧序 % 180) != 0) return;
+    if (!IsValidAddr(实体)) return;
+    ++原始dump次[k];
+    const uint64_t 一 = vm_read<uint64_t>(实体 + 0xa8);
+    const uint64_t 二 = IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0;
+    const uint64_t 三 = IsValidAddr(二) ? vm_read<uint64_t>(二 + 0x00) : 0;
+    const uint64_t 层[4] = { 实体, 一, 二, 三 };
+    const char* 层名[4] = { "实体", "一", "二", "三" };
+    for (int L = 0; L < 4; ++L) {
+        if (!IsValidAddr(层[L])) { 日志("DUMP k=%d L=%s 无效", k, 层名[L]); continue; }
+        unsigned char buf[0x200];
+        if (!readMemory(层[L], buf, sizeof(buf))) { 日志("DUMP k=%d L=%s 读失败", k, 层名[L]); continue; }
+        日志("DUMP k=%d L=%s 基=%llx 第%d次", k, 层名[L], (unsigned long long)层[L], 原始dump次[k]);
+        for (int o = 0; o < 0x200; o += 16) {
+            char 行[80]; int w = 0;
+            for (int i = 0; i < 16 && w < 66; ++i)
+                w += snprintf(行 + w, sizeof(行) - w, "%02x", buf[o + i]);
+            日志("  +%03x %s", o, 行);
+        }
+    }
+}
+
 // ==================== v52：四槽帧 —— 同帧 4 槽对照 ====================
 // 环 dump 每块只装 1 个槽，看不出「跳的这一帧别的槽是什么」。而这局最缺的正是同帧对照：
 // 21:49:30 f=2888 四个槽同时跳，但 4 块是分开 dump 的，无法确认「k1 跳后的新值
@@ -4406,7 +4468,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v61 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v62 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -4592,7 +4654,7 @@ void Draw::StartBooks() {
     static double 上次差分 = 0.0;
     static int 本拍行数 = 0;                   // 一个采样周期内最多打 12 行，防日志爆掉
     static int 本拍浮点行 = 0;                 // 浮点单独限额，免得读条时把整数行挤没
-    const bool 做差分 = cfg_recall && (CACurrentMediaTime() - 上次差分 > 0.2);
+    const bool 做差分 = false && cfg_recall && (CACurrentMediaTime() - 上次差分 > 0.2);   // v62：差分占日志 84%，先关掉腾地方
     if (做差分) { 上次差分 = CACurrentMediaTime(); 本拍行数 = 0; 本拍浮点行 = 0; }
 
     // v45：全槽坐标对照（纯读、纯打印；2Hz 采 10 次，挑离屏幕中心最近的槽当「我」）
@@ -4639,6 +4701,7 @@ void Draw::StartBooks() {
         有效实体++;
 
         int 阵营 = 稳定阵营(k, 实体);
+        if (k < 4) 原始dump(k, 实体);      // v62：前 4 槽各转储 4 次（3 秒一次）
         if (阵营 >= -1 && 阵营 <= 7) 阵营直方[阵营 + 1]++;
         // v33 对照：SDK 写的是 +0xC0，代码一直用 +52。两个都打出来，一眼能看出谁是真的。
         if (首个阵营C0 == 0) {
