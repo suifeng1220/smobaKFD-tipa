@@ -1535,6 +1535,20 @@ static void 环dump(int k, unsigned 跳帧) {
 // 兼容旧调用（我方自检）：优先组A，不行用组B
 static int 读英雄坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
     if (!IsValidAddr(实体)) return 0;
+    // v69：无雾坐标优先（原生注册表 pose 链，迷雾外也实时更新）
+    {
+        float wx = 0, wz = 0;
+        if (无雾坐标(实体, &wx, &wz)) {
+            // 世界单位(±54.5) → 毫米级 int（×1000），与旧坐标同量纲
+            int mmx = (int)(wx * 1000.0f);
+            int mmz = (int)(wz * 1000.0f);
+            if ((mmx || mmz) && mmx > -120000 && mmx < 120000 && mmz > -120000 && mmz < 120000) {
+                *X = (unsigned)mmx;
+                *Z = (unsigned)mmz;
+                return 5;   // 5 = 无雾坐标（新）
+            }
+        }
+    }
     const uint64_t 一 = vm_read<uint64_t>(实体 + 0xa8);
     if (!IsValidAddr(一)) return 0;
     const uint64_t 二 = vm_read<uint64_t>(一 + 0x10);
@@ -1728,6 +1742,19 @@ static int 槽验(int k, uint64_t 实体, int x, int z, unsigned* X, unsigned* Z
 }
 
 static int 读实体坐标(int k, uint64_t 实体, unsigned* X, unsigned* Z) {
+    // v69：无雾坐标优先（原生注册表 pose 链，迷雾外也实时更新）
+    {
+        float wx = 0, wz = 0;
+        if (无雾坐标(实体, &wx, &wz)) {
+            int mmx = (int)(wx * 1000.0f);
+            int mmz = (int)(wz * 1000.0f);
+            if ((mmx || mmz) && mmx > -120000 && mmx < 120000 && mmz > -120000 && mmz < 120000) {
+                *X = (unsigned)mmx;
+                *Z = (unsigned)mmz;
+                return 5;   // 5 = 无雾坐标
+            }
+        }
+    }
     unsigned dx = 0, dz = 0;
     bool 直有 = 直接读坐标(实体, &dx, &dz) != 0;
     上次直X = dx; 上次直Z = dz; 上次直有 = 直有;
@@ -1912,6 +1939,376 @@ static void 校验链() {
     unsigned x = 0, z = 0;
     if (链样点统计(数组, 数量, 当前链, &x, &z) < 2)
         链打分(数组, 数量);
+}
+
+// ==================== v69：无雾坐标（原生注册表 pose 链）====================
+// 移植自 S45赛季绘制_v9.3.mm（逐行对齐 wz_nat_fog.h）
+// 根因：ActorLinker.position(+0x4C4) 在迷雾外被游戏冻结（只保留最后一次可见值）；
+//       而引擎原生注册表里每个 actor 的 pose 槽仍在逐帧更新。
+//       这就是 v39~v68 组B 冻结 / 组A 共享 / 框乱跳的全部原因。
+//
+// 链（每层都校验，任一失败即整链失败，绝不输出猜测值）：
+//   slot = 模块基址 + 0x130EB9B0
+//   [slot]           → rootReference
+//   [rootRef+0]      → root
+//   [root+0x2B0]     → source
+//   [source+0x38]    → world   (u32[source+0x40] == u32[world+0xC])
+//   world+0xB0       → registry header
+//   [header]         → data 数组 (u32[header+0x1C] = count, 须 10..512)
+//   data[i] stride 0x20: u32 id@0x0 / u64 actor@0x8 / u32 sequence@0x10
+//
+// 取坐标：
+//   actor+0x100 必须 == objId
+//   pose 槽：u32[actor+0x28] = variant
+//     variant==0 → slot = actor+0x30
+//     否则       → pool = [actor+0x48]; u32[pool+0x50] = selectorActive
+//                  selectorActive ? idx = u16[[pool+0x30]+2] : idx = 0
+//                  slot = [pool+0x10] + idx*0x18
+//   pose = [slot];  u32[slot+8] == u32[pose+0xC] != 0
+//   external = [pose+0x60]
+//   world 14B @ external / local 14B @ pose+0xC0
+//   标志：world[12]==local[12] && world[13]==1 && local[13]==1
+//   坐标 = (int32 external[3] - int32 local[3]) * scale
+//   scale = float@( [基址+0x12F98A30] ), 必须 ∈ (0,1)
+
+#define NAT_ROOT_REF_RVA    0x130EB9B0ULL
+#define NAT_SRC_IN_ROOT     0x2B0ULL
+#define NAT_WORLD_HANDLE    0x38ULL
+#define NAT_REGISTRY        0xB0ULL
+#define NAT_REG_COUNT       0x1CULL
+#define NAT_REG_STRIDE      0x20ULL
+#define NAT_ACTOR_OBJID     0x100ULL
+#define NAT_OBJ_SEQ         0xCULL
+#define NAT_POSE_VARIANT    0x28ULL
+#define NAT_INLINE_POSE     0x30ULL
+#define NAT_POSE_POOL       0x48ULL
+#define NAT_POOL_SEL_ACTIVE 0x50ULL
+#define NAT_POOL_IDX_PTR    0x30ULL
+#define NAT_POOL_DATA       0x10ULL
+#define NAT_POSE_EXT_POS    0x60ULL
+#define NAT_POSE_LOCAL_POS  0xC0ULL
+#define NAT_SCALE_RVA       0x12F98A30ULL
+#define NAT_POSE_GETTER_RVA 0x9DF42D8ULL
+#define NAT_VT_GETTER       0x1E8ULL
+#define NAT_POOL_SLOT_STRIDE 0x18ULL
+#define NAT_COUNT_MIN       10
+#define NAT_COUNT_MAX       512
+
+struct 自然条目 {
+    unsigned id;        // +0x00
+    unsigned 源下标;    // +0x04
+    unsigned long long 演员; // +0x08
+    unsigned 序列;      // +0x10
+    unsigned 编码;      // +0x14
+    unsigned long long 守卫; // +0x18
+};
+// 确保 0x20
+static_assert(sizeof(自然条目) == NAT_REG_STRIDE, "stride must be 0x20");
+
+static 自然条目 无雾表[NAT_COUNT_MAX];
+static int      无雾数       = 0;
+static float    无雾比例     = 0;       // scale
+static bool     无雾好       = false;
+static char     无雾诊[200]  = "";
+static unsigned long long 无雾槽   = 0;   // rootReference 槽地址
+static unsigned long long 无雾数据 = 0;
+static unsigned long long 无雾头   = 0;
+static float    无雾比例址   = 0;
+static unsigned 无雾计数     = 0;
+static unsigned long long 无雾基址 = 0;   // 本次成功的 模块基址
+static char     无雾层[96]  = "";         // 断在第几层
+static int      无雾扫次    = 0;
+static int      无雾严格    = 0;
+static int      无雾宽放    = 0;         // flag 位放行次数
+static int      无雾严中    = 0;
+static int      无雾宽松标志 = 1;         // flag 校验降级为二级（默认开）
+static double   无雾上次时间 = 0;         // 最近成功刷新时刻
+static int      无雾连续失败 = 0;
+
+static bool 无雾指针(unsigned long long p) {
+    return p >= 0x100000ULL && p <= 0x00007FFFFFFFFFFFULL && !(p & 3ULL);
+}
+
+// 走链到注册表头
+static bool 无雾走链(unsigned long long 槽, unsigned long long* 根,
+                      unsigned long long* 世, unsigned long long* 头,
+                      unsigned* 世序) {
+    if (!槽) return false;
+    unsigned long long 根引 = 0, 根p = 0, 源 = 0, 世p = 0;
+    unsigned 句序 = 0, 世序v = 0;
+    根引 = vm_read<unsigned long long>(槽);
+    if (!无雾指针(根引)) { strcpy(无雾层, "L1 [slot]->rootRef"); return false; }
+    根p = vm_read<unsigned long long>(根引);
+    if (!无雾指针(根p)) { strcpy(无雾层, "L2 [rootRef]->root"); return false; }
+    源 = vm_read<unsigned long long>(根p + NAT_SRC_IN_ROOT);
+    if (!无雾指针(源)) { strcpy(无雾层, "L3 [root+0x2B0]->source"); return false; }
+    世p = vm_read<unsigned long long>(源 + NAT_WORLD_HANDLE);
+    if (!无雾指针(世p)) { strcpy(无雾层, "L4 [source+0x38]->world"); return false; }
+    // u32[source+0x40] 必须非零且 == u32[world+0xC]
+    readMemory(源 + NAT_WORLD_HANDLE + 8, &句序, 4);
+    readMemory(世p + NAT_OBJ_SEQ, &世序v, 4);
+    if (句序 == 0 || 句序 != 世序v) {
+        snprintf(无雾层, sizeof(无雾层), "L5 seq %u!=%u", 句序, 世序v);
+        return false;
+    }
+    if (根) *根 = 根p;
+    if (世) *世 = 世p;
+    if (头) *头 = 世p + NAT_REGISTRY;
+    if (世序) *世序 = 世序v;
+    return true;
+}
+
+// 宽松链（只验结构不验序列号）
+static bool 无雾走链松(unsigned long long 槽) {
+    unsigned long long 根引 = 0, 根p = 0, 源 = 0, 世p = 0, 头 = 0, 数据 = 0;
+    unsigned 计数 = 0;
+    根引 = vm_read<unsigned long long>(槽);
+    if (!无雾指针(根引)) return false;
+    根p = vm_read<unsigned long long>(根引);
+    if (!无雾指针(根p)) return false;
+    源 = vm_read<unsigned long long>(根p + NAT_SRC_IN_ROOT);
+    if (!无雾指针(源)) return false;
+    世p = vm_read<unsigned long long>(源 + NAT_WORLD_HANDLE);
+    if (!无雾指针(世p)) return false;
+    头 = 世p + NAT_REGISTRY;
+    数据 = vm_read<unsigned long long>(头);
+    if (!无雾指针(数据)) return false;
+    readMemory(头 + NAT_REG_COUNT, &计数, 4);
+    if (计数 < NAT_COUNT_MIN || 计数 > NAT_COUNT_MAX) return false;
+    int 见 = 0, 好 = 0;
+    for (unsigned i = 0; i < 计数 && i < 12; i++) {
+        unsigned id = 0, seq = 0;
+        unsigned long long actor = 0;
+        readMemory(数据 + (unsigned long long)i * NAT_REG_STRIDE, &id, 4);
+        actor = vm_read<unsigned long long>(数据 + (unsigned long long)i * NAT_REG_STRIDE + 8);
+        readMemory(数据 + (unsigned long long)i * NAT_REG_STRIDE + 0x10, &seq, 4);
+        见++;
+        if (id && id < 2000000000u && seq && 无雾指针(actor)) 好++;
+    }
+    return (见 >= 4 && 好 >= 见 - 1);
+}
+
+// pose 槽定位
+static bool 无雾pose槽(unsigned long long 演员, unsigned long long* 槽) {
+    unsigned 变体 = 0;
+    if (!槽 || !无雾指针(演员)) return false;
+    readMemory(演员 + NAT_POSE_VARIANT, &变体, 4);
+    if (变体 == 0) {
+        *槽 = 演员 + NAT_INLINE_POSE;
+        return 无雾指针(*槽);
+    }
+    unsigned long long 池 = 0, 索引组 = 0, 数据 = 0;
+    unsigned 选择器活 = 0;
+    unsigned short 索引 = 0;
+    池 = vm_read<unsigned long long>(演员 + NAT_POSE_POOL);
+    if (!无雾指针(池)) return false;
+    readMemory(池 + NAT_POOL_SEL_ACTIVE, &选择器活, 4);
+    if (选择器活) {
+        索引组 = vm_read<unsigned long long>(池 + NAT_POOL_IDX_PTR);
+        if (!无雾指针(索引组)) return false;
+        readMemory(索引组 + 2, &索引, 2);
+    }
+    if (索引 >= 4096) return false;
+    数据 = vm_read<unsigned long long>(池 + NAT_POOL_DATA);
+    if (!无雾指针(数据)) return false;
+    *槽 = 数据 + (unsigned long long)索引 * NAT_POOL_SLOT_STRIDE;
+    return 无雾指针(*槽);
+}
+
+// 注册表刷新（~2Hz 调用一次即可）
+static void 无雾刷新() {
+    无雾好 = false;
+    if (!IsValidAddr(模块基址)) {
+        strcpy(无雾诊, "no uf base"); return;
+    }
+    无雾基址 = 模块基址;
+    无雾层[0] = 0;
+
+    // 步骤一：定位 rootReference 槽（固定 RVA 探针）
+    if (!无雾槽) {
+        无雾扫次++;
+        if (无雾走链(模块基址 + NAT_ROOT_REF_RVA, 0, 0, 0, 0)) {
+            无雾槽 = 模块基址 + NAT_ROOT_REF_RVA;
+            无雾严格 = 1;
+        } else if (无雾走链松(模块基址 + NAT_ROOT_REF_RVA)) {
+            无雾槽 = 模块基址 + NAT_ROOT_REF_RVA;
+            无雾严格 = 0;
+        } else {
+            char 层存[96];
+            strcpy(层存, 无雾层);
+            snprintf(无雾诊, sizeof(无雾诊), "RVA miss(%s) try=%d", 层存, 无雾扫次);
+            return;
+        }
+    }
+
+    // 步骤二：走链取注册表
+    unsigned long long 根 = 0, 世 = 0, 头 = 0;
+    unsigned 世序 = 0;
+    bool 严 = 无雾走链(无雾槽, &根, &世, &头, &世序);
+    if (!严) {
+        char 层存[96];
+        strcpy(层存, 无雾层);
+        if (!无雾走链松(无雾槽)) {
+            snprintf(无雾诊, sizeof(无雾诊), "chain lost [%s]", 层存);
+            无雾连续失败++;
+            if (无雾连续失败 >= 20) { 无雾槽 = 0; 无雾连续失败 = 0; }
+            return;
+        }
+        // 宽松链可用，重新取头
+        unsigned long long 根引 = vm_read<unsigned long long>(无雾槽);
+        unsigned long long 根p = vm_read<unsigned long long>(根引);
+        unsigned long long 源 = vm_read<unsigned long long>(根p + NAT_SRC_IN_ROOT);
+        世 = vm_read<unsigned long long>(源 + NAT_WORLD_HANDLE);
+        头 = 世 + NAT_REGISTRY;
+        无雾严格 = 0;
+    } else {
+        无雾严格 = 1;
+    }
+
+    // count 须 10..512
+    unsigned long long 数据 = 0;
+    unsigned 计数 = 0;
+    数据 = vm_read<unsigned long long>(头);
+    if (!无雾指针(数据)) { 无雾连续失败++; return; }
+    readMemory(头 + NAT_REG_COUNT, &计数, 4);
+    if (计数 < NAT_COUNT_MIN || 计数 > NAT_COUNT_MAX) {
+        snprintf(无雾诊, sizeof(无雾诊), "reg cnt=%u", 计数);
+        无雾连续失败++;
+        return;
+    }
+
+    // scale ∈ (0,1)
+    {
+        unsigned long long 比址 = 0;
+        float sc = 0;
+        比址 = vm_read<unsigned long long>(模块基址 + NAT_SCALE_RVA);
+        if (无雾指针(比址) && readMemory(比址, &sc, 4) && isfinite(sc) && sc > 0 && sc < 1) {
+            无雾比例 = sc;
+        }
+    }
+
+    // 读全表
+    {
+        unsigned char* 原 = (unsigned char*)无雾表;
+        size_t 已 = 0, 总 = (size_t)计数 * NAT_REG_STRIDE;
+        while (已 < 总) {
+            size_t 块 = (总 - 已 > 4096) ? 4096 : (总 - 已);
+            if (!readMemory(数据 + 已, 原 + 已, 块)) break;
+            已 += 块;
+        }
+        if (已 != 总) { 无雾连续失败++; return; }
+    }
+
+    int n = 0;
+    for (unsigned i = 0; i < 计数 && n < NAT_COUNT_MAX; i++) {
+        自然条目 e = 无雾表[i];
+        if (!e.id || !e.序列 || !无雾指针(e.演员)) continue;
+        e.源下标 = i;
+        无雾表[n] = e;
+        n++;
+    }
+    if (n < 8) {
+        snprintf(无雾诊, sizeof(无雾诊), "ents %d too few", n);
+        无雾连续失败++;
+        return;
+    }
+    无雾数 = n;
+    无雾数据 = 数据;
+    无雾头 = 头;
+    无雾计数 = 计数;
+    无雾好 = true;
+    无雾连续失败 = 0;
+    无雾上次时间 = CACurrentMediaTime();
+    if (无雾扫次 <= 3 || (无雾扫次 % 20) == 0)
+        日志("无雾刷新 ok slot+%#llx[%s] cnt=%u ents=%d sc=%.6g try=%d",
+             (unsigned long long)(无雾槽 - 模块基址), 无雾严格 ? "strict" : "loose",
+             计数, n, 无雾比例, 无雾扫次);
+}
+
+// 按 ObjID 取无雾坐标（返回 true = 命中）
+// 出参 x,z 为世界单位 float（±54.5）
+static bool 无雾坐标ID(unsigned objId, float* x, float* z) {
+    if (!objId || !无雾数) return false;
+    // 刷新失败但 1 秒内成功过 → 用缓存
+    if (!无雾好 && (CACurrentMediaTime() - 无雾上次时间) > 1.0) return false;
+    int 找 = -1;
+    for (int i = 0; i < 无雾数; i++) {
+        if (无雾表[i].id == objId) { 找 = i; break; }
+    }
+    if (找 < 0) return false;
+    const 自然条目* 条 = &无雾表[找];
+    if (!无雾指针(条->演员) || !条->序列) return false;
+
+    for (int 试 = 0; 试 < 3; 试++) {
+        unsigned 本ID = 0, 本序 = 0, 槽序 = 0, 姿序 = 0;
+        unsigned long long 槽 = 0, 姿 = 0, 外 = 0;
+        // 身份确认
+        readMemory(条->演员 + NAT_ACTOR_OBJID, &本ID, 4);
+        if (本ID != objId) continue;
+        readMemory(条->演员 + NAT_OBJ_SEQ, &本序, 4);
+        if (本序 != 条->序列) continue;
+        if (!无雾pose槽(条->演员, &槽)) continue;
+        姿 = vm_read<unsigned long long>(槽);
+        if (!无雾指针(姿)) continue;
+        readMemory(槽 + 8, &槽序, 4);
+        readMemory(姿 + NAT_OBJ_SEQ, &姿序, 4);
+        if (槽序 == 0 || 槽序 != 姿序) continue;
+        外 = vm_read<unsigned long long>(姿 + NAT_POSE_EXT_POS);
+        if (!无雾指针(外)) continue;
+        unsigned char 世界[14] = {0}, 本地[14] = {0}, 世界2[14] = {0}, 本地2[14] = {0};
+        if (!readMemory(外, 世界, 14)) continue;
+        if (!readMemory(姿 + NAT_POSE_LOCAL_POS, 本地, 14)) continue;
+        if (!readMemory(外, 世界2, 14)) continue;
+        if (!readMemory(姿 + NAT_POSE_LOCAL_POS, 本地2, 14)) continue;
+        if (memcmp(世界, 世界2, 14) || memcmp(本地, 本地2, 14)) continue;  // torn read
+        int w[3], l[3];
+        memcpy(w, 世界, 12);
+        memcpy(l, 本地, 12);
+        // 二次确认条目未变
+        自然条目 再;
+        if (!readMemory(无雾数据 + (unsigned long long)条->源下标 * NAT_REG_STRIDE, &再, sizeof(再))) continue;
+        if (再.id != 条->id || 再.演员 != 条->演员 || 再.序列 != 条->序列) continue;
+        // flag 位（降级为二级校验）
+        bool 旗 = (世界[12] == 本地[12] && 世界[13] == 1 && 本地[13] == 1);
+        if (!旗 && !无雾宽松标志) continue;
+        if (旗) 无雾严中++; else 无雾宽放++;
+        if (无雾比例 > 0 && 无雾比例 < 1) {
+            *x = (float)(w[0] - l[0]) * 无雾比例;
+            *z = (float)(w[2] - l[2]) * 无雾比例;
+        } else {
+            *x = (float)(w[0] - l[0]);
+            *z = (float)(w[2] - l[2]);
+        }
+        return true;
+    }
+    return false;
+}
+
+// 从实体指针找 ObjID：先试 +0x100（native actor），再试 +0x4AC（ActorLinker）
+static unsigned 无雾找ID(uint64_t 实体) {
+    if (!IsValidAddr(实体)) return 0;
+    unsigned id = 0;
+    readMemory(实体 + NAT_ACTOR_OBJID, &id, 4);
+    if (id && id < 2000000000u) return id;
+    readMemory(实体 + 0x4AC, &id, 4);
+    if (id && id < 2000000000u) return id;
+    return 0;
+}
+
+// 对外接口：实体 → 无雾世界坐标（float, ±54.5）
+// 返回 true = 命中，x/z 有效
+static bool 无雾坐标(uint64_t 实体, float* x, float* z) {
+    if (!无雾数) return false;
+    // 先试按指针匹配（实体 == 注册表演员）
+    for (int i = 0; i < 无雾数; i++) {
+        if (无雾表[i].演员 == 实体) {
+            return 无雾坐标ID(无雾表[i].id, x, z);
+        }
+    }
+    // 再试读 ObjID
+    unsigned id = 无雾找ID(实体);
+    if (id) return 无雾坐标ID(id, x, z);
+    return false;
 }
 
 // ==================== 实体字段 ====================
@@ -4818,7 +5215,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v68 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v69 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -4900,6 +5297,37 @@ void Draw::StartBooks() {
         状态浮层(4, "实体数组无效");
         if (!在对局) 底部文字(屏, "等待进入对局");
         return;
+    }
+
+    // v69：无雾坐标注册表刷新（2Hz）
+    {
+        static double 上次无雾刷 = 0;
+        if (now - 上次无雾刷 > 0.5) {
+            上次无雾刷 = now;
+            无雾刷新();
+        }
+        // 5 秒一次诊断
+        static double 上次无雾诊 = 0;
+        if (now - 上次无雾诊 > 5.0) {
+            上次无雾诊 = now;
+            日志("无雾诊 好=%d ents=%d sc=%.6g 严中=%d 宽放=%d [%s] 槽+%llx",
+                 无雾好 ? 1 : 0, 无雾数, 无雾比例, 无雾严中, 无雾宽放, 无雾诊,
+                 无雾槽 ? (无雾槽 - 模块基址) : 0ULL);
+            // 实体↔注册表对照：前 3 个实体 vs 前 3 个注册表条目
+            if (无雾数 > 0) {
+                char 行[300] = {0};
+                int 位 = 0;
+                for (int i = 0; i < 数量 && i < 3; ++i) {
+                    uint64_t e = vm_read<uint64_t>(数组 + 24ULL * i);
+                    unsigned eid = 无雾找ID(e);
+                    位 += snprintf(行 + 位, sizeof(行) - 位, "e%d=%llx/id=%u ", i, e, eid);
+                }
+                for (int i = 0; i < 无雾数 && i < 3; ++i) {
+                    位 += snprintf(行 + 位, sizeof(行) - 位, "| n%d=%llx/id=%u ", i, 无雾表[i].演员, 无雾表[i].id);
+                }
+                日志("无雾对照 %s", 行);
+            }
+        }
     }
 
     // 我方阵营：配置指定 or 按相机朝向猜（矩阵[0]<=0 → 2，否则 1）
@@ -5293,6 +5721,8 @@ void Draw::StartBooks() {
 
         unsigned 样X = 0, 样Z = 0;
         int 链 = 读实体坐标(k, 实体, &样X, &样Z);
+        // v69 诊断：统计无雾命中
+        if (链 == 5) { static int 无雾命中计 = 0; ++无雾命中计; }
         写环(k);            // v49：成功失败都记 —— 「读不到」本身就是这次要查的东西
         if (链 < 0 || 样X == 1000000) { if (k < 24) 槽无跳[k]++; continue; }
         const unsigned 原X = 样X, 原Z = 样Z;   // 原始值留着做诊断
