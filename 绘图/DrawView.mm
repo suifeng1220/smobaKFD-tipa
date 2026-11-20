@@ -2726,7 +2726,7 @@ static void 我方自检(uint64_t 数组, int 数量, const float* 矩阵, float
 //   (4) 至少一个实体的投影距屏幕中心 < 150px          —— 相机跟随我 => 我恒投屏心
 //   (4) 不需要知道哪一槽是我，只要求「存在一个实体在屏心附近」；
 //       且只在样本里确实有我方实体时才作为硬条件，找不到我方时降级为仅记录。
-#define 找位体数 6
+#define 找位体数 12          // v68: 6→12，确保玩家（槽7）一定在样本里
 #define 找位节点 25          // 0 = 本体；1..N = 实体+指针偏移；末尾两个 = 二 / 三
 #define 找位缓冲 0x400
 
@@ -2766,11 +2766,13 @@ static void 找位名(const 找位路& r, char* s, size_t n) {
 }
 
 // 从缓冲取 (X,Z)，统一为毫米级整数；float 按「米」解释 x1000
+// v68 增加解释3: int32 间隔对 (o, o+8) —— x,y,z 整数 Vector3 取 x,z
 static bool 找位取(int 解释, const unsigned char* b, int len, int o, int* X, int* Z) {
-    if (解释 == 0) {
-        if (o + 8 > len) return false;
+    if (解释 == 0 || 解释 == 3) {
+        const int 步 = (解释 == 0) ? 4 : 8;
+        if (o + 步 + 4 > len) return false;
         int a, c;
-        memcpy(&a, b + o, 4); memcpy(&c, b + o + 4, 4);
+        memcpy(&a, b + o, 4); memcpy(&c, b + o + 步, 4);
         *X = a; *Z = c;
         return true;
     }
@@ -2815,7 +2817,8 @@ static void 找位扫(uint64_t 数组, int 数量, const float* m, float 宽, fl
     // ---- 选样：优先 3 个我方（相机跟随我 => 锚定真值必须在样本里），再补到 6 个 ----
     uint64_t 体[找位体数];
     int 用 = 0, 我数 = 0;
-    for (int k = 0; k < 数量 && k < 24 && 用 < 3; ++k) {
+    // v68: 先取全部我方（确保玩家在样本里，锚定才能生效），再补其它
+    for (int k = 0; k < 数量 && k < 24 && 用 < 找位体数; ++k) {
         const uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
         if (!IsValidAddr(e)) continue;
         if (vm_read<int>(e + 52) == (int)我方) { 体[用++] = e; ++我数; }
@@ -2893,7 +2896,7 @@ static void 找位扫(uint64_t 数组, int 数量, const float* m, float 宽, fl
         限 &= ~3;
 
         for (int o = 0; o + 8 <= 限; o += 4) {
-            for (int 解 = 0; 解 < 3; ++解) {
+            for (int 解 = 0; 解 < 4; ++解) {
                 int xs[找位体数], zs[找位体数];
                 bool ok[找位体数];
                 int 通 = 0;
@@ -2921,6 +2924,10 @@ static void 找位扫(uint64_t 数组, int 数量, const float* m, float 宽, fl
                 }
                 if (!异) continue;
 
+                // v68: 诊断——通过①②的候选数（不加④之前）
+                { static int 过①② = 0; if (过①② < 40) { ++过①②;
+                  日志("找位过①② 节=%s +0x%x 解=%d 通=%d/%d", 路名, o, 解, 通, 用); } }
+
                 // (4) 屏心锚定：至少一个实体投影落在屏心 150px 内
                 float 锚距 = 1e9f;
                 int 锚i = -1;
@@ -2941,7 +2948,7 @@ static void 找位扫(uint64_t 数组, int 数量, const float* m, float 宽, fl
                 for (int q = 0; q < 找位表数; ++q)
                     if (找位表[q].路 == t && 找位表[q].偏移 == o && 找位表[q].解释 == 解) { 位 = q; break; }
 
-                const char* 解名 = (解 == 0) ? "i32" : (解 == 1) ? "f32" : "v3";
+                const char* 解名 = (解 == 0) ? "i32" : (解 == 1) ? "f32" : (解 == 2) ? "v3" : "i32x";
 
                 if (位 < 0) {
                     if (找位表数 >= 16) {
@@ -4811,7 +4818,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v67 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v68 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
