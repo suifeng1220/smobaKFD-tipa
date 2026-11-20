@@ -1964,14 +1964,15 @@ static void 校验链() {
 }
 
 // ==================== v70：ActorManager 坐标链（Frida 实测确认）====================
-// 2026-11-20 Frida + il2cpp 元数据实测，完整链路：
-//   UF_base + 0x2262b4a0  → ActorManager 实例指针（静态存储，RVA 稳定）
+// 2026-11-21 Frida + il2cpp 元数据实测，完整链路：
+//   UF_base + 0x2260b4a0  → ActorManager 实例指针（静态存储，RVA 稳定）
 //   实例+0x18             → HeroActors (TinyValueList)
 //   HeroActors+8          → 列表对象（内部条目数组）
 //   列表+16               = count（10 = 5v5 英雄）
 //   列表+32 + i*0x10      → (ActorLinker*, listId)
 //   ActorLinker+0x4C4     → position (float x,y,z) 世界坐标 ±54.5
 //   ActorLinker+0x4AC     → ObjID（干净小整数 7,11,18...）
+//   ActorLinker+0x40C     → 阵营 (1=队A, 2=队B) 5/5 完美分割
 //   ActorLinker+0x505     → _logicVisible（1=可见 0=迷雾）
 //   ActorLinker+0x3B8     → ValueComponent（血量）
 // 坐标缩放：世界 ±54.5 → 内部 ±103500，系数 = 103500/109 ≈ 949.54
@@ -1979,7 +1980,7 @@ static void 校验链() {
 // 对比 v69 注册表 pose 链：链路短 5 倍，不需要 scale/pose/variant，
 // 直接读 3 个 float，且经采样验证坐标逐帧更新（id=36 每 1.5s 匀速 1.12 单位）。
 
-#define AM_INST_RVA     0x2262b4a0ULL    // ActorManager 实例指针在 UF 中的 RVA
+#define AM_INST_RVA     0x2260b4a0ULL    // ActorManager 实例指针在 UF 中的 RVA
 #define AM_IDX_OFF      0x18ULL          // ActorManager → HeroActors
 #define AM_LIST_OFF     0x08ULL          // HeroActors → 条目列表对象
 #define AM_COUNT_OFF    0x10ULL          // 列表 → count
@@ -1988,6 +1989,7 @@ static void 校验链() {
 #define AM_LINKER_POS   0x4C4ULL         // ActorLinker → position (3×float)
 #define AM_LINKER_ID    0x4ACULL         // ActorLinker → ObjID
 #define AM_LINKER_VIS   0x505ULL         // ActorLinker → _logicVisible
+#define AM_LINKER_CAMP  0x40CULL         // ActorLinker → 阵营 (1=队A, 2=队B)
 #define AM_MAX_HERO     16
 
 struct AM英雄 {
@@ -1995,6 +1997,7 @@ struct AM英雄 {
     unsigned           编号;     // ObjID
     float              x, y, z;  // 世界坐标 ±54.5
     unsigned char      可见;     // _logicVisible
+    unsigned           阵营;     // +0x40C (1 or 2)
 };
 
 static AM英雄  AM表[AM_MAX_HERO];
@@ -2051,11 +2054,13 @@ static void AM刷新() {
         unsigned 编号 = 0;
         float x = 0, y = 0, z = 0;
         unsigned char 可见 = 0;
+        unsigned 阵营值 = 0;
         readMemory(连接器 + AM_LINKER_ID, &编号, 4);
         readMemory(连接器 + AM_LINKER_POS, &x, 4);
         readMemory(连接器 + AM_LINKER_POS + 4, &y, 4);
         readMemory(连接器 + AM_LINKER_POS + 8, &z, 4);
         readMemory(连接器 + AM_LINKER_VIS, &可见, 1);
+        readMemory(连接器 + AM_LINKER_CAMP, &阵营值, 4);
 
         // 校验：坐标在 ±60 范围内，编号非零
         if (!编号 || !isfinite(x) || !isfinite(z) || x < -60 || x > 60 || z < -60 || z > 60) continue;
@@ -2064,6 +2069,7 @@ static void AM刷新() {
         AM表[n].编号 = 编号;
         AM表[n].x = x; AM表[n].y = y; AM表[n].z = z;
         AM表[n].可见 = 可见;
+        AM表[n].阵营 = 阵营值;
         n++;
     }
 
@@ -2077,8 +2083,11 @@ static void AM刷新() {
     AM好 = true;
     AM失败连 = 0;
     AM上次 = CACurrentMediaTime();
-    if (AM失败连 == 0 && (AM数 <= 3 || (n % 20) == 0))
-        日志("AM刷新 ok inst=%#llx cnt=%u valid=%d", 实例, 数量, n);
+    if (AM失败连 == 0 && (AM数 <= 3 || (n % 20) == 0)) {
+        int c1 = 0, c2 = 0;
+        for (int j = 0; j < n; j++) { if (AM表[j].阵营 == 1) c1++; else if (AM表[j].阵营 == 2) c2++; }
+        日志("AM刷新 ok inst=%#llx cnt=%u valid=%d camp1=%d camp2=%d", 实例, 数量, n, c1, c2);
+    }
 }
 
 // 按实体指针找 ActorLinker 坐标（返回 true = 命中）
@@ -2133,6 +2142,29 @@ static bool AM坐标内部(uint64_t 实体, int* X, int* Z) {
     *X = AM换算(wx);
     *Z = AM换算(wz);
     return true;
+}
+
+// 按实体取 AM 阵营（1 or 2），找不到返回 0
+static unsigned AM阵营(uint64_t 实体) {
+    if (!AM数 || !IsValidAddr(实体)) return 0;
+    for (int i = 0; i < AM数; i++) {
+        if (AM表[i].连接器 == 实体) return AM表[i].阵营;
+    }
+    unsigned id = 0;
+    readMemory(实体 + AM_LINKER_ID, &id, 4);
+    if (id && id < 2000000000u) {
+        for (int i = 0; i < AM数; i++) {
+            if (AM表[i].编号 == id) return AM表[i].阵营;
+        }
+    }
+    id = 0;
+    readMemory(实体 + 0x100, &id, 4);
+    if (id && id < 2000000000u) {
+        for (int i = 0; i < AM数; i++) {
+            if (AM表[i].编号 == id) return AM表[i].阵营;
+        }
+    }
+    return 0;
 }
 
 // ==================== v69：无雾坐标（原生注册表 pose 链）====================
@@ -5409,7 +5441,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v70 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v71 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -6332,6 +6364,44 @@ void Draw::StartBooks() {
                 画文字(mx, my - 10.0f * 缩放, 秒串, 0xFFFFFFFF, true);
             } else {
                 画实心圆(0xFFFF00FF, mx, my, 3.0f * 缩放);
+            }
+        }
+    }
+
+    // ==================== v71：AM 直画敌方头像（绕过老实体数组）====================
+    // 老实体数组的坐标链不可靠（组A共享/组B冻结/链读兜底绕过门控），
+    // AM（ActorManager HeroActors）的坐标是引擎内部实时值，直接用它画。
+    // 我方阵营沿用 判定我方阵营 的结果（和 AM 阵营同量纲 1/2）。
+    if (cfg_map && AM好 && AM数 > 0) {
+        for (int i = 0; i < AM数; i++) {
+            if ((int)AM表[i].阵营 == (int)我方阵营) continue;   // 我方跳过
+            int wx = AM换算(AM表[i].x);
+            int wz = AM换算(AM表[i].z);
+            float mx = 0, my = 0;
+            小图坐标(wx, wz, (int)AM表[i].阵营, 地图, &mx, &my);
+            mx *= 缩放;
+            my *= 缩放;
+            if (!在框内(地图, mx / 缩放, my / 缩放)) continue;
+
+            const float 图标大小 = 14.0f * 缩放;
+            const float 环粗 = 1.35f * 缩放;
+            const float 环半径 = 图标大小 * 0.5f + 0.65f * 缩放 + 环粗 * 0.5f;
+            char 编号[8] = {0};
+            snprintf(编号, sizeof(编号), "%d", (int)(AM表[i].编号 % 1000));
+            id 英雄纹理 = [图标缓存 英雄:(int)AM表[i].编号];
+            画图标(英雄纹理, 0x80000000, 英雄纹理 ? 编号 : nullptr,
+                   mx - 图标大小 * 0.5f, my - 图标大小 * 0.5f, 图标大小);
+            画血环(0xFF00FF00, mx, my, 环半径, 1.0f, 环粗);
+            // AM 诊断：每 5 秒打一行
+            static double AM画诊时 = 0;
+            static int AM画计 = 0;
+            AM画计++;
+            if (now - AM画诊时 > 5.0) {
+                AM画诊时 = now;
+                日志("AM画 敌=%d/%d 例=(%d,%d)→(%.0f,%.0f) camp=%u id=%u",
+                     AM画计, AM数, wx, wz, mx / 缩放, my / 缩放,
+                     AM表[i].阵营, AM表[i].编号);
+                AM画计 = 0;
             }
         }
     }
