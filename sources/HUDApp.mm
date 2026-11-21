@@ -11,6 +11,7 @@
 #import <objc/runtime.h>
 #import <sys/utsname.h>
 #import <sys/sysctl.h>
+#import <unistd.h>
 
 #if !NO_TROLL
 #import "AXEventRepresentation.h"
@@ -314,6 +315,24 @@ int main(int argc, char *argv[]) {
         setenv("PATH", "/sbin:/bin:/usr/sbin:/usr/bin:/var/jb/sbin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/usr/bin", 1);
         setenv("TERM", "xterm-256color", 1);
       }
+    }
+
+    // persona(root) 拉起的进程（越狱下 -hud 走策略2）：趁 root 先把越狱通道建好
+    // —— jbclient_initialize_primitives 硬性要求 uid 0（root 域只放行 root 进程）。
+    // 建完立刻降权到 mobile(501)：窗口 / NSUserDefaults / 日志都在降权之后创建，
+    // 文件属主不会漂成 root，设置持久化不会断。同步执行（内部自带 8s XPC 超时），
+    // 必须赶在任何 Foundation 偏好读写之前，且不能拖进 didFinishLaunching。
+    // 只对 -hud / 主进程做：-check/-exit 也是 root 拉起的，但它们秒进秒出，
+    // 在这跑一遍通道初始化纯属拖慢开关（-check 被限时 waitpid 2s 强杀）。
+    if (getuid() == 0 && (argc <= 1 || (argv[1] && strcmp(argv[1], "-hud") == 0))) {
+      extern "C" int exploit_init_jailbreak(void);
+      extern "C" void KernelLogLine(const char *line);
+      int 通道 = exploit_init_jailbreak();
+      setgid(501);
+      setuid(501);
+      KernelLogLine(通道 == 0
+        ? "HUD: 越狱通道就绪（零内核利用），已降权至 mobile(501)"
+        : "HUD: 越狱通道未建成，已降权至 mobile(501)（kread 不可用，绘制走任务端口）");
     }
 
 #if !NO_TROLL

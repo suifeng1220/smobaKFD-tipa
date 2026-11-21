@@ -523,9 +523,18 @@ static void 内核自检() {
     if (!IsKernelAddr(基)) 基 = 静态基 + 偏移;
     uint64_t allproc = gSystemInfo.kernelSymbol.allproc;
     uint32_t magic = IsKernelAddr(基) ? kread32(基) : 0;
+    BOOL 好 = (magic == 0xFEEDFACF);
+    // 状态没变就别刷屏：以前每 5 秒固定 3 行 ❌，把真正有用的日志全淹了。
+    // 只在 ✅/❌ 翻转或距上次完整报告 ≥60 秒时才打。
+    static int 上次好坏 = -1;
+    static double 上次详报 = -1e9;
+    double 现在 = CACurrentMediaTime();
+    if (好 == 上次好坏 && 现在 - 上次详报 < 60.0) return;
+    上次好坏 = 好 ? 1 : 0;
+    上次详报 = 现在;
     日志("内核自检: base=0x%llx staticBase=0x%llx slide=0x%llx allproc=0x%llx magic=0x%08x %s",
          基, 静态基, 偏移, allproc, magic,
-         (magic == 0xFEEDFACF) ? "✅ kread 正常" : "❌ kread 异常/符号缺失");
+         好 ? "✅ kread 正常" : "❌ kread 异常/符号缺失");
     日志("内核偏移: proc.next=0x%x proc.prev=0x%x proc.pid=0x%x proc.task=0x%x proc.textvp=0x%x proc.size=0x%x",
          gSystemInfo.kernelStruct.proc.list_next,
          gSystemInfo.kernelStruct.proc.list_prev,

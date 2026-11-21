@@ -9,6 +9,21 @@
 
 uint64_t gKfd = 0;
 
+// 主程序日志通道（DOJailbreaker.m）：通道初始化的关键状态同步进终端，别只落文件
+extern void KernelLogLine(const char *line);
+#include <sys/stat.h>
+
+// 通道日志：文件 + 终端双写（终端那份走 ab_hud.log 转发，出问题当场能看见）
+static void jb通道日志(const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    kfd_log("%s", buf);
+    KernelLogLine(buf);
+}
+
 // 🔥 简单的文件日志功能
 static FILE *kfd_log_file = NULL;
 
@@ -43,6 +58,9 @@ void kfd_log(const char *format, ...) {
             snprintf(log_path, sizeof(log_path), "%s/Documents/kfd_debug.log", home);
             kfd_log_file = fopen(log_path, "a");
             if (kfd_log_file) {
+                // root（persona 拉起的 -hud）创建的文件会带 root 属主，进程降权后就
+                // 再也写不进去 —— 放开权限让降权后的同一进程继续追加。
+                chmod(log_path, 0666);
                 // 添加iOS版本信息到日志 - 使用安全的系统调用
                 char version_str[32];
                 size_t size = sizeof(version_str);
@@ -64,6 +82,7 @@ void kfd_log(const char *format, ...) {
         if (kfd_log_file == NULL) {
             kfd_log_file = fopen("/tmp/kfd_debug.log", "a");
             if (kfd_log_file) {
+                chmod("/tmp/kfd_debug.log", 0666);
                 // 使用安全的系统调用获取版本信息
                 char version_str[32];
                 size_t size = sizeof(version_str);
@@ -531,6 +550,7 @@ int exploit_init_jailbreak(void)
     if (gPrimitives.physreadbuf && gPrimitives.kreadbuf) {
         gUseJBChannel = true;
         kfd_log("ℹ️ 越狱通道: 已初始化，跳过重复初始化\n");
+        KernelLogLine("[越狱通道] 已初始化，跳过重复初始化");
         return 0;
     }
 
@@ -540,7 +560,7 @@ int exploit_init_jailbreak(void)
     gid_t 原gid = getgid();
     if (原uid != 0) {
         if (setgid(0) != 0 || setuid(0) != 0) {
-            kfd_log("⚠️ 越狱通道: 提权失败 uid=%d euid=%d，走降级模式\n", getuid(), geteuid());
+            jb通道日志("[越狱通道] 提权失败 uid=%d euid=%d（setuid(0) 被拒），走降级模式", getuid(), geteuid());
             return -1;
         }
     }
@@ -553,7 +573,7 @@ int exploit_init_jailbreak(void)
         dispatch_semaphore_signal(sem);
     });
     if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)8 * NSEC_PER_SEC)) != 0) {
-        kfd_log("❌ 越狱通道: jbclient_initialize_primitives 超时(8s)，按失败处理\n");
+        jb通道日志("[越狱通道] jbclient_initialize_primitives 超时(8s)，按失败处理");
         if (原uid != 0) { setuid(原uid); setgid(原gid); }
         return -1;
     }
@@ -566,7 +586,7 @@ int exploit_init_jailbreak(void)
     }
 
     if (r != 0) {
-        kfd_log("❌ 越狱通道: jbclient_initialize_primitives 失败 r=%d\n", r);
+        jb通道日志("[越狱通道] jbclient_initialize_primitives 失败 r=%d", r);
         return -1;
     }
 
@@ -577,7 +597,7 @@ int exploit_init_jailbreak(void)
     if (!基) 基 = kconstant(staticBase) + kconstant(slide);
     uint32_t magic = kread32(基);
     if (magic != 0xFEEDFACF) {
-        kfd_log("❌ 越狱通道: 内核自检失败 base=0x%llx magic=0x%08x\n", 基, magic);
+        jb通道日志("[越狱通道] 内核自检失败 base=0x%llx magic=0x%08x", 基, magic);
         gUseJBChannel = false;
         return -1;
     }
@@ -597,9 +617,15 @@ int exploit_init_jailbreak(void)
         }
     }
 
-    kfd_log("✅ 越狱通道: physrw 就绪 base=0x%llx current_proc=0x%llx allproc=0x%llx\n",
+    jb通道日志("[越狱通道] physrw 就绪 base=0x%llx current_proc=0x%llx allproc=0x%llx",
             基, gJB_current_proc, ksymbol(allproc));
     return 0;
+}
+
+// 越狱通道是否真的可用（physrw 已映射、kread 可走）；0 = 仅符号解析（免利用模式）
+int exploit_jb_channel_ready(void)
+{
+    return (gUseJBChannel && gPrimitives.physreadbuf && gPrimitives.kreadbuf) ? 1 : 0;
 }
 
 

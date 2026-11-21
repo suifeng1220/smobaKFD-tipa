@@ -14,6 +14,7 @@
 
 #import "HUDHelper.h"
 #import "NSUserDefaults+Private.h"
+#import "DOEnvironmentManager.h"
 
 extern "C" char **environ;
 
@@ -114,7 +115,24 @@ BOOL IsHUDEnabled(void)
 #define HUD_PID_FILE "/var/mobile/Library/Caches/cnm.sb.sjz.pid"
 
 // SetHUDEnabled 三级 spawn 策略序列（还原自 SetHUDEnabled::策略序列）
-static const unsigned 策略序列[3] = { 1, 0, 2 };
+// 普通设备维持原序 1,0,2（persona 在非越狱机多半不可用，放最后兜底）；
+// 越狱设备改成 2,1,0 —— persona(root) 优先：jbclient_initialize_primitives 硬性
+// 要求 uid 0（root 域只放行 root 进程），策略 1/0 拉起的 -hud 是 uid=501，
+// 越狱通道必然降级、kread 全废、自检永远 ❌。-hud 拿到 root 后自己会降权回 mobile。
+static const unsigned 策略序列_普通[3] = { 1, 0, 2 };
+static const unsigned 策略序列_越狱[3] = { 2, 1, 0 };
+static const unsigned* 策略表(void) {
+    static const unsigned* p = NULL;
+    if (!p) {
+        BOOL jb = [DOEnvironmentManager sharedManager].isJailbroken;
+        p = jb ? 策略序列_越狱 : 策略序列_普通;
+        char 行[120];
+        snprintf(行, sizeof(行), "SetHUD: spawn 策略序=%s",
+                 jb ? "2,1,0（persona root 优先）" : "1,0,2");
+        KernelLogLine(行);
+    }
+    return p;
+}
 
 void SetHUDEnabled(BOOL isEnabled)
 {
@@ -202,9 +220,9 @@ void SetHUDEnabled(BOOL isEnabled)
 
         unlink(HUD_PID_FILE);
 
-        // 三级 spawn：策略 1 → 0 → 2，每级起活后等 600ms 确认进程还在
+        // 三级 spawn：按设备环境选序列，每级起活后等 600ms 确认进程还在
         for (int i = 0; i < 3; ++i) {
-            unsigned 策略 = 策略序列[i];
+            unsigned 策略 = 策略表()[i];
             pid_t 拉起pid = 0;
             if (HUD执行Spawn(executablePath, "-hud", 策略, &拉起pid) == 0) {
                 usleep(600000);   // 600ms
@@ -229,7 +247,7 @@ void SetHUDEnabled(BOOL isEnabled)
 
         for (int i = 0; i < 3; ++i) {
             pid_t 退出pid = 0;
-            if (HUD执行Spawn(executablePath, "-exit", 策略序列[i], &退出pid) == 0) {
+            if (HUD执行Spawn(executablePath, "-exit", 策略表()[i], &退出pid) == 0) {
                 限时waitpid(退出pid, 2000);
                 return;
             }
