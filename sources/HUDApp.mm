@@ -35,6 +35,13 @@ extern "C"
 #endif
 void KernelLogLine(const char *line);
 
+// 绘制层配置直连（DrawView.mm 实现）。-hud 进程启动时用它把主开关同步进绘制层，
+// 不依赖 plist / NSUserDefaults 的跨进程可见性。
+#ifdef __cplusplus
+extern "C"
+#endif
+void SLCfg写开关(const char *键, bool 值);
+
 static __used NSString *mDeviceModel(void) {
   struct utsname systemInfo;
   uname(&systemInfo);
@@ -368,6 +375,11 @@ int main(int argc, char *argv[]) {
                       : (写错 ? 写错.localizedDescription.UTF8String : "?"));
         KernelLogLine(行);
       }
+      
+      // v79：浮层被拉起 = 主开关刚被打开。强制把绘制层的 draw 置 1 ——
+      // 偏好域 / plist 里可能残留上一次的 0（在面板里关过总开关），不置的话
+      // 浮层一挂上就自判「主开关=0」把自己藏掉，表现就是点主开关球一闪而过。
+      SLCfg写开关("draw", true);
       
       [UIScreen initialize];
       CFRunLoopGetCurrent();

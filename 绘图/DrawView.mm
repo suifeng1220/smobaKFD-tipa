@@ -201,6 +201,17 @@ void SLCfg写开关(const char* 键, bool 值) {
     }
     [[NSUserDefaults standardUserDefaults] setBool:值 forKey:桥存储键(键)];
     [桥键集() addObject:@(键)];
+
+    // v79：draw 是跨进程键（主 App 主开关 ↔ 浮层总开关）。浮层是独立进程，
+    // 两个进程的偏好域未必同步；只写 NSUserDefaults 会出现「这边开了那边还是 0」，
+    // 浮层起来后自判主开关=0。这里额外落一份 plist，两边读到的永远是同一个值。
+    if (strcmp(键, "draw") == 0) {
+        NSString* p = [NSString stringWithUTF8String:设置路径];
+        NSMutableDictionary* d = [NSMutableDictionary dictionaryWithContentsOfFile:p];
+        if (!d) d = [NSMutableDictionary dictionary];
+        d[@"draw"] = @(值);
+        [d writeToFile:p atomically:YES];
+    }
 }
 
 void SLCfg写数值(const char* 键, float 值) {
@@ -4727,7 +4738,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v78 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v79 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }

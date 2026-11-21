@@ -17,6 +17,7 @@
 #import "HUDHelper.h"
 #import "NSUserDefaults+Private.h"
 #import "DOEnvironmentManager.h"
+#import "DOJailbreaker.h"
 
 extern "C" char **environ;
 
@@ -251,7 +252,12 @@ static const unsigned 策略序列_越狱[3] = { 2, 1, 0 };
 static const unsigned* 策略表(void) {
     static const unsigned* p = NULL;
     if (!p) {
-        BOOL jb = [DOEnvironmentManager sharedManager].isJailbroken;
+        // v79：不能只看 DOEnvironmentManager.isJailbroken —— 隐藏越狱 / roothide
+        // 下它会误判 NO，而 jbserver 探针能连上。策略表跟着误判走 1,0,2，
+        // 拉起的 -hud 就是 uid=501，jbclient_initialize_primitives 必然失败
+        // （日志表现：内核自检 base=0 ❌ kread 异常，越狱通道降级免利用）。
+        // JBDeviceJailbroken() 内部是 isJailbroken || JBRootProbe，且带缓存。
+        BOOL jb = JBDeviceJailbroken();
         p = jb ? 策略序列_越狱 : 策略序列_普通;
         char 行[120];
         snprintf(行, sizeof(行), "SetHUD: spawn 策略序=%s",
@@ -275,6 +281,24 @@ static dispatch_queue_t HUD开关队列(void) {
 
 static void SetHUDEnabled同步(BOOL isEnabled)
 {
+    // v79：主开关状态同步给浮层进程。
+    // 浮层是独立进程，它面板里的「总开关」读的就是配置里的 draw。以前主开关只管
+    // spawn / kill，从不写 draw —— 一旦 draw 是 0（旧 plist 残留、面板里关过），
+    // 浮层挂上 0.8 秒就判定「主开关=0」把自己藏起来，面板也打不开，
+    // 表现就是「悬浮球一闪而过」。现在让 draw 永远跟随主开关。
+    {
+        NSString *配置 = @"/var/mobile/Library/Preferences/com.map.settings.plist";
+        NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:配置];
+        if (!d) d = [NSMutableDictionary dictionary];
+        d[@"draw"] = @(isEnabled ? YES : NO);
+        BOOL plistOK = [d writeToFile:配置 atomically:YES];
+        [[NSUserDefaults standardUserDefaults] setBool:(isEnabled ? YES : NO) forKey:@"cfg2.draw"];
+        char 行[220];
+        snprintf(行, sizeof(行), "SetHUD: draw 同步为 %d（plist 写入=%d）",
+                 isEnabled ? 1 : 0, plistOK ? 1 : 0);
+        KernelLogLine(行);
+    }
+
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
 
