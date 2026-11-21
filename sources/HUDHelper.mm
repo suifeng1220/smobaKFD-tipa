@@ -163,7 +163,7 @@ pid_t HUDFindOverlayPID(void) {
         }
     }
     // ② 全进程扫描（pid 文件缺失/过期时的正路）
-    int mib[3] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
     size_t len = 0;
     if (sysctl(mib, 3, NULL, &len, NULL, 0) != 0 || len == 0) return 0;
     struct kinfo_proc *all = (struct kinfo_proc *)calloc(1, len + sizeof(struct kinfo_proc));
@@ -207,7 +207,7 @@ int HUDKillOverlay(const char *reason) {
         unlink([ROOT_PATH_NS(@HUD_PID_FILE) fileSystemRepresentation]);
     }
     // ② 全进程扫描：argv[1]=="-hud" 全杀（堆叠实例、pid 文件丢失都在这兜住）
-    int mib[3] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
     size_t len = 0;
     if (sysctl(mib, 3, NULL, &len, NULL, 0) == 0 && len > 0) {
         struct kinfo_proc *all = (struct kinfo_proc *)calloc(1, len + sizeof(struct kinfo_proc));
