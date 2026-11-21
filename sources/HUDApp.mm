@@ -23,10 +23,17 @@
 #import "SLBall.h"
 
 #import "DOEnvironmentManager.h"
+#import "DOJailbreaker.h"
 #import <libjailbreak/info.h>
 #import <libjailbreak/jbclient_xpc.h>
 #import "LFVirtualDigitizer.h"
 #define PID_PATH "/var/mobile/Library/Caches/cnm.sb.sjz.pid"
+
+// 主程序日志通道（DOJailbreaker.m 实现）；文件级声明，C/C++ 两种编译模式都成立
+#ifdef __cplusplus
+extern "C"
+#endif
+void KernelLogLine(const char *line);
 
 static __used NSString *mDeviceModel(void) {
   struct utsname systemInfo;
@@ -325,9 +332,6 @@ int main(int argc, char *argv[]) {
     // 只对 -hud / 主进程做：-check/-exit 也是 root 拉起的，但它们秒进秒出，
     // 在这跑一遍通道初始化纯属拖慢开关（-check 被限时 waitpid 2s 强杀）。
     if (getuid() == 0 && (argc <= 1 || (argv[1] && strcmp(argv[1], "-hud") == 0))) {
-      extern "C" int exploit_init_jailbreak(void);
-      extern "C" const char* exploit_jb_channel_last_status(void);
-      extern "C" void KernelLogLine(const char *line);
       int 通道 = exploit_init_jailbreak();
       setgid(501);
       setuid(501);
