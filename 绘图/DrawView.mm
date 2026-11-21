@@ -1732,6 +1732,9 @@ static int       解锁计 = 0;
 // 否则两个框会叠在一处互相拉扯（这正是「几个框叠在一起」的成因）。
 static unsigned  帧位X[24] = {0}, 帧位Z[24] = {0};
 static bool      帧位有[24] = {false};
+// v78：本帧实体循环已经画过的敌人（实体指针），AM直画按此去重，消除双影
+static uint64_t  本帧体[24] = {0};
+static int       本帧数 = 0;
 static int       槽重跳[24] = {0};
 
 static inline bool 是好点(int x, int z) {
@@ -1806,26 +1809,30 @@ static int 槽验(int k, uint64_t 实体, int x, int z, unsigned* X, unsigned* Z
 }
 
 static int 读实体坐标(int k, uint64_t 实体, unsigned* X, unsigned* Z) {
-    // v70：ActorManager 坐标链最优先（Frida 实测确认，坐标逐帧更新）
+    // v78：无雾坐标最先（pose 链迷雾内也逐帧更新；ActorLinker.position 迷雾外冻结）。
+    // 换算统一走 AM换算（×103500/109）：旧代码这里用 ×1000，与 AM/二链 两路差 5.3%，
+    // 实体在来源之间切换时坐标整体缩放跳变 —— 头像乱跳的主源之一。
+    // 依据：小美绘制.mm 的 wz_nat_pos 输出直接赋给 h->x（与 ActorLinker.position 同域），
+    // 两路必须走同一换算。
+    {
+        float wx = 0, wz = 0;
+        if (无雾坐标(实体, &wx, &wz)) {
+            int mmx = AM换算(wx);
+            int mmz = AM换算(wz);
+            if ((mmx || mmz) && mmx > -120000 && mmx < 120000 && mmz > -120000 && mmz < 120000) {
+                *X = (unsigned)mmx;
+                *Z = (unsigned)mmz;
+                return 8;   // 8 = 无雾坐标（5 已被 二A 占用，旧代码两路共用 5 导致诊断互串）
+            }
+        }
+    }
+    // v70：ActorManager 坐标链第二（同一 ActorLinker.position 字段，迷雾外冻结 → 只作备选）
     {
         int ax = 0, az = 0;
         if (AM坐标内部(实体, &ax, &az)) {
             *X = (unsigned)ax;
             *Z = (unsigned)az;
             return 7;   // 7 = ActorManager 坐标
-        }
-    }
-    // v69：无雾坐标（原生注册表 pose 链，迷雾外也实时更新）
-    {
-        float wx = 0, wz = 0;
-        if (无雾坐标(实体, &wx, &wz)) {
-            int mmx = (int)(wx * 1000.0f);
-            int mmz = (int)(wz * 1000.0f);
-            if ((mmx || mmz) && mmx > -120000 && mmx < 120000 && mmz > -120000 && mmz < 120000) {
-                *X = (unsigned)mmx;
-                *Z = (unsigned)mmz;
-                return 8;   // 8 = 无雾坐标（5 已被 二A 占用，旧代码两路共用 5 导致诊断互串）
-            }
         }
     }
     unsigned dx = 0, dz = 0;
@@ -2113,8 +2120,9 @@ static void AM刷新() {
         readMemory(连接器 + AM_LINKER_VIS, &可见, 1);
         readMemory(连接器 + AM_LINKER_CAMP, &阵营值, 4);
 
-        // 校验：坐标在 ±60 范围内，编号非零
-        if (!编号 || !isfinite(x) || !isfinite(z) || x < -60 || x > 60 || z < -60 || z > 60) continue;
+        // 校验：坐标在 ±130 范围内，编号非零（v78：±60 → ±130，世界域 ±109，
+        // 旧值把地图边缘的英雄整批踢出 AM表，只能落到旧链上）
+        if (!编号 || !isfinite(x) || !isfinite(z) || x < -130 || x > 130 || z < -130 || z > 130) continue;
 
         AM表[n].连接器 = 连接器;
         AM表[n].编号 = 编号;
@@ -2151,8 +2159,9 @@ static void AM刷新() {
 // 出参 x,z 为世界坐标 float（±54.5）
 static bool AM坐标(uint64_t 实体, float* x, float* z) {
     if (!AM数 || !IsValidAddr(实体)) return false;
-    // 30 秒内成功过就用缓存
-    if (!AM好 && (CACurrentMediaTime() - AM上次) > 30.0) return false;
+    // v78：缓存窗 30s → 1.5s。AM刷新失败后旧表最多再撑 1.5 秒，超时立刻不用 ——
+    // 30 秒陈旧坐标会在恢复那一帧整片瞬移，也是乱跳来源之一。
+    if (!AM好 && (CACurrentMediaTime() - AM上次) > 1.5) return false;
 
     // 策略 1：实体指针 == ActorLinker 指针
     for (int i = 0; i < AM数; i++) {
@@ -4408,7 +4417,9 @@ static int 读野怪(uint64_t 模块, 野怪信息* 输出, int 上限) {
         if (!IsValidAddr(怪)) continue;
         int x = vm_read<int>(怪 + SDK::坐标X);
         int z = vm_read<int>(怪 + SDK::坐标Y);
-        if (x < -200000 || x > 200000 || z < -200000 || z > 200000 || (!x && !z)) continue;
+        // v78：收紧。单轴为 0 是「一半读失败」的典型垃圾（零与真值混装）→ 直接丢；
+        // 世界半程 ±103500，±115000 之外不可能是野怪（旧 ±200000 太松）。
+        if (x < -115000 || x > 115000 || z < -115000 || z > 115000 || !x || !z) continue;
         int cd = vm_read<int>(怪 + SDK::技能CD);
         int hp = vm_read<int>(怪 + 484);   // 野怪刷新原始值（0x1E4）
         if (hp <= 0 || hp > 600000) continue;
@@ -4420,6 +4431,110 @@ static int 读野怪(uint64_t 模块, 野怪信息* 输出, int 上限) {
         m.刷新 = hp / 1000 + 3;
     }
     return 数;
+}
+
+// ==================== v78：野怪营地本地计时状态机 ====================
+// 乱跳根因：怪对象 +0x240（技能CD）每帧直读直画，该字段在存活态常是乱值
+// （对象回收/字段并非重生计时），0.13 秒内数字全变随机值（24→58→74…）。
+// JS 原版（绘制.original.js L6583）与小美绘制.mm 都是「本地倒计时」：
+//   数字 = 死亡时刻 + 间隔 − 现在，绝不在每帧内存里读倒计时。
+// 这里按「营地位置键」（营地固定不动）建状态机，数字只在两种硬证据下出现：
+//   ① cd 字段连续 ≥10 帧非增、且总降幅 ≤ 实时 3 倍（乱值做不到单调）→ 锁定，
+//      显示平滑跟随的读数；读数一旦离谱只走本地倒数；
+//   ② 营地从数组里消失（曾连续在场 ≥15 帧、连失 ≥12 帧）→ 按本地死亡时刻+间隔倒数；
+//   其余一切情况画洋红点（存活样式）。刷新间隔首周期默认 75s，之后按实测学习。
+struct 营地槽 {
+    bool   用;
+    bool   本帧见;
+    int    世X, 世Z, 阵营;
+    int    态;            // 0 = 点（存活/未知）；1 = 数字（重生读秒）
+    int    单调帧, 连见帧, 消失帧, 存活帧;
+    double 上原始;        // 上帧原始剩余秒（-1 = 无效）
+    double 连起值, 连起时; // 单调段起点（判降幅用）
+    double 锁定值, 死时, 间隔, 显示剩余, 见时;
+};
+static 营地槽 营地表[24];
+static int   营地数 = 0;
+
+static 营地槽* 营地取(int x, int z) {
+    for (int i = 0; i < 营地数; ++i) {
+        long long dx = (long long)营地表[i].世X - x, dz = (long long)营地表[i].世Z - z;
+        if (dx * dx + dz * dz <= 2500LL * 2500LL) return &营地表[i];
+    }
+    if (营地数 >= 24) return NULL;
+    营地槽* s = &营地表[营地数++];
+    s->用 = true; s->本帧见 = false;
+    s->世X = x; s->世Z = z; s->阵营 = 0; s->态 = 0;
+    s->单调帧 = s->连见帧 = s->消失帧 = s->存活帧 = 0;
+    s->上原始 = -1.0; s->连起值 = 0; s->连起时 = 0;
+    s->锁定值 = 0; s->死时 = 0; s->间隔 = 0; s->显示剩余 = 0; s->见时 = 0;
+    return s;
+}
+
+// 每帧喂一次。raw = cd 字段原始剩余秒（cd/1000）；raw < 0 表示本帧没读到该营地。
+static void 营地喂(营地槽* s, double raw, double now) {
+    if (!s || !s->用) return;
+    if (raw >= 0.0) {
+        s->见时 = now;
+        s->消失帧 = 0;
+        if (++s->连见帧 > 1000000) s->连见帧 = 1000000;
+        const bool 合理 = (raw > 2.0 && raw < 595.0);
+        if (合理) {
+            // 单调段：非增（允许 0.7s 抖动）且总降幅 ≤ 实时 3 倍 + 2s 容差
+            if (s->上原始 > 2.0 && raw <= s->上原始 + 0.7) {
+                double 降 = s->连起值 - raw;
+                double 历时 = now - s->连起时;
+                if (降 <= 3.0 * 历时 + 2.0) s->单调帧++;
+                else { s->单调帧 = 1; s->连起值 = raw; s->连起时 = now; }
+            } else {
+                s->单调帧 = 1; s->连起值 = raw; s->连起时 = now;
+            }
+            s->上原始 = raw;
+            if (s->态 == 0) {
+                if (s->单调帧 >= 10) {
+                    s->态 = 1;
+                    s->锁定值 = raw; s->死时 = now; s->显示剩余 = raw;
+                }
+            } else {
+                double 本地 = s->锁定值 - (now - s->死时);
+                if (raw - 本地 > -6.0 && raw - 本地 < 6.0) {
+                    s->显示剩余 = s->显示剩余 * 0.5 + raw * 0.5;
+                    s->锁定值 = s->显示剩余; s->死时 = now;
+                } else {
+                    s->显示剩余 = 本地;   // 读数离谱：只走本地倒数
+                }
+            }
+            s->存活帧 = 0;
+        } else {
+            s->上原始 = -1.0; s->单调帧 = 0;
+            if (raw <= 2.0) {
+                // cd 字段回零 = 存活证据；连续 3 帧确认 → 回点，并学习刷新间隔
+                if (s->态 == 1 && ++s->存活帧 >= 3) {
+                    double 用时 = now - s->死时;
+                    if (用时 > 40.0 && 用时 < 300.0) s->间隔 = 用时;
+                    s->态 = 0; s->显示剩余 = 0;
+                }
+            } else if (s->态 == 1) {
+                s->显示剩余 = s->锁定值 - (now - s->死时);
+            }
+        }
+    } else {
+        // 本帧没读到：曾连续在场的营地突然消失 ≥12 帧（≈0.2s）→ 认死亡
+        if (++s->消失帧 == 12) {
+            if (s->态 == 0 && s->连见帧 >= 15 && s->见时 > 0.0 && now - s->见时 < 2.0) {
+                s->态 = 1;
+                s->死时 = now;
+                s->锁定值 = (s->间隔 > 0.0) ? s->间隔 : 75.0;
+                s->显示剩余 = s->锁定值;
+            }
+        }
+        if (s->消失帧 > 12) s->连见帧 = 0;
+        if (s->态 == 1) s->显示剩余 = s->锁定值 - (now - s->死时);
+    }
+    // 读完（含消失分支）统一收尾：倒数走完 → 回点
+    if (s->态 == 1 && s->显示剩余 <= 0.0) {
+        if (s->显示剩余 < -4.0) { s->态 = 0; s->显示剩余 = 0; }
+    }
 }
 
 // 世界半程：世界坐标取 ±世界半程 时正好落在小地图矩形边界上。
@@ -4612,7 +4727,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v77 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v78 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -4851,6 +4966,7 @@ void Draw::StartBooks() {
         if (时基 == 0.0) 时基 = CACurrentMediaTime();
         ++帧序;
         for (int j = 0; j < 24; ++j) 帧位有[j] = false;   // v65：同帧去重的表每帧清空
+        本帧数 = 0;   // v78：AM直画去重表每帧清空
         毫秒计 = (unsigned)((CACurrentMediaTime() - 时基) * 1000.0);
         for (int j = 0; j < 24; ++j) {
             if (待dump[j] && 帧序 >= 待dump[j]) {
@@ -4945,6 +5061,8 @@ void Draw::StartBooks() {
             if (k < 24) { 帧位X[k] = 样X; 帧位Z[k] = 样Z; 帧位有[k] = true; }
             if (重复) { if (k < 24) 槽重跳[k]++; continue; }
         }
+        // v78：记入「本帧已画」表，AM直画对同一实体不再补画（双影 = 乱跳观感）
+        if (本帧数 < 24) 本帧体[本帧数++] = 实体;
 
         // v34 诊断：世界坐标帧间位移。一帧 16ms 英雄最多走几百单位，
         // 超过 3000 只可能是脏读/链跳。同时记录本窗口最大值（不看阈值）。
@@ -5306,50 +5424,59 @@ void Draw::StartBooks() {
         野怪信息 野怪[20];
         for (int i = 0; i < 20; ++i) 野怪[i] = {0, 0, 0, 0, 0};
         野怪计 = 读野怪(模块基址, 野怪, 20);
-        // 诊断日志：3 秒一次，打印前 4 个野怪的原始世界坐标 → 小图逻辑坐标，方便对照
-        static double 上次野怪日志 = 0;
         double 野怪日志时 = CACurrentMediaTime();
+        // ① 喂状态机：见得到的营地喂原始读数，见不到的喂「消失」
+        for (int i = 0; i < 营地数; ++i) 营地表[i].本帧见 = false;
+        for (int m = 0; m < 野怪计; ++m) {
+            营地槽* s = 营地取(野怪[m].x, 野怪[m].z);
+            if (!s) continue;
+            s->本帧见 = true;
+            s->阵营 = 野怪[m].camp;
+            营地喂(s, (double)野怪[m].cd - 3.0, 野怪日志时);
+        }
+        for (int i = 0; i < 营地数; ++i)
+            if (营地表[i].用 && !营地表[i].本帧见) 营地喂(&营地表[i], -1.0, 野怪日志时);
+        // ② 按营地槽绘制（位置跨帧不变 → 点/数字不再跟着乱值漂）
+        static double 上次野怪日志 = 0;
         bool 打野怪日志 = (野怪日志时 - 上次野怪日志 > 3.0);
         if (打野怪日志) 上次野怪日志 = 野怪日志时;
-        for (int m = 0; m < 野怪计; ++m) {
+        for (int i = 0; i < 营地数; ++i) {
+            营地槽& s = 营地表[i];
+            if (!s.用) continue;
             // 正 / 反两种朝向各算一次：野怪阵营字段（0/1/2）到底是哪边不确定，
             // 按阵营取一路，落框外就换另一路，两路都落框外说明坐标无效，直接不画。
             float 正X = 0.0f, 正Y = 0.0f, 反X = 0.0f, 反Y = 0.0f;
-            世界转小图(野怪[m].x, 野怪[m].z, 1.0f, 地图, &正X, &正Y);
-            世界转小图(野怪[m].x, 野怪[m].z, -1.0f, 地图, &反X, &反Y);
+            世界转小图(s.世X, s.世Z, 1.0f, 地图, &正X, &正Y);
+            世界转小图(s.世X, s.世Z, -1.0f, 地图, &反X, &反Y);
             float mx, my;
-            if (阵营符号(野怪[m].camp) > 0.0f) { mx = 正X; my = 正Y; }
-            else                                { mx = 反X; my = 反Y; }
+            if (阵营符号(s.阵营) > 0.0f) { mx = 正X; my = 正Y; }
+            else                           { mx = 反X; my = 反Y; }
             if (!在框内(地图, mx, my)) {
                 if (在框内(地图, 正X, 正Y))      { mx = 正X; my = 正Y; }
                 else if (在框内(地图, 反X, 反Y)) { mx = 反X; my = 反Y; }
                 else continue;
             }
-            // 全部野怪都记（原来只记前 4 个，导致截图里能看到的点没法逐个配对）
-            if (打野怪日志)
-                日志("野怪%d 世=(%d,%d) 阵=%d → 图=(%.1f,%.1f) 框=(%.1f,%.1f,%.1f) 缩=%.2f",
-                     m, 野怪[m].x, 野怪[m].z, 野怪[m].camp, mx, my,
-                     cfg_mapX, cfg_mapY, cfg_mapSize, 缩放);
-            // 缩放校正：v23 起「小图比例」已经在 世界转小图() 里统一乘过了，
-            // 这里再乘一次会变成平方 —— 删掉。
-            // 面板「野怪点位对齐微调」：手动平移，单位是逻辑点，最后一起乘缩放
             if (cfg_monsteroff_on) {
                 mx += cfg_monsterOffX;
                 my += cfg_monsterOffY;
             }
             mx *= 缩放;
             my *= 缩放;
-            // v76：点与倒计时互斥。存活只画点；被刷（进入重生倒计时）后，
-            // 点位原地换成倒计时数字。旧逻辑 cd>0 就点+数字一起画，而存活时
-            // cd=0/1000+3 恒等于 3，也落进倒计时分支 —— 点和数字永远并存。
-            // cd=3 即原始值 0（存活态），>3 才是真的重生读秒。
-            if (野怪[m].cd > 3 && 野怪[m].cd < 野怪[m].刷新 && 野怪[m].cd <= 600) {
+            // v76 语义保持：点与倒计时互斥。v78：数字只认状态机的硬证据，
+            // 其余画点 —— 存活/未知/垃圾一律点，被刷读秒才是数字。
+            if (s.态 == 1 && s.显示剩余 > 0.0) {
                 char 秒串[16];
-                snprintf(秒串, sizeof(秒串), "%d", 野怪[m].cd);
+                int 秒 = (int)(s.显示剩余 + 0.999);
+                if (秒 > 999) 秒 = 999;
+                snprintf(秒串, sizeof(秒串), "%d", 秒);
                 画文字(mx, my, 秒串, 0xFFFFFFFF, true, true);   // 数字占住点位
             } else {
-                画实心圆(0xFFFF00FF, mx, my, 3.0f * 缩放);   // 洋红底点：和游戏原生绿苗区分开
+                画实心圆(0xFFFF00FF, mx, my, 3.0f * 缩放);   // 洋红底点
             }
+            if (打野怪日志)
+                日志("营地%d 世=(%d,%d) 阵=%d 态=%d 剩=%.1f 单调=%d 连见=%d 图=(%.1f,%.1f)",
+                     i, s.世X, s.世Z, s.阵营, s.态, s.显示剩余,
+                     s.单调帧, s.连见帧, mx / 缩放, my / 缩放);
         }
     }
 
@@ -5362,6 +5489,23 @@ void Draw::StartBooks() {
             if ((int)AM表[i].阵营 == (int)我方阵营) continue;   // 我方跳过
             int wx = AM换算(AM表[i].x);
             int wz = AM换算(AM表[i].z);
+            // v78：去重 —— 实体循环本帧已画的敌人不再补画。
+            // 双影根因：实体循环走实时链（60fps 平滑），AM直画走 2Hz 陈旧缓存，
+            // 同一英雄画两份、位置一分一合，肉眼就是「头像乱跳」。
+            {
+                bool 已画 = false;
+                for (int j = 0; j < 本帧数 && !已画; ++j)
+                    if (本帧体[j] == AM表[i].连接器) 已画 = true;
+                if (!已画) {
+                    for (int j = 0; j < 24 && !已画; ++j) {
+                        if (!帧位有[j]) continue;
+                        long long ddx = (long long)(int)wx - (long long)(int)帧位X[j];
+                        long long ddz = (long long)(int)wz - (long long)(int)帧位Z[j];
+                        if (ddx * ddx + ddz * ddz <= 6000LL * 6000LL) 已画 = true;
+                    }
+                }
+                if (已画) continue;
+            }
             float mx = 0, my = 0;
             小图坐标(wx, wz, (int)AM表[i].阵营, 地图, &mx, &my);
             mx *= 缩放;
