@@ -7,15 +7,14 @@
 
 #include "DrawView.hpp"
 #include <mutex>
-#include <atomic>
 #include <cstdint>
 #include <cmath>
 #include <mach/mach.h>
-#include <mach/task_info.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <cstring>
 #include <cstdio>
+#include <dlfcn.h>          // v72：dlopen/dlsym 取 il2cpp 导出，替代写死 RVA
 #include "BBZGui.h"
 #include "游戏/SDK.h"
 
@@ -201,17 +200,6 @@ void SLCfg写开关(const char* 键, bool 值) {
     }
     [[NSUserDefaults standardUserDefaults] setBool:值 forKey:桥存储键(键)];
     [桥键集() addObject:@(键)];
-
-    // v79：draw 是跨进程键（主 App 主开关 ↔ 浮层总开关）。浮层是独立进程，
-    // 两个进程的偏好域未必同步；只写 NSUserDefaults 会出现「这边开了那边还是 0」，
-    // 浮层起来后自判主开关=0。这里额外落一份 plist，两边读到的永远是同一个值。
-    if (strcmp(键, "draw") == 0) {
-        NSString* p = [NSString stringWithUTF8String:设置路径];
-        NSMutableDictionary* d = [NSMutableDictionary dictionaryWithContentsOfFile:p];
-        if (!d) d = [NSMutableDictionary dictionary];
-        d[@"draw"] = @(值);
-        [d writeToFile:p atomically:YES];
-    }
 }
 
 void SLCfg写数值(const char* 键, float 值) {
@@ -327,8 +315,8 @@ static inline bool IsKernelAddr(uint64_t address) {
     return address >= 0xffff000000000000ULL;
 }
 
-static std::atomic<double> 上次限流窗口{0};
-static std::atomic<long> 窗口读数{0};
+static double 上次限流窗口 = 0;
+static long 窗口读数 = 0;
 
 // ==================== 目标进程读取（任务端口优先） ====================
 // 关键：App 的 entitlements 里有 task_for_pid-allow（platform-application 生效），
@@ -354,12 +342,7 @@ static mach_port_t 取任务端口(pid_t pid) {
     return 任务端口;
 }
 
-// 跨进程读：有任务端口就走 vm_read_overwrite。
-// v75：vm_read 失败直接认失败，不再退回内核页表慢路径 —— 扫描机常态探测无效
-// 地址，旧逻辑每次都触发 exploit_mach_readbuf（页表翻译 + physrw 往返），
-// 游戏数据一开读主线程就被打爆：触摸事件排队饿死、画面冻结。无效地址两条路
-// 都读不到，快速失败既对又快；只有拿不到任务端口（task_for_pid 被拒）才走
-// 内核页表路线兜底。
+// 跨进程读：有任务端口就走 vm_read_overwrite，失败再退回内核页表路线
 static bool 目标读(pid_t pid, uint64_t 地址, void* 输出, size_t 大小) {
     mach_port_t 端口 = 取任务端口(pid);
     if (端口) {
@@ -367,7 +350,6 @@ static bool 目标读(pid_t pid, uint64_t 地址, void* 输出, size_t 大小) {
         if (vm_read_overwrite(端口, (vm_address_t)地址, (vm_size_t)大小,
                               (vm_address_t)输出, &读出) == KERN_SUCCESS && 读出 == (vm_size_t)大小)
             return true;
-        return false;
     }
     return exploit_mach_readbuf(pid, 地址, 输出, 大小);
 }
@@ -375,19 +357,29 @@ static bool 目标读(pid_t pid, uint64_t 地址, void* 输出, size_t 大小) {
 bool readMemory(uint64_t address, void* buffer, size_t size) {
     if (!IsValidAddr(address) || size == 0 || 游戏pid <= 0) return false;
     double now = CACurrentMediaTime();
-    if (now - 上次限流窗口.load(std::memory_order_relaxed) > 0.1) {
-        上次限流窗口.store(now, std::memory_order_relaxed);
-        窗口读数.store(0, std::memory_order_relaxed);
+    if (now - 上次限流窗口 > 0.1) {
+        上次限流窗口 = now;
+        窗口读数 = 0;
     }
-    if (窗口读数.fetch_add(1, std::memory_order_relaxed) + 1 > 8000) {   // 0.1 秒内最多 8000 次读取
+    if (++窗口读数 > 8000) {   // 0.1 秒内最多 8000 次读取
         读限流计数++;
         return false;
     }
     读总数++;
-    // v75：整段一次读完。旧逻辑按 256 字节碎切（16KB 要 64 次系统调用），
-    // 实体扫描每帧上千次碎读直接把主线程吃光。vm_read_overwrite / vreadbuf
-    // 本身都能一次处理跨页长读，失败语义不变（中途有无效页照样整段失败）。
-    return 目标读(游戏pid, address, buffer, size);
+    char* dst = (char*)buffer;
+    uint64_t src = address;
+    size_t remain = size;
+    while (remain > 0) {
+        uint64_t 页内 = 4096 - (src & 0xFFF);
+        uint64_t chunk = remain < 页内 ? remain : 页内;
+        uint64_t step = chunk > 0x100 ? 0x100 : chunk;   // 单次最多 256 字节
+        if (!step) return false;
+        if (!目标读(游戏pid, src, dst, step)) return false;
+        dst += step;
+        src += step;
+        remain -= step;
+    }
+    return true;
 }
 
 // 前向声明
@@ -472,20 +464,6 @@ static void 日志入环(const char* line) {
     std::atomic_flag_clear_explicit(&日志锁, std::memory_order_release);
 }
 
-// v75：日志落盘挪到串行队列。旧逻辑每行 fprintf+fflush×2（ab_draw.log）再加
-// KernelLogLine 的 ab_hud.log fflush，全部同步在调用线程（多数在主线程渲染帧内），
-// 转储/扫描一次打几十行就能把整帧打停 —— 触摸失效、画面冻结的元凶之一。
-// 行内容复制到堆后异步写；环形缓冲（日志入环）仍在原线程即时更新。
-static dispatch_queue_t 日志队列(void) {
-    static dispatch_queue_t 队列;
-    static dispatch_once_t 一次;
-    dispatch_once(&一次, ^{
-        队列 = dispatch_queue_create("slwz.ablog", DISPATCH_QUEUE_SERIAL);
-    });
-    return 队列;
-}
-static std::atomic<int> 日志排队{0};
-
 void 日志(const char* fmt, ...) {
     static bool 日志初始化 = false;
     va_list va;
@@ -498,47 +476,20 @@ void 日志(const char* fmt, ...) {
     vsnprintf(line, sizeof(line), fmt, va);
     va_end(va);
     日志入环(line);
-    // 背压：积压超 2000 行就丢弃落盘（环里还留着最近 12 行），防止扫描风暴
-    // 把日志队列撑爆成新的卡顿源。
-    if (日志排队.fetch_add(1, std::memory_order_relaxed) >= 2000) {
-        日志排队.fetch_sub(1, std::memory_order_relaxed);
-        return;
-    }
-    char* 堆行 = strdup(line);
-    dispatch_async(日志队列(), ^{
-        日志排队.fetch_sub(1, std::memory_order_relaxed);
-        if (!堆行) return;
-        KernelLogLine(堆行);
-        if (日志文件 || 日志文件2) {
-            time_t now = time(nullptr);
-            struct tm tmv;
-            localtime_r(&now, &tmv);
-            if (日志文件) {
-                fprintf(日志文件, "%02d:%02d:%02d %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, 堆行);
-                fflush(日志文件);
-            }
-            if (日志文件2) {
-                fprintf(日志文件2, "%02d:%02d:%02d %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, 堆行);
-                fflush(日志文件2);
-            }
+    KernelLogLine(line);
+    if (日志文件 || 日志文件2) {
+        time_t now = time(nullptr);
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        if (日志文件) {
+            fprintf(日志文件, "%02d:%02d:%02d %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, line);
+            fflush(日志文件);
         }
-        free(堆行);
-    });
-}
-
-// 安全追加：snprintf 截断时返回值是「想写的长度」，直接累加会让 位 越过缓冲区，
-// 下一轮 sizeof(缓)-位 对 size_t 下溢成巨大值 → 越界写。统一在这里钳位。
-static int 追加(char* 缓, size_t 容, int 位, const char* fmt, ...) {
-    if (位 < 0) 位 = 0;
-    if ((size_t)位 >= 容) return (int)容 - 1;
-    va_list va;
-    va_start(va, fmt);
-    int n = vsnprintf(缓 + 位, 容 - (size_t)位, fmt, va);
-    va_end(va);
-    if (n < 0) return 位;
-    位 += n;
-    if ((size_t)位 >= 容) 位 = (int)容 - 1;
-    return 位;
+        if (日志文件2) {
+            fprintf(日志文件2, "%02d:%02d:%02d %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, line);
+            fflush(日志文件2);
+        }
+    }
 }
 
 // ==================== 绘制原语 ====================
@@ -558,18 +509,9 @@ static void 内核自检() {
     if (!IsKernelAddr(基)) 基 = 静态基 + 偏移;
     uint64_t allproc = gSystemInfo.kernelSymbol.allproc;
     uint32_t magic = IsKernelAddr(基) ? kread32(基) : 0;
-    BOOL 好 = (magic == 0xFEEDFACF);
-    // 状态没变就别刷屏：以前每 5 秒固定 3 行 ❌，把真正有用的日志全淹了。
-    // 只在 ✅/❌ 翻转或距上次完整报告 ≥60 秒时才打。
-    static int 上次好坏 = -1;
-    static double 上次详报 = -1e9;
-    double 现在 = CACurrentMediaTime();
-    if (好 == 上次好坏 && 现在 - 上次详报 < 60.0) return;
-    上次好坏 = 好 ? 1 : 0;
-    上次详报 = 现在;
     日志("内核自检: base=0x%llx staticBase=0x%llx slide=0x%llx allproc=0x%llx magic=0x%08x %s",
          基, 静态基, 偏移, allproc, magic,
-         好 ? "✅ kread 正常" : "❌ kread 异常/符号缺失");
+         (magic == 0xFEEDFACF) ? "✅ kread 正常" : "❌ kread 异常/符号缺失");
     日志("内核偏移: proc.next=0x%x proc.prev=0x%x proc.pid=0x%x proc.task=0x%x proc.textvp=0x%x proc.size=0x%x",
          gSystemInfo.kernelStruct.proc.list_next,
          gSystemInfo.kernelStruct.proc.list_prev,
@@ -1341,7 +1283,7 @@ static void 链打分(uint64_t 数组, int 数量) {
     for (int i = 0; i < 3; ++i) {
         unsigned x = 0, z = 0;
         int 数 = 链样点统计(数组, 数量, i, (unsigned*)&x, &z);
-        写 = 追加(汇总, sizeof(汇总), 写, "%s=%d ", SDK::坐标链表[i].名字, 数);
+        写 += snprintf(汇总 + 写, sizeof(汇总) - 写, "%s=%d ", SDK::坐标链表[i].名字, 数);
         if (写 >= 144) break;
         if (数 > 最佳数) { 最佳数 = 数; 最佳链 = i; 样X = x; 样Z = z; }
     }
@@ -1360,9 +1302,6 @@ static void 链打分(uint64_t 数组, int 数量) {
 static const char* 链名(int i) {
     if (i == 4) return "二";
     if (i == 5) return "二A";
-    if (i == 6) return "保";     // 槽验 保持上一帧有效位置
-    if (i == 7) return "AM";     // ActorManager 直读
-    if (i == 8) return "无雾";   // 原生注册表 pose 链
     if (i == 3) return "本体";
     if (i < 0 || i >= 3) return "-";
     return SDK::坐标链表[i].名字;
@@ -1620,7 +1559,7 @@ static int 读英雄坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
             if ((mmx || mmz) && mmx > -120000 && mmx < 120000 && mmz > -120000 && mmz < 120000) {
                 *X = (unsigned)mmx;
                 *Z = (unsigned)mmz;
-                return 8;   // 8 = 无雾坐标（5 已被 二A 占用，旧代码两路共用 5 导致诊断互串）
+                return 5;   // 5 = 无雾坐标
             }
         }
     }
@@ -1743,9 +1682,6 @@ static int       解锁计 = 0;
 // 否则两个框会叠在一处互相拉扯（这正是「几个框叠在一起」的成因）。
 static unsigned  帧位X[24] = {0}, 帧位Z[24] = {0};
 static bool      帧位有[24] = {false};
-// v78：本帧实体循环已经画过的敌人（实体指针），AM直画按此去重，消除双影
-static uint64_t  本帧体[24] = {0};
-static int       本帧数 = 0;
 static int       槽重跳[24] = {0};
 
 static inline bool 是好点(int x, int z) {
@@ -1820,30 +1756,26 @@ static int 槽验(int k, uint64_t 实体, int x, int z, unsigned* X, unsigned* Z
 }
 
 static int 读实体坐标(int k, uint64_t 实体, unsigned* X, unsigned* Z) {
-    // v78：无雾坐标最先（pose 链迷雾内也逐帧更新；ActorLinker.position 迷雾外冻结）。
-    // 换算统一走 AM换算（×103500/109）：旧代码这里用 ×1000，与 AM/二链 两路差 5.3%，
-    // 实体在来源之间切换时坐标整体缩放跳变 —— 头像乱跳的主源之一。
-    // 依据：小美绘制.mm 的 wz_nat_pos 输出直接赋给 h->x（与 ActorLinker.position 同域），
-    // 两路必须走同一换算。
-    {
-        float wx = 0, wz = 0;
-        if (无雾坐标(实体, &wx, &wz)) {
-            int mmx = AM换算(wx);
-            int mmz = AM换算(wz);
-            if ((mmx || mmz) && mmx > -120000 && mmx < 120000 && mmz > -120000 && mmz < 120000) {
-                *X = (unsigned)mmx;
-                *Z = (unsigned)mmz;
-                return 8;   // 8 = 无雾坐标（5 已被 二A 占用，旧代码两路共用 5 导致诊断互串）
-            }
-        }
-    }
-    // v70：ActorManager 坐标链第二（同一 ActorLinker.position 字段，迷雾外冻结 → 只作备选）
+    // v70：ActorManager 坐标链最优先（Frida 实测确认，坐标逐帧更新）
     {
         int ax = 0, az = 0;
         if (AM坐标内部(实体, &ax, &az)) {
             *X = (unsigned)ax;
             *Z = (unsigned)az;
             return 7;   // 7 = ActorManager 坐标
+        }
+    }
+    // v69：无雾坐标（原生注册表 pose 链，迷雾外也实时更新）
+    {
+        float wx = 0, wz = 0;
+        if (无雾坐标(实体, &wx, &wz)) {
+            int mmx = (int)(wx * 1000.0f);
+            int mmz = (int)(wz * 1000.0f);
+            if ((mmx || mmz) && mmx > -120000 && mmx < 120000 && mmz > -120000 && mmz < 120000) {
+                *X = (unsigned)mmx;
+                *Z = (unsigned)mmz;
+                return 5;   // 5 = 无雾坐标
+            }
         }
     }
     unsigned dx = 0, dz = 0;
@@ -2058,7 +1990,9 @@ static void 校验链() {
 #define AM_LINKER_POS   0x4C4ULL         // ActorLinker → position (3×float)
 #define AM_LINKER_ID    0x4ACULL         // ActorLinker → ObjID
 #define AM_LINKER_VIS   0x505ULL         // ActorLinker → _logicVisible
-#define AM_LINKER_CAMP  0x40CULL         // ActorLinker → 阵营 (1=队A, 2=队B)
+#define AM_LINKER_CAMP  0x40CULL         // 旧：填充区野值，仅作兜底（字段表里 0x408=EffectControl, 0x410=BuffControl）
+#define AM_LINKER_META  0x548ULL         // v72：ActorLinker → theMeta (ActorMeta*)
+#define AM_META_CAMP    0x24ULL          // v72：ActorMeta → ActorCamp (1=队A, 2=队B)
 #define AM_MAX_HERO     16
 
 struct AM英雄 {
@@ -2078,39 +2012,164 @@ static double  AM上次 = 0;
 static int     AM失败连 = 0;
 static char    AM诊[160] = "";
 
+// ===== v72：用 il2cpp 元数据取 ActorManager 单例 =====
+// 旧写法写死 AM_INST_RVA，换构建就偏（v70 偏 0x20000 直接全废）。
+// 这里让引擎自己解析：找 ActorManager 类 → s_instance 静态字段 → 读值。
+// 偏移不参与，构建变化免疫；失败才回落写死 RVA。
+typedef void*       (*t_dom_get)(void);
+typedef void*       (*t_dom_asms)(void*, uint32_t*);
+typedef void*       (*t_asm_img)(void*);
+typedef uint32_t    (*t_img_cnt)(void*);
+typedef void*       (*t_img_cls)(void*, uint32_t);
+typedef const char* (*t_cls_name)(void*);
+typedef void*       (*t_cls_field)(void*, const char*);
+typedef void        (*t_fld_static)(void*, void*);
+typedef void*       (*t_cls_parent)(void*);
+
+static void* AM导出(const char* 名) {
+    static bool 初始化 = false;
+    static void* 句柄 = NULL;
+    if (!初始化) {
+        初始化 = true;
+        句柄 = dlopen("UnityFramework", RTLD_LAZY | RTLD_NOLOAD);
+        if (!句柄) 句柄 = dlopen("@rpath/UnityFramework.framework/UnityFramework", RTLD_LAZY);
+    }
+    void* p = 句柄 ? dlsym(句柄, 名) : NULL;
+    if (!p) p = dlsym(RTLD_DEFAULT, 名);
+    return p;
+}
+
+static uint64_t AM静态实例 = 0;
+
+static uint64_t 查AM单例_il2cpp(void) {
+    static double 上次试 = 0;
+    static int    连续失败 = 0;
+    static void*  kAM = NULL;              // 缓存 ActorManager klass
+    double t = CACurrentMediaTime();
+    if (AM静态实例 && t - 上次试 < 15.0) return AM静态实例;
+    if (t - 上次试 < 2.0) return AM静态实例;   // 失败后 2 秒内不重试，避免每帧遍历元数据
+    上次试 = t;
+
+    static t_dom_get    f_dom   = NULL;
+    static t_dom_asms   f_asms  = NULL;
+    static t_asm_img    f_img   = NULL;
+    static t_img_cnt    f_cnt   = NULL;
+    static t_img_cls    f_cls   = NULL;
+    static t_cls_name   f_cname = NULL;
+    static t_cls_field  f_field = NULL;
+    static t_fld_static f_sget  = NULL;
+    static t_cls_parent f_par   = NULL;
+    static bool 绑定 = false;
+    if (!绑定) {
+        绑定 = true;
+        f_dom   = (t_dom_get)AM导出("il2cpp_domain_get");
+        f_asms  = (t_dom_asms)AM导出("il2cpp_domain_get_assemblies");
+        f_img   = (t_asm_img)AM导出("il2cpp_assembly_get_image");
+        f_cnt   = (t_img_cnt)AM导出("il2cpp_image_get_class_count");
+        f_cls   = (t_img_cls)AM导出("il2cpp_image_get_class");
+        f_cname = (t_cls_name)AM导出("il2cpp_class_get_name");
+        f_field = (t_cls_field)AM导出("il2cpp_class_get_field_from_name");
+        f_sget  = (t_fld_static)AM导出("il2cpp_field_static_get_value");
+        f_par   = (t_cls_parent)AM导出("il2cpp_class_get_parent");
+    }
+    if (!f_dom || !f_asms || !f_img || !f_cnt || !f_cls || !f_cname || !f_field || !f_sget) {
+        if (++连续失败 >= 8) { 连续失败 = 0; 绑定 = false; kAM = NULL; AM静态实例 = 0; }
+        return 0;
+    }
+    if (!kAM) {
+        void* 域 = f_dom();
+        uint32_t 数 = 0;
+        void* 集 = 域 ? f_asms(域, &数) : NULL;
+        if (!集) { if (++连续失败 >= 8) { 连续失败 = 0; 绑定 = false; kAM = NULL; AM静态实例 = 0; } return 0; }
+        void* 首个 = NULL;
+        for (uint32_t i = 0; i < 数 && !kAM; i++) {
+            uint64_t 表项 = ((uint64_t*)集)[i];
+            if (!IsValidAddr(表项)) continue;
+            void* 图 = f_img((void*)表项);
+            if (!图) continue;
+            uint32_t 类数 = f_cnt(图);
+            for (uint32_t j = 0; j < 类数; j++) {
+                void* 类 = f_cls(图, j);
+                if (!类) continue;
+                const char* 名 = f_cname(类);
+                if (!名 || strcmp(名, "ActorManager") != 0) continue;
+                if (!首个) 首个 = 类;
+                // 同名类可能不止一个：必须带 HeroActors 字段才是我们要的
+                if (f_field(类, "HeroActors")) { kAM = 类; break; }
+            }
+        }
+        if (!kAM) kAM = 首个;
+        if (!kAM) { if (++连续失败 >= 8) { 连续失败 = 0; 绑定 = false; AM静态实例 = 0; } return 0; }
+    }
+    for (void* 类 = kAM; 类; 类 = f_par ? f_par(类) : NULL) {
+        for (int n = 0; n < 2; n++) {
+            void* 字段 = f_field(类, n == 0 ? "s_instance" : "_instance");
+            if (!字段) continue;
+            unsigned char 缓冲[16] = {0};
+            f_sget(字段, 缓冲);
+            uint64_t 值 = *(uint64_t*)缓冲;
+            if (IsValidAddr(值)) {
+                AM静态实例 = 值;
+                连续失败 = 0;
+                return 值;
+            }
+        }
+    }
+    if (++连续失败 >= 8) { 连续失败 = 0; 绑定 = false; AM静态实例 = 0; }
+    return 0;
+}
+
 // 世界坐标(±54.5) → 内部坐标(±103500)
 static inline int AM换算(float w) {
     return (int)(w * (103500.0f / 109.0f));
 }
 
-// 刷新 ActorManager 英雄表（~2Hz 即可）
+// ===== v72：敌方头像痕迹（迷雾定格 + 灰显 + 复现缓动）=====
+// 迷雾期服务器不下发坐标，position 冻结。若直接画原值，敌人一出雾就瞬间跳到新位置。
+// 这里保留「最后已知坐标」：迷雾中原地画半透明灰；出雾时 0.3 秒缓动滑过去，不再「啪」地跳。
+struct AM痕迹槽 {
+    bool     有;
+    bool     本帧;
+    unsigned 编号;
+    float    画X, 画Z;        // 当前绘制坐标（世界）
+    float    上次X, 上次Z;    // 最后已知真实坐标
+    double   隐藏起;          // 进入迷雾的时刻（0=当前可见）
+    double   消失起;          // 从 AM 表消失的时刻
+};
+static AM痕迹槽 AM痕迹[AM_MAX_HERO];
+
+// 刷新 ActorManager 英雄表（v72：每帧刷新，保证框跟人不落后）
 static void AM刷新() {
-    AM好 = false;
-    if (!IsValidAddr(模块基址)) { strcpy(AM诊, "no base"); return; }
+    if (!IsValidAddr(模块基址)) { strcpy(AM诊, "no base"); AM失败连++; if (AM失败连 >= 5) AM好 = false; return; }
     AM基址 = 模块基址;
 
-    // 读 ActorManager 实例
-    unsigned long long 实例 = vm_read<unsigned long long>(模块基址 + AM_INST_RVA);
+    // v72：优先 il2cpp 静态字段，注释见 查AM单例_il2cpp
+    unsigned long long 实例 = 查AM单例_il2cpp();
+    if (!IsValidAddr(实例)) {
+        实例 = vm_read<unsigned long long>(模块基址 + AM_INST_RVA);   // 兜底：写死 RVA
+    }
     if (!IsValidAddr(实例)) {
         snprintf(AM诊, sizeof(AM诊), "inst@+%#llx=0", AM_INST_RVA);
         AM失败连++;
+        if (AM失败连 >= 5) AM好 = false;
         return;
     }
     AM实例 = 实例;
 
     // HeroActors
     unsigned long long 英雄表 = vm_read<unsigned long long>(实例 + AM_IDX_OFF);
-    if (!IsValidAddr(英雄表)) { strcpy(AM诊, "no HeroActors"); AM失败连++; return; }
+    if (!IsValidAddr(英雄表)) { strcpy(AM诊, "no HeroActors"); AM失败连++; if (AM失败连 >= 5) AM好 = false; return; }
 
     // 条目列表
     unsigned long long 列表 = vm_read<unsigned long long>(英雄表 + AM_LIST_OFF);
-    if (!IsValidAddr(列表)) { strcpy(AM诊, "no list"); AM失败连++; return; }
+    if (!IsValidAddr(列表)) { strcpy(AM诊, "no list"); AM失败连++; if (AM失败连 >= 5) AM好 = false; return; }
 
     unsigned 数量 = 0;
     readMemory(列表 + AM_COUNT_OFF, &数量, 4);
     if (数量 == 0 || 数量 > AM_MAX_HERO) {
         snprintf(AM诊, sizeof(AM诊), "cnt=%u", 数量);
         AM失败连++;
+        if (AM失败连 >= 5) AM好 = false;
         return;
     }
 
@@ -2129,11 +2188,21 @@ static void AM刷新() {
         readMemory(连接器 + AM_LINKER_POS + 4, &y, 4);
         readMemory(连接器 + AM_LINKER_POS + 8, &z, 4);
         readMemory(连接器 + AM_LINKER_VIS, &可见, 1);
-        readMemory(连接器 + AM_LINKER_CAMP, &阵营值, 4);
 
-        // 校验：坐标在 ±130 范围内，编号非零（v78：±60 → ±130，世界域 ±109，
-        // 旧值把地图边缘的英雄整批踢出 AM表，只能落到旧链上）
-        if (!编号 || !isfinite(x) || !isfinite(z) || x < -130 || x > 130 || z < -130 || z > 130) continue;
+        // v72：阵营走真字段 theMeta@0x548 → ActorCamp@0x24；0x40C 是填充区野值，仅兜底
+        unsigned long long 元 = 0;
+        if (readMemory(连接器 + AM_LINKER_META, &元, 8) && IsValidAddr(元)) {
+            unsigned 元阵营 = 0;
+            if (readMemory(元 + AM_META_CAMP, &元阵营, 4) && (元阵营 == 1 || 元阵营 == 2)) 阵营值 = 元阵营;
+        }
+        if (阵营值 != 1 && 阵营值 != 2) {
+            阵营值 = 0;
+            readMemory(连接器 + AM_LINKER_CAMP, &阵营值, 4);
+            if (阵营值 != 1 && 阵营值 != 2) 阵营值 = 0;
+        }
+
+        // 校验：坐标在 ±60 范围内，编号非零
+        if (!编号 || !isfinite(x) || !isfinite(z) || x < -60 || x > 60 || z < -60 || z > 60) continue;
 
         AM表[n].连接器 = 连接器;
         AM表[n].编号 = 编号;
@@ -2146,6 +2215,7 @@ static void AM刷新() {
     if (n < 5) {
         snprintf(AM诊, sizeof(AM诊), "only %d/%u valid", n, 数量);
         AM失败连++;
+        if (AM失败连 >= 5) AM好 = false;
         return;
     }
 
@@ -2154,14 +2224,19 @@ static void AM刷新() {
     AM失败连 = 0;
     AM上次 = CACurrentMediaTime();
     {
-        // 旧条件 (AM失败连==0 && (AM数<=3 || n%20==0)) 恒不成立：失败连刚清零恒真，
-        // 而 n<16 永远摸不到 n%20==0 —— 这行日志一次都没打出来过。改成「人数变了才打」。
-        static int AM上次报数 = -1;
-        if (n != AM上次报数) {
-            AM上次报数 = n;
-            int c1 = 0, c2 = 0;
-            for (int j = 0; j < n; j++) { if (AM表[j].阵营 == 1) c1++; else if (AM表[j].阵营 == 2) c2++; }
-            日志("AM刷新 ok inst=%#llx cnt=%u valid=%d camp1=%d camp2=%d", 实例, 数量, n, c1, c2);
+        static double 上次AM日志 = 0;
+        double t = CACurrentMediaTime();
+        if (t - 上次AM日志 > 5.0) {
+            上次AM日志 = t;
+            int c1 = 0, c2 = 0, c0 = 0, v0 = 0;
+            for (int j = 0; j < n; j++) {
+                if (AM表[j].阵营 == 1) c1++;
+                else if (AM表[j].阵营 == 2) c2++;
+                else c0++;
+                if (!AM表[j].可见) v0++;
+            }
+            日志("AM刷新 ok inst=%#llx(il2cpp=%d) cnt=%u valid=%d camp1=%d camp2=%d camp0=%d 迷雾=%d",
+                 实例, 查AM单例_il2cpp() ? 1 : 0, 数量, n, c1, c2, c0, v0);
         }
     }
 }
@@ -2170,9 +2245,8 @@ static void AM刷新() {
 // 出参 x,z 为世界坐标 float（±54.5）
 static bool AM坐标(uint64_t 实体, float* x, float* z) {
     if (!AM数 || !IsValidAddr(实体)) return false;
-    // v78：缓存窗 30s → 1.5s。AM刷新失败后旧表最多再撑 1.5 秒，超时立刻不用 ——
-    // 30 秒陈旧坐标会在恢复那一帧整片瞬移，也是乱跳来源之一。
-    if (!AM好 && (CACurrentMediaTime() - AM上次) > 1.5) return false;
+    // 30 秒内成功过就用缓存
+    if (!AM好 && (CACurrentMediaTime() - AM上次) > 30.0) return false;
 
     // 策略 1：实体指针 == ActorLinker 指针
     for (int i = 0; i < AM数; i++) {
@@ -2781,10 +2855,493 @@ static void 稳定坐标(int k, unsigned* X, unsigned* Z) {
     // 现在 槽验 已经是唯一门控（阈值收到 2000），这一层直接透传，不再有自己的基准。
     (void)X; (void)Z; (void)k;
     return;
+    const int rx = (int)*X, rz = (int)*Z;
+
+    if (!槽稳有[k]) {
+        槽稳X[k] = *X; 槽稳Z[k] = *Z; 槽稳有[k] = true; 离群连[k] = 0;
+        稳定接计++;
+        return;
+    }
+
+    long long dx = (long long)rx - (long long)(int)槽稳X[k];
+    long long dz = (long long)rz - (long long)(int)槽稳Z[k];
+    bool 离群 = (dx * dx + dz * dz > 3000LL * 3000LL);
+
+    if (离群) {
+        离群连[k]++;
+        if (离群连[k] < 60) {
+            稳定压计++;
+            *X = 槽稳X[k]; *Z = 槽稳Z[k];
+            return;
+        }
+        // 连续 60 帧（1 秒）都在新位置 → 真瞬移（闪现/复活/换人）
+        槽稳X[k] = *X; 槽稳Z[k] = *Z; 离群连[k] = 0;
+        瞬移认计++; 稳定接计++;
+        if (瞬移认计 <= 20)
+            日志("坐标认新 k=%d 新(%d,%d) 距%.0f（连续60帧）",
+                 k, rx, rz, sqrt((double)(dx * dx + dz * dz)));
+        return;
+    }
+
+    离群连[k] = 0;
+    槽稳X[k] = *X; 槽稳Z[k] = *Z;   // 未离群：零延迟直接跟随
+    稳定接计++;
 }
 
-// 投影 的定义在 读矩阵 之后；全槽对比 / 我方自检 等在此之前就要用，这里前置声明。
-static bool 投影(const float* m, int 世界X, int 世界Z, float* 屏X, float* 屏Y, float 宽, float 高);
+// ==================== v42：坐标自标定（双解释 + 漏斗诊断）====================
+// v41 实测（_ab_v41.log）：5 个敌方槽全试过（活度 8243 → 146210，都是真在动的人），
+//   4 个对象 × 2048 个字，候选全是 0。这不是锁错人，是判据或解释方式的问题。
+// 所以 v42 不改判据的「结论」，只做两件事：
+//   ① 把筛子拆成漏斗，逐级计数（界内 / 界内+会变 / 界内+会变+平滑 / 全过），
+//      打印每个对象每一级剩多少 —— 哪一级归零，一眼看到。
+//   ② 同一批字节同时按 int32 和 float 两种解释统计。原代码整套假设坐标是
+//      「千分位 int32」（投影里除以 1000，野怪 0x2B8 确实是 int）。如果英雄用的是
+//      float，按 int 解释就是一串垃圾，第一关（界内）就全灭 —— 这正是「候选=0」的一个
+//      可检验解释，而不是又一个猜测。
+//      float 解释的额外门槛：0.01 < |f| < 110000。整数 53395 按 float 读是 7.5e-41
+//      的次正规数，直接被这条挡掉，所以两种解释不会互相污染。
+// float 的坐标单位有两种可能（米 或 千分之一米），无法先验确定，所以配对时两种倍率
+//   （1.0 和 0.001）各算一遍，都去投影，谁分数高谁留下 —— 用投影结果说话。
+// 扫描范围 v41 的 0x2000 扩到 0x4000：前 8KB 已经证明没有，就往后看，不是猜。
+#define 扫范围   0x4000
+#define 扫词数   (扫范围 / 4)
+#define 扫对象数 4
+#define 扫粗帧   240
+#define 扫细帧   400
+#define 短上限   48
+#define 对上限   1200
+
+static bool 投影(const float* m, int 世界X, int 世界Z, float* 屏X, float* 屏Y,
+                float 宽, float 高);
+
+struct 偏移统 {
+    // int32 解释
+    int 上值;
+    int 帧数;
+    int 界内;
+    int 变;
+    int 小变;
+    int 最大差;
+    int 总变程;
+    // float 解释
+    float 上F;
+    int 界F;
+    int 变F;
+    int 滑F;
+    int 最大F;
+};
+
+struct 对统 {
+    int 对象;
+    int 类;        // 0 = int32，1 = float
+    float 倍率;    // 仅 float：1.0（米） 或 0.001（千分之一米）
+    int 甲期;      // X 偏移
+    int 乙期;      // Z 偏移
+    int 帧数;
+    int 投影成;
+    int 屏内;
+    int 屏平滑;
+    int 屏最大跳;
+    int 世变;
+    int 上屏X;
+    int 上屏Y;
+    int 上世X;
+    int 上世Z;
+};
+
+static 偏移统 扫统[扫对象数][扫词数];
+static 对统   扫对[对上限];
+static unsigned char 扫块[扫对象数][扫范围];
+static int    扫对数 = 0;
+static int    短单[扫对象数][短上限];   // 偏移字节
+static signed char 短类[扫对象数][短上限];
+static int    短数[扫对象数];
+static uint64_t 扫对象址[扫对象数] = {0, 0, 0, 0};
+static uint64_t 扫键 = 0;
+static int 扫粗计 = 0;
+static int 扫细计 = 0;
+static int 扫阶段 = 0;
+static int      稳连[24] = {0};
+static uint64_t 稳实体[24] = {0};
+static int      活度[24] = {0};
+static int      上活X[24] = {0}, 上活Z[24] = {0};
+static bool     活有[24] = {false};
+static bool     已试[24] = {false};
+static int      锁槽 = -1;
+static int 扫调粗 = 0, 扫调细 = 0;
+static int 扫空帧 = 0;
+static float 扫屏宽 = 0.0f, 扫屏高 = 0.0f;
+
+static bool 浮点可用(float f) {
+    return isfinite(f) && fabsf(f) > 0.01f && fabsf(f) < 110000.0f;
+}
+
+static void 组长短名单() {
+    扫对数 = 0;
+
+    // ---- 漏斗：逐级计数，看是哪一级归零 ----
+    for (int o = 0; o < 扫对象数; ++o) {
+        短数[o] = 0;
+        if (!IsValidAddr(扫对象址[o])) {
+            日志("粗筛 对象%d 地址非法，跳过", o);
+            continue;
+        }
+        int 界I = 0, 变I = 0, 滑I = 0, 全I = 0;
+        int 界F = 0, 变F = 0, 滑F = 0;
+        for (int i = 0; i < 扫词数; ++i) {
+            偏移统& s = 扫统[o][i];
+            if (s.帧数 < 扫粗计 || s.帧数 < 2) continue;
+
+            double 界 = (double)s.界内 / s.帧数;
+            double 变 = (double)s.变 / s.帧数;
+            // v43 修 bug：分母原来写的是 (帧数-1)，但分子「小变」只统计「变了且变化小」的次数，
+            // 最多等于「变」。v42 日志 int 变=19（变率 8%），滑上限只有 19/239=0.08，
+            // 永远过不了 0.80 的门槛 —— 12 轮扫描全 0 候选就是这一行造成的。
+            // float 那一路用的是 滑F/变F，分母正确，所以只有 int 被误杀。
+            double 滑 = (s.变 > 0) ? (double)s.小变 / s.变 : 0.0;
+            if (界 >= 0.85) {
+                界I++;
+                if (变 >= 0.03) {
+                    变I++;
+                    if (滑 >= 0.80) {
+                        滑I++;
+                        if (s.最大差 <= 6000 && s.总变程 >= 1000) {
+                            全I++;
+                            if (短数[o] < 短上限) {
+                                短单[o][短数[o]] = i * 4;
+                                短类[o][短数[o]] = 0;
+                                短数[o]++;
+                            }
+                        }
+                    }
+                }
+            }
+
+            double 界f = (double)s.界F / s.帧数;
+            double 变f = (double)s.变F / s.帧数;
+            double 滑f = (s.变F > 0) ? (double)s.滑F / s.变F : 0.0;
+            if (界f >= 0.85) {
+                界F++;
+                if (变f >= 0.03) {
+                    变F++;
+                    if (滑f >= 0.80) {
+                        滑F++;
+                        if (短数[o] < 短上限) {
+                            短单[o][短数[o]] = i * 4;
+                            短类[o][短数[o]] = 1;
+                            短数[o]++;
+                        }
+                    }
+                }
+            }
+        }
+        日志("漏斗 对象%d 址=%llx 字=%d | int 界=%d 变=%d 滑=%d 全=%d | float 界=%d 变=%d 滑=%d | 短单=%d",
+             o, (unsigned long long)扫对象址[o], 扫词数,
+             界I, 变I, 滑I, 全I, 界F, 变F, 滑F, 短数[o]);
+
+        // v43：变化字明细。不管「平滑」过不过，把「界内率≥85% 且 变率≥3%」的字全列出来，
+        // 每条带 偏移 / 变率% / 滑率% / 最大帧间差 / 总变程 / 当前值。
+        // 这是为了万一修好分母后仍是 0 候选，能直接看到「变化字都在哪个偏移、值多大」，
+        // 而不是只知道筛空了。真坐标必然是其中某两条相差 4 或 8、值在 ±103500 附近的一对。
+        {
+            char 串[900] = {0};
+            int 位 = 0, 已列 = 0, 行 = 0;
+            for (int i = 0; i < 扫词数 && 已列 < 60; ++i) {
+                偏移统& s = 扫统[o][i];
+                if (s.帧数 < 2) continue;
+                if ((double)s.界内 / s.帧数 < 0.85) continue;
+                if ((double)s.变 / s.帧数 < 0.03) continue;
+                位 += snprintf(串 + 位, sizeof(串) - 位, "+0x%X 变%d%% 滑%d%% 差%d 程%d =%d | ",
+                               i * 4,
+                               (int)(100.0 * s.变 / s.帧数),
+                               (s.变 > 0 ? (int)(100.0 * s.小变 / s.变) : 0),
+                               s.最大差, s.总变程, s.上值);
+                已列++;
+                if (已列 % 8 == 0 || 位 > 700) {
+                    日志("变化字 对象%d (%d) %s", o, ++行, 串);
+                    位 = 0; 串[0] = 0;
+                }
+            }
+            if (位 > 0) 日志("变化字 对象%d (%d) %s", o, ++行, 串);
+            if (已列 == 0) 日志("变化字 对象%d 无（界内≥85% 且 变率≥3%% 的字一个都没有）", o);
+        }
+    }
+
+    // ---- 组对：同一对象、同一解释、偏移差 +4 / +8 ----
+    bool 满 = false;
+    for (int o = 0; o < 扫对象数 && !满; ++o) {
+        for (int i = 0; i < 短数[o] && !满; ++i) {
+            for (int j = 0; j < 短数[o]; ++j) {
+                if (短类[o][i] != 短类[o][j]) continue;
+                int d = 短单[o][j] - 短单[o][i];
+                if (d != 4 && d != 8) continue;
+                int 倍 = (短类[o][i] == 1) ? 2 : 1;
+                for (int m = 0; m < 倍; ++m) {
+                    if (扫对数 >= 对上限) { 满 = true; break; }
+                    对统& p = 扫对[扫对数++];
+                    memset(&p, 0, sizeof(p));
+                    p.对象 = o;
+                    p.类 = 短类[o][i];
+                    p.倍率 = (短类[o][i] == 1 && m == 1) ? 0.001f : 1.0f;
+                    p.甲期 = 短单[o][i];
+                    p.乙期 = 短单[o][j];
+                }
+            }
+        }
+    }
+    日志("配对 候选对数=%d", 扫对数);
+
+    if (扫对数 == 0) {
+        static int 空轮 = 0;
+        空轮++;
+        日志("粗筛无候选 第%d轮（见上面漏斗，看是哪一级归零）→ 换人重试", 空轮);
+        if (空轮 < 5) {
+            扫阶段 = 0; 扫键 = 0; 锁槽 = -1;
+            return;
+        }
+        空轮 = 0;
+        memset(已试, 0, sizeof(已试));
+        memset(活度, 0, sizeof(活度));
+        memset(活有, 0, sizeof(活有));
+        扫阶段 = 0; 扫键 = 0; 锁槽 = -1;
+        return;
+    }
+
+    // 短名单明细（带类型前缀）
+    for (int o = 0; o < 扫对象数; ++o) {
+        char 串[420] = {0};
+        int 位 = 0;
+        for (int i = 0; i < 短数[o] && 位 < 360; ++i) {
+            int idx = 短单[o][i] / 4;
+            if (短类[o][i] == 0)
+                位 += snprintf(串 + 位, sizeof(串) - 位, "i+0x%X=%d ",
+                               短单[o][i], 扫统[o][idx].上值);
+            else
+                位 += snprintf(串 + 位, sizeof(串) - 位, "f+0x%X=%.3f ",
+                               短单[o][i], 扫统[o][idx].上F);
+        }
+        日志("短名单 对象%d %s", o, 串);
+    }
+}
+
+static void 输出扫描结果() {
+    日志("=== 坐标自标定 实体=%llx 粗=%d 细=%d 对=%d ===",
+         (unsigned long long)扫键, 扫粗计, 扫细计, 扫对数);
+    bool 用[对上限];
+    memset(用, 0, sizeof(用));
+    int 出名 = 0;
+    for (int 名 = 1; 名 <= 10; ++名) {
+        int 最佳 = -1;
+        double 最高 = -1e9;
+        for (int i = 0; i < 扫对数; ++i) {
+            if (用[i]) continue;
+            对统& p = 扫对[i];
+            if (p.帧数 < 扫细计 || p.帧数 == 0) continue;
+            if (p.世变 < 2000) continue;
+            double 内 = (double)p.屏内 / p.帧数;
+            double 滑 = (double)p.屏平滑 / p.帧数;
+            double 投 = (double)p.投影成 / p.帧数;
+            double 分 = 内 * 2.0 + 滑 + 投 * 0.5 - (double)p.屏最大跳 / (扫屏宽 > 1 ? 扫屏宽 : 1);
+            if (分 > 最高) { 最高 = 分; 最佳 = i; }
+        }
+        if (最佳 < 0) break;
+        用[最佳] = true;
+        出名++;
+        对统& p = 扫对[最佳];
+        日志("配对%d 对象%d %s%s X=+0x%X(%d) Z=+0x%X(%d) 分=%.2f 投=%d/%d 屏内=%d/%d 屏滑=%d 屏最大跳=%d 世变=%d",
+             名, p.对象,
+             p.类 == 0 ? "int " : "float ",
+             p.类 == 0 ? "" : (p.倍率 > 0.5f ? "米" : "毫米"),
+             p.甲期, p.上世X, p.乙期, p.上世Z, 最高,
+             p.投影成, p.帧数, p.屏内, p.帧数, p.屏平滑, p.屏最大跳, p.世变);
+    }
+    if (出名 == 0)
+        日志("配对 无合格候选（看看漏斗每一级的数，以及短名单里的值长什么样）");
+    日志("=== 坐标自标定结束 ===");
+}
+
+static void 更新活度(int k, int x, int z) {
+    if (k < 0 || k >= 24) return;
+    if (活有[k]) {
+        long long dx = (long long)x - (long long)上活X[k];
+        long long dz = (long long)z - (long long)上活Z[k];
+        double d = sqrt((double)(dx * dx + dz * dz));
+        if (d > 30.0 && d <= 4000.0) {
+            活度[k] += (int)d;
+            if (活度[k] > 4000000) 活度[k] = 4000000;
+        }
+    }
+    上活X[k] = x; 上活Z[k] = z; 活有[k] = true;
+}
+
+static void 坐标自标定(int k, uint64_t 实体, const float* 矩阵, float 宽, float 高,
+                     int 原X, int 原Z) {
+    if (扫阶段 >= 3 || 实体 == 0) return;
+
+    更新活度(k, 原X, 原Z);
+
+    if (扫阶段 == 0) {
+        if (已试[k]) return;
+        if (稳实体[k] == 实体) 稳连[k]++;
+        else { 稳实体[k] = 实体; 稳连[k] = 1; }
+        if (稳连[k] < 90) return;
+        if (活度[k] < 8000) return;
+
+        memset(扫统, 0, sizeof(扫统));
+        memset(扫对, 0, sizeof(扫对));
+        扫对数 = 0; 扫粗计 = 0; 扫细计 = 0;
+        扫调粗 = 0; 扫调细 = 0; 扫空帧 = 0;
+        扫屏宽 = 宽; 扫屏高 = 高;   // 与主流程 投影(..., 屏.x, 屏.y) 完全同源，不自作聪明
+        扫键 = 实体;
+        锁槽 = k;
+        已试[k] = true;
+        for (int o = 0; o < 扫对象数; ++o) 扫对象址[o] = 0;
+
+        扫对象址[0] = 实体;
+        const SDK::坐标链& 链 = SDK::坐标链表[0];
+        uint64_t t = 实体;
+        扫对象址[1] = 链步(&t, 链.一) ? t : 0;
+        t = 扫对象址[1];
+        扫对象址[2] = 链步(&t, 链.二) ? t : 0;
+        t = 扫对象址[2];
+        扫对象址[3] = 链步(&t, 链.三) ? t : 0;
+        扫阶段 = 1;
+        日志("自标定 锁定 k=%d 实体=%llx 一=%llx 二=%llx 三=%llx 活度=%d 屏=%.0fx%.0f 范围=0x%X",
+             k, (unsigned long long)扫对象址[0], (unsigned long long)扫对象址[1],
+             (unsigned long long)扫对象址[2], (unsigned long long)扫对象址[3],
+             活度[k], 宽, 高, 扫范围);
+        return;
+    }
+
+    if (k != 锁槽) return;
+
+    if (实体 != 扫键) {
+        if (++扫空帧 > 900) {
+            日志("自标定 目标丢失，重置（准备换人）");
+            扫阶段 = 0; 扫键 = 0; 锁槽 = -1; 扫空帧 = 0;
+        }
+        return;
+    }
+    扫空帧 = 0;
+
+    if (扫阶段 == 1) {
+        if (扫粗计 >= 扫粗帧) { 组长短名单(); if (扫阶段 == 1) 扫阶段 = 2; return; }
+        if ((扫调粗++ & 1) != 0) return;
+        for (int o = 0; o < 扫对象数; ++o) {
+            uint64_t 址 = 扫对象址[o];
+            if (!IsValidAddr(址)) continue;
+            if (!readMemory(址, 扫块[o], 扫范围)) continue;
+            for (int i = 0; i < 扫词数; ++i) {
+                int v = 0;
+                float f = 0.0f;
+                memcpy(&v, 扫块[o] + i * 4, 4);
+                memcpy(&f, 扫块[o] + i * 4, 4);
+                偏移统& s = 扫统[o][i];
+
+                if (s.帧数 > 0) {
+                    // ---- int32 解释 ----
+                    long long dd = (long long)v - (long long)s.上值;
+                    if (dd < 0) dd = -dd;
+                    if (dd > 100000) dd = 100000;
+                    if (dd > 0) {
+                        s.变++;
+                        s.总变程 += (int)dd;
+                        if (dd <= 4000) s.小变++;
+                    }
+                    if ((int)dd > s.最大差) s.最大差 = (int)dd;
+
+                    // ---- float 解释 ----
+                    if (isfinite(f) && isfinite(s.上F)) {
+                        double df = fabs((double)f - (double)s.上F);
+                        double 幅 = fabs((double)f);
+                        double 限 = 0.05 * (幅 > 1.0 ? 幅 : 1.0);   // 相对 5%，至少 0.05
+                        if (df > 0.0) {
+                            s.变F++;
+                            if (df <= 限) s.滑F++;
+                            if (df > s.最大F) s.最大F = (int)(df > 2000000.0 ? 2000000.0 : df);
+                        }
+                    }
+                }
+                if (v > -110000 && v < 110000 && v != 0) s.界内++;
+                if (浮点可用(f)) s.界F++;
+                s.上值 = v;
+                s.上F = f;
+                s.帧数++;
+            }
+        }
+        扫粗计++;
+        return;
+    }
+
+    if (扫阶段 == 2) {
+        if (扫细计 >= 扫细帧) { 输出扫描结果(); 扫阶段 = 3; return; }
+        if ((扫调细++ & 1) != 0) return;
+
+        bool 有[扫对象数] = {false, false, false, false};
+        for (int o = 0; o < 扫对象数; ++o) {
+            uint64_t 址 = 扫对象址[o];
+            if (!IsValidAddr(址)) continue;
+            if (!readMemory(址, 扫块[o], 扫范围)) continue;
+            有[o] = true;
+        }
+        for (int i = 0; i < 扫对数; ++i) {
+            对统& p = 扫对[i];
+            if (!有[p.对象]) continue;
+
+            double wx = 0.0, wz = 0.0;
+            if (p.类 == 0) {
+                int x = 0, z = 0;
+                memcpy(&x, 扫块[p.对象] + p.甲期, 4);
+                memcpy(&z, 扫块[p.对象] + p.乙期, 4);
+                if (x <= -110000 || x >= 110000 || z <= -110000 || z >= 110000) continue;
+                wx = (double)x; wz = (double)z;
+            } else {
+                float fx = 0.0f, fz = 0.0f;
+                memcpy(&fx, 扫块[p.对象] + p.甲期, 4);
+                memcpy(&fz, 扫块[p.对象] + p.乙期, 4);
+                if (!浮点可用(fx) || !浮点可用(fz)) continue;
+                // 统一换算成千分之一米（投影函数的分母就是 1000）
+                wx = (double)fx * (double)p.倍率 * 1000.0;
+                wz = (double)fz * (double)p.倍率 * 1000.0;
+                if (fabs(wx) >= 110000.0 || fabs(wz) >= 110000.0) continue;
+            }
+
+            float sx = 0.0f, sy = 0.0f;
+            if (!投影(矩阵, (int)wx, (int)wz, &sx, &sy, 扫屏宽, 扫屏高)) continue;
+            p.投影成++;
+            if (sx > -0.15f * 扫屏宽 && sx < 1.15f * 扫屏宽 &&
+                sy > -0.15f * 扫屏高 && sy < 1.15f * 扫屏高) p.屏内++;
+            if (p.帧数 > 0) {
+                double dx = (double)sx - (double)p.上屏X;
+                double dy = (double)sy - (double)p.上屏Y;
+                double d = sqrt(dx * dx + dy * dy);
+                if (d < 0.25 * (double)扫屏宽) p.屏平滑++;
+                if ((int)d > p.屏最大跳) p.屏最大跳 = (int)d;
+                double mx = wx - (double)p.上世X;
+                double mz = wz - (double)p.上世Z;
+                p.世变 += (int)(sqrt(mx * mx + mz * mz));
+            }
+            p.上屏X = (int)sx; p.上屏Y = (int)sy;
+            p.上世X = (int)wx; p.上世Z = (int)wz;
+            p.帧数++;
+        }
+        扫细计++;
+        return;
+    }
+}
+
+// ==================== v45：全槽坐标对照（只读、只打印，不参与绘制）====================
+// v44 已经测出的事实（不需要再重复）：
+//   ① 「三」= *(二+0x0) 在 10 个槽里是 10 个不同指针（图G0 三去重=10）→ 它不是类级/共享指针，
+//      v36 里 k=4 与 k=5 共用「三」是那两槽同时指向同一个英雄，不是链的问题。
+//   ② 坐标在「二」里，两组各一份：+0x2C≡+0x44、+0x34≡+0x4C，单位毫米，随移动平滑变化。
+//   ③ v44 的「找不到我方槽」是探针自己的 bug：读阵营用了 +0xC0（垃圾 -1029978168），
+//      真字段是 +52（主循环统计行 阵52=1 一直稳定）。
+//   ④ 实战时 DisplaySize = 2796x1290（横屏），启动横幅那时是 1290x2796（竖屏）——
+//      v42 那个「屏=2796x1290」的矛盾是朝向变了，不是代码错。
+// 这一版只测一件事：谁是「我」，以及「二」里的坐标投影后是否落在我身上。
+// 判据就是免费真值：相机跟着我走，我的投影必落在屏幕中心附近。全部 10 个槽都投影一遍，
+// 离中心最近的那个就是我，它的距心值直接判定「偏移对不对」和「投影宽高对不对」。
 #define 全槽样数 10
 static int 全槽计 = 0;
 static int 全槽帧 = 0;
@@ -2806,7 +3363,7 @@ static void 图打印对象(uint64_t 址, const char* 名, int 槽) {
     char 串[440] = {0};
     int 位 = 0;
     for (int i = 0; i < 8 && 位 < 400; ++i)
-        位 = 追加(串, sizeof(串), 位, "%llx ", (unsigned long long)q[i]);
+        位 += snprintf(串 + 位, sizeof(串) - 位, "%llx ", (unsigned long long)q[i]);
     日志("图 %s 槽%d 址=%llx q0..7= %s", 名, 槽, (unsigned long long)址, 串);
 }
 
@@ -2847,7 +3404,7 @@ static void 全槽对比(uint64_t 数组, int 数量, const float* 矩阵, float
             最近距 = 距; 最近槽 = k; 最近X = x; 最近Z = z; 最近阵 = 阵; 最近实体 = e;
         }
         if (位 < 400)
-            位 = 追加(串, sizeof(串), 位, "k%d阵%d(%d,%d)=%.0f ", k, 阵, x, z, 距);
+            位 += snprintf(串 + 位, sizeof(串) - 位, "k%d阵%d(%d,%d)=%.0f ", k, 阵, x, z, 距);
     }
     日志("全槽 第%d次 中(%.0f,%.0f) %s", 全槽计, 中X, 中Y, 串);
 
@@ -3018,7 +3575,7 @@ static void 槽性扫(uint64_t 数组, int 数量) {
         const uint64_t 血 = vm_read<uint64_t>(e + 0x1d0);
         int 当 = -1, 上 = -1;
         if (IsValidAddr(血)) { 当 = vm_read<int>(血 + 0xc0); 上 = vm_read<int>(血 + 0xc8); }
-        p = 追加(串, sizeof(串), p, "k%d阵%d血%d/%d ", k, 阵, 当, 上);
+        p += snprintf(串 + p, sizeof(串) - p, "k%d阵%d血%d/%d ", k, 阵, 当, 上);
     }
     日志("槽性 n=%d %s", 数量, 串);
 }
@@ -3156,7 +3713,7 @@ static void 找位扫(uint64_t 数组, int 数量, const float* m, float 宽, fl
                     const float dx = sx - 宽 * 0.5f, dy = sy - 高 * 0.5f;
                     const float d = sqrtf(dx * dx + dy * dy);
                     if (投位 < (int)sizeof(投串) - 30)
-                        投位 = 追加(投串, sizeof(投串), 投位, "(%.0f,%.0f)", sx, sy);
+                        投位 += snprintf(投串 + 投位, sizeof(投串) - 投位, "(%.0f,%.0f)", sx, sy);
                     if (d < 锚距) { 锚距 = d; 锚i = i; }
                 }
                 if (我数 > 0 && 锚距 >= 150.0f) continue;
@@ -3460,7 +4017,7 @@ static void 锚扫描(uint64_t 数组, int 数量, const float* m, float 宽, fl
                 readMemory(二k + 0x2c, &x, 4);
                 readMemory(二k + 0x34, &z, 4);
                 if (位 < (int)sizeof(行) - 48)
-                    位 = 追加(行, sizeof(行), 位, "k%d%s(%d,%d) ",
+                    位 += snprintf(行 + 位, sizeof(行) - 位, "k%d%s(%d,%d) ",
                                   k, 同 ? "同" : "异", x, z);
             }
             日志("槽表 真v=%llx 异=%d/%d %s",
@@ -3590,6 +4147,81 @@ static void 锚扫描(uint64_t 数组, int 数量, const float* m, float 宽, fl
     }
 }
 
+// ==================== v47：两跳指针轨迹 + 野怪已知真值对照 ====================
+// v46 实测（_ab_v46.log）留了三个必须解释的事实：
+//  ① 同一个槽（槽世键未变，实体不变）的 二+0x44 仍在两组值之间跳：
+//     k3 (47770,-27742) → (2027,418) → (38221,-34237) → (36500,34000)，最大距 68259。
+//  ② `二失=375/1750`，约 21% 的槽帧读不到 二，那一帧退回三链投票，
+//     于是输出里又出现 v36 的老僵尸值 (53395,56435)/(54045,54045)/(56368,53358)。
+//  ③ 我方自检的「最近者即我」不可靠：自身那一帧读失败时，它会挑到站泉水的队友
+//     （k4 二(1300,1299) 恒定、距心 323→2578 一路涨），所以「距心」不能单独用来判死偏移。
+// 要分清 ① 是「指针在换人」还是「对象里存了两份」，只能逐帧看指针本身：
+//   二 在两个地址间换 → 指针级换人（链的某一跳不稳）
+//   二 恒定、值在两组间换 → 同一对象里两份状态（逻辑位/插值位）
+// 另加一条对照：野怪用 +0x2B8 读出来一直是真坐标（v24 起用小地图 20 点标定过），
+//   把野怪的 0x2B8 与 野怪的二+0x44 并排打出来，就能判断 +0x44 到底是不是位置字段。
+static int 轨迹帧 = 0, 轨迹计 = 0;
+static void __attribute__((unused)) 指针轨迹(uint64_t 数组, int 数量) {
+    if (轨迹计 >= 400) return;
+    if (++轨迹帧 < 6) return;               // 约 10Hz
+    轨迹帧 = 0;
+    for (int k = 0; k < 数量 && k < 12 && 轨迹计 < 400; ++k) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (!IsValidAddr(e)) continue;
+        uint64_t 一 = vm_read<uint64_t>(e + 0xa8);
+        uint64_t 二 = IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0;
+        int x = 0, z = 0;
+        if (IsValidAddr(二)) {
+            x = vm_read<int>(二 + 0x44);
+            z = vm_read<int>(二 + 0x4C);
+        }
+        日志("轨迹 k=%d 实体=%llx 一=%llx 二=%llx v(%d,%d)", k,
+             (unsigned long long)e, (unsigned long long)一, (unsigned long long)二, x, z);
+        轨迹计++;
+    }
+}
+
+static int 对照帧 = 0, 对照计 = 0;
+static void __attribute__((unused)) 野怪对照(void) {
+    if (对照计 >= 12) return;
+    if (++对照帧 < 20) return;
+    对照帧 = 0;
+    ++对照计;
+
+    uint64_t 根 = 0;
+    uint64_t a = vm_read<uint64_t>(模块基址 + SDK::根野怪);
+    if (IsValidAddr(a)) {
+        uint64_t b = vm_read<uint64_t>(a + 952);
+        if (IsValidAddr(b)) {
+            uint64_t c = vm_read<uint64_t>(b + 136);
+            if (IsValidAddr(c)) 根 = vm_read<uint64_t>(c + 320);
+        }
+    }
+    if (!IsValidAddr(根)) { 日志("野怪对照 第%d次 根无效", 对照计); return; }
+
+    char 串[460] = {0};
+    int 位 = 0;
+    for (int i = 0; i < 20 && 位 < 400; ++i) {
+        uint64_t 怪 = vm_read<uint64_t>(根 + 24ULL * i);
+        if (!IsValidAddr(怪)) continue;
+        int x = vm_read<int>(怪 + SDK::坐标X);
+        int z = vm_read<int>(怪 + SDK::坐标Y);
+        if ((!x && !z) || x < -200000 || x > 200000 || z < -200000 || z > 200000) continue;
+        uint64_t 一 = vm_read<uint64_t>(怪 + 0xa8);
+        uint64_t 二 = IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0;
+        int bx = 0, bz = 0;
+        if (IsValidAddr(二)) { bx = vm_read<int>(二 + 0x44); bz = vm_read<int>(二 + 0x4C); }
+        位 += snprintf(串 + 位, sizeof(串) - 位, "[%d]2B8(%d,%d)二44(%d,%d) ", i, x, z, bx, bz);
+    }
+    日志("野怪对照 第%d次 %s", 对照计, 串);
+}
+
+// ==================== v48：跳变帧四份读数 + 整局快照 ====================
+// v47 的 400 行上限只覆盖了开局 5 秒，恰好错过了「跳」爆发的时段（07:50:30 之后）。
+// 这两个探针改成「按事件打 + 定期快照 + 上限拉高」，覆盖整局：
+//   跳四值：每次世界跳变（>3000）打一行，把 二 的四份值同帧列出，
+//           看交替的两组数是「同一字段双缓冲」还是「组A/组B 不同步」。
+//   整局快照：每 5 秒打 10 槽的 阵/组A/组B，用来确认哪一组在连续变化。
 static int 跳探计 = 0;
 static void 跳变四值(int k, uint64_t 实体, unsigned 原X, unsigned 原Z, double 距) {
     if (跳探计 >= 240) return;
@@ -3617,7 +4249,7 @@ static void 整局快照(uint64_t 数组, int 数量) {
         uint64_t 一 = vm_read<uint64_t>(e + 0xa8);
         uint64_t 二 = IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0;
         const 二十四 r = 读二四(二);
-        位 = 追加(串, sizeof(串), 位, "k%d/阵%d/%d,%d|%d,%d ", k,
+        位 += snprintf(串 + 位, sizeof(串) - 位, "k%d/阵%d/%d,%d|%d,%d ", k,
                        vm_read<int>(e + 52), r.A, r.B, r.C, r.D);
     }
     int 跳A = 0, 跳B = 0, 失总 = 0, 二变总 = 0, 一变总 = 0;
@@ -3629,8 +4261,8 @@ static void 整局快照(uint64_t 数组, int 数量) {
         失总 += 槽二失[k];
         二变总 += 槽二指针变[k]; 一变总 += 槽一指针变[k];
         if (k < 12) {
-            失位 = 追加(失串, sizeof(失串), 失位, "%d:%d ", k, 槽二失[k]);
-            针位 = 追加(针串, sizeof(针串), 针位, "%d:%d/%d ",
+            失位 += snprintf(失串 + 失位, sizeof(失串) - 失位, "%d:%d ", k, 槽二失[k]);
+            针位 += snprintf(针串 + 针位, sizeof(针串) - 针位, "%d:%d/%d ",
                              k, 槽二指针变[k], 槽一指针变[k]);
         }
         槽二失[k] = 0;
@@ -3677,7 +4309,7 @@ static void 原始dump(int k, uint64_t 实体) {
         for (int o = 0; o < 0x200; o += 16) {
             char 行[80]; int w = 0;
             for (int i = 0; i < 16 && w < 66; ++i)
-                w = 追加(行, sizeof(行), w, "%02x", buf[o + i]);
+                w += snprintf(行 + w, sizeof(行) - w, "%02x", buf[o + i]);
             日志("  +%03x %s", o, 行);
         }
     }
@@ -3689,7 +4321,7 @@ static void 原始dump(int k, uint64_t 实体) {
 // 是不是 k3 跳前的旧值」。本行每 3 帧把前 4 个有效槽的 二地址低 32 位 + A/B/C/D
 // 打在同一行，最多 400 行（约 20 秒），足够完整覆盖一次跳变前后。
 static int 四槽帧 = 0;
-static void 四槽行(uint64_t 数组, int 数量, unsigned 帧) {
+static void __attribute__((unused)) 四槽行(uint64_t 数组, int 数量, unsigned 帧) {
     if (四槽帧 >= 400) return;
     if (帧 % 3 != 0) return;
     char 串[700] = {0};
@@ -3701,7 +4333,7 @@ static void 四槽行(uint64_t 数组, int 数量, unsigned 帧) {
         uint64_t 二 = IsValidAddr(一) ? vm_read<uint64_t>(一 + 0x10) : 0;
         if (!IsValidAddr(二)) continue;
         const 二十四 r = 读二四(二);
-        位 = 追加(串, sizeof(串), 位, "k%d/%x A(%d,%d) B(%d,%d) | ", k,
+        位 += snprintf(串 + 位, sizeof(串) - 位, "k%d/%x A(%d,%d) B(%d,%d) | ", k,
                       (unsigned)(二 & 0xFFFFFFFF), r.A, r.B, r.C, r.D);
         ++n;
     }
@@ -3710,7 +4342,365 @@ static void 四槽行(uint64_t 数组, int 数量, unsigned 帧) {
     日志("四槽 f=%u %s", 帧, 串);
 }
 
+// ==================== v50：坐标猎人（真值反查）====================
+// v49 实测（_ab_v49.log，50 个环 dump × 40 帧 = 2000 个样本）：
+//   ① 指针变 二变=0 一变=0 整整 2000 个样本 —— 每个槽的「一」「二」地址整局一次没变
+//      k1 一=dd0a6cb0 二=dbdd9498 / k3 一=dd0a52f0 二=dbddaef4 /
+//      k5 一=dd0c48f0 二=dbdb974c / k8 一=dd0b4df0 二=dbdd9c9c / k4 一=dd0c62b0 二=dbdb494c（均低 32 位）
+//      → 「指针换人」这条假说彻底排除，对象从头到尾是同一个。
+//   ② 但同一帧里两个不同槽会读出完全相同的 8 字节值，连续几十帧：
+//      f=5813~5816 k3 与 k8 同为 A(2146,3476)
+//      f=5817~5822 k1 与 k8 同为 A(41139,-39956) 接着同变为 A(40582,-40507)
+//      f=5951~5956 k1 与 k8 同为 A(-40750,-40750)
+//      全日志「值跨槽流转」102 次（A(34430,-45759) 先在 k3，20:17:43 出现在 k5）
+//      → 地址不变、内容换人，只能是对象被复用或指向同一份共享数据，不是该实体私有位置。
+//   ③ 二失槽 总=300 全部落在 k4 一个槽（其余槽 0）→ 那 20% 失败率是 k4 的垃圾值，
+//      不是普遍现象，不能拿它解释全局抖动。
+//   ④ 全槽 我=k6 阵=1 二(-57673,-55764) 距心40 → 「二」对本地玩家是对的。
+// 于是只剩一个问题：敌方实体自己的坐标存在哪。
+// 做法不猜：拿「我」当已知真值（距屏心 < 400px 才采信），扫 实体本体 / 一 / 二 三层，
+// 找 int32 恰好等于我方坐标 X 或 Z 的偏移；找到后立刻用同一偏移读全部槽位做交叉验证。
+static unsigned char 猎人缓冲[0x4000];
+static int 猎人计 = 0;
+static int 猎人X层 = -1, 猎人X偏 = -1, 猎人Z层 = -1, 猎人Z偏 = -1;
+static void __attribute__((unused)) 坐标猎人(uint64_t 数组, int 数量, const float* 矩阵, float 宽, float 高, unsigned 我方) {
+    if (猎人计 >= 60) return;
+    static double 上次 = 0.0;
+    const double 现时 = CACurrentMediaTime();
+    if (现时 - 上次 < 5.0) return;
+    上次 = 现时;
+    ++猎人计;
+
+    const float 中X = 宽 * 0.5f, 中Y = 高 * 0.5f;
+    int 我槽 = -1; double 我距 = 1e9; int 真X = 0, 真Z = 0; uint64_t 我实体 = 0;
+    for (int k = 0; k < 数量 && k < 24; ++k) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (!IsValidAddr(e)) continue;
+        if ((unsigned)vm_read<int>(e + 52) != 我方) continue;
+        uint64_t 二 = 图解二(图解一(e));
+        if (!IsValidAddr(二)) continue;
+        const 二十四 r = 读二四(二);
+        int x, z;
+        if (组可用(r.A, r.B)) { x = r.A; z = r.B; }
+        else if (组可用(r.C, r.D)) { x = r.C; z = r.D; }
+        else continue;
+        float sx = 0.0f, sy = 0.0f;
+        if (!投影(矩阵, x, z, &sx, &sy, 宽, 高)) continue;
+        double 距 = sqrt((double)(sx - 中X) * (sx - 中X) + (double)(sy - 中Y) * (sy - 中Y));
+        if (距 < 我距) { 我距 = 距; 我槽 = k; 真X = x; 真Z = z; 我实体 = e; }
+    }
+    if (我槽 < 0) { 日志("猎人 %d 找不到我方槽(我方阵营=%u)", 猎人计, 我方); return; }
+    if (我距 > 400.0) {
+        日志("猎人 %d 我方槽 k=%d 距心%.0f 超过 400px，本拍不采信真值", 猎人计, 我槽, 我距);
+        return;
+    }
+
+    const uint64_t 一 = 图解一(我实体);
+    const uint64_t 二 = 图解二(一);
+    const uint64_t 对象[3] = { 我实体, 一, 二 };
+    const int      长[3]   = { 0x4000, 0x2000, 0x2000 };
+    const char*    层名[3] = { "本体", "一", "二" };
+
+    char 串[700] = {0}; int 位 = 0, 命中 = 0;
+    for (int t = 0; t < 3; ++t) {
+        if (!IsValidAddr(对象[t])) continue;
+        if (!readMemory(对象[t], 猎人缓冲, 长[t])) continue;
+        for (int o = 0; o + 4 <= 长[t] && 命中 < 12; o += 4) {
+            int v; memcpy(&v, 猎人缓冲 + o, 4);
+            if (v > -500 && v < 500) continue;          // 0 / 小值巧合一律不算
+            const bool 是X = (v == 真X), 是Z = (v == 真Z);
+            if (!是X && !是Z) continue;
+            if (是X && 猎人X层 < 0) { 猎人X层 = t; 猎人X偏 = o; }
+            if (是Z && 猎人Z层 < 0) { 猎人Z层 = t; 猎人Z偏 = o; }
+            位 += snprintf(串 + 位, sizeof(串) - 位, "%s+0x%x=%d%s ",
+                           层名[t], o, v, 是X ? (是Z ? "(XZ)" : "(X)") : "(Z)");
+            ++命中;
+        }
+    }
+    日志("猎人 %d 我=k%d 阵=%u 距心%.0f 真(%d,%d) 一=%llx 二=%llx 命中%d: %s",
+         猎人计, 我槽, 我方, 我距, 真X, 真Z,
+         (unsigned long long)一, (unsigned long long)二, 命中, 命中 ? 串 : "无");
+
+    // 命中后立刻交叉验证：同一层同一偏移，读全部槽位，看敌方是否也得到合理且连续的坐标
+    if (猎人X层 >= 0 && 猎人X偏 >= 0) {
+        char s2[520] = {0}; int p2 = 0;
+        for (int k = 0; k < 数量 && k < 12 && p2 < 470; ++k) {
+            uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+            if (!IsValidAddr(e)) continue;
+            uint64_t o = (猎人X层 == 0) ? e : (猎人X层 == 1 ? 图解一(e) : 图解二(图解一(e)));
+            if (!IsValidAddr(o)) continue;
+            const int gx = vm_read<int>(o + 猎人X偏);
+            int gz = 0;
+            if (猎人Z层 == 猎人X层 && 猎人Z偏 >= 0) gz = vm_read<int>(o + 猎人Z偏);
+            p2 += snprintf(s2 + p2, sizeof(s2) - p2, "k%d阵%d(%d,%d) ",
+                           k, vm_read<int>(e + 52), gx, gz);
+        }
+        日志("猎人 %d 反查 %s+0x%x / %s+0x%x → %s",
+             猎人计, 层名[猎人X层], 猎人X偏,
+             (猎人Z层 >= 0 ? 层名[猎人Z层] : "?"), 猎人Z偏, s2);
+    }
+}
+
+// ==================== v51：猎人2（扩范围 + 三种解释 + 邻域变化）====================
+// v50 实测（_ab_v50.log）：
+//   ① 命中 9 处，全部是「同一对坐标的副本」：
+//      本体+0x278/+0x280、一+0x970/+0x978、二+0x2c/+0x34、二+0x44/+0x4c（间距都是 8 字节）
+//   ② 但反查行当场给出反证：本体+0x278/+0x280 在 20:40:25~20:41:30 共 65 秒里
+//      k0(-53416,-56414) k1(53395,56435) k2(-53911,-53939) k3(57668,55750)
+//      k4(55757,57652) k5(56368,53358) k7(-55764,-57574) k8(54045,54045) 一字未变 ——
+//      这些正是加载期 20:16:06「坐标对照」里那批常量 → 本体 0x278 是出生点，不是实时位置。
+//   ③ 20:40:55 起我方真值开始变（-57673,-55764 → -41914,-33369 → -28307,-3208 …），
+//      命中的 9 处只剩 二+0x2c/+0x34/+0x44/+0x4c 四个 ——
+//      说明「实时位置」只在二对象里，实体本体里只有出生点。
+//   ④ 但 二 是共享池（v49 已证），且同一帧内读两次值都不同：
+//      跳四值 k=1 用(12942,13440) 组A(12758,13272) 组B(12942,13440) —— 锁组=1 却用上了组B，
+//      说明判定组A可用时读到的是越界垃圾、打印时重读又变回界内，一帧内被改写多次。
+// 于是 v51 补两件测量（仍不改绘制）：
+//   A. 把扫描范围从 0x4000/0x2000/0x2000 扩到 0x8000/0x6000/0x3000，
+//      并且不只认 int32 精确相等，同时认 float（毫米）与 float（米）三种解释 ——
+//      v50 只认 int32，若实体里存的是浮点，就会 0 命中。
+//   B. 邻域变化：每 5 秒对每槽读一遍本体 0x8000，只打印「变了、界内、单步幅度 50~6000」
+//      的偏移。不管单位是什么，实时位置一定在这个集合里 —— 这能把范围从 32KB 缩到几个偏移。
 static inline float 绝对值f(float x) { return x < 0.0f ? -x : x; }
+static unsigned char 猎2缓冲[0x8000];
+static int 猎2计 = 0;
+static int 猎2X层 = -1, 猎2X偏 = -1, 猎2X型 = 0, 猎2Z层 = -1, 猎2Z偏 = -1, 猎2Z型 = 0;
+static void __attribute__((unused)) 坐标猎人2(uint64_t 数组, int 数量, const float* 矩阵, float 宽, float 高, unsigned 我方) {
+    if (猎2计 >= 40) return;
+    static double 上次 = 0.0;
+    const double 现时 = CACurrentMediaTime();
+    if (现时 - 上次 < 8.0) return;
+    上次 = 现时;
+    ++猎2计;
+
+    const float 中X = 宽 * 0.5f, 中Y = 高 * 0.5f;
+    int 我槽 = -1; double 我距 = 1e9; int 真X = 0, 真Z = 0; uint64_t 我实体 = 0;
+    for (int k = 0; k < 数量 && k < 24; ++k) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (!IsValidAddr(e)) continue;
+        if ((unsigned)vm_read<int>(e + 52) != 我方) continue;
+        uint64_t 二 = 图解二(图解一(e));
+        if (!IsValidAddr(二)) continue;
+        const 二十四 r = 读二四(二);
+        int x, z;
+        if (组可用(r.A, r.B)) { x = r.A; z = r.B; }
+        else if (组可用(r.C, r.D)) { x = r.C; z = r.D; }
+        else continue;
+        float sx = 0.0f, sy = 0.0f;
+        if (!投影(矩阵, x, z, &sx, &sy, 宽, 高)) continue;
+        double 距 = sqrt((double)(sx - 中X) * (sx - 中X) + (double)(sy - 中Y) * (sy - 中Y));
+        if (距 < 我距) { 我距 = 距; 我槽 = k; 真X = x; 真Z = z; 我实体 = e; }
+    }
+    if (我槽 < 0 || 我距 > 400.0) {
+        日志("猎2 %d 无真值(我槽=%d 距心%.0f)", 猎2计, 我槽, 我距);
+        return;
+    }
+
+    const uint64_t 一 = 图解一(我实体);
+    const uint64_t 二 = 图解二(一);
+    const uint64_t 对象[3] = { 我实体, 一, 二 };
+    const int      长[3]   = { 0x8000, 0x6000, 0x3000 };
+    const char*    层名[3] = { "本体", "一", "二" };
+
+    char 串[820] = {0}; int 位 = 0, 命中 = 0;
+    for (int t = 0; t < 3; ++t) {
+        if (!IsValidAddr(对象[t])) continue;
+        int 实长 = 长[t];
+        while (实长 >= 0x400 && !readMemory(对象[t], 猎2缓冲, 实长)) 实长 /= 2;   // 跨页读不到就降档，别整层丢掉
+        if (实长 < 0x400) continue;
+        for (int o = 0; o + 4 <= 实长 && 命中 < 14; o += 4) {
+            int v; memcpy(&v, 猎2缓冲 + o, 4);
+            float f; memcpy(&f, &v, 4);
+            char 型[16] = {0};
+            bool 是X = false, 是Z = false;
+            // ① int32 精确相等（v50 用的就是这一条）
+            if (v > -500 && v < 500) {
+                // 落到 ±500 内的一律不认 int，交给浮点解释，避免 0 / 小值巧合
+            } else if (v == 真X) {
+                是X = true; snprintf(型, sizeof(型), "i");
+            } else if (v == 真Z) {
+                是Z = true; snprintf(型, sizeof(型), "i");
+            }
+            // ② 浮点解释：毫米 float 与 米 float 两种都试
+            if (!是X && !是Z) {
+                if (绝对值f(f) > 500.0f && 绝对值f(f - (float)真X) < 0.6f) {
+                    是X = true; snprintf(型, sizeof(型), "f%.1f", (double)f);
+                } else if (绝对值f(f) > 500.0f && 绝对值f(f - (float)真Z) < 0.6f) {
+                    是Z = true; snprintf(型, sizeof(型), "f%.1f", (double)f);
+                } else if (绝对值f(f) > 0.5f && 绝对值f(f * 1000.0f - (float)真X) < 6.0f) {
+                    是X = true; snprintf(型, sizeof(型), "f%.2f", (double)f);
+                } else if (绝对值f(f) > 0.5f && 绝对值f(f * 1000.0f - (float)真Z) < 6.0f) {
+                    是Z = true; snprintf(型, sizeof(型), "f%.2f", (double)f);
+                }
+            }
+            if (!是X && !是Z) continue;
+            if (是X && 猎2X层 < 0) { 猎2X层 = t; 猎2X偏 = o; 猎2X型 = 型[0]; }
+            if (是Z && 猎2Z层 < 0) { 猎2Z层 = t; 猎2Z偏 = o; 猎2Z型 = 型[0]; }
+            位 += snprintf(串 + 位, sizeof(串) - 位, "%s+0x%x=%s%s ",
+                           层名[t], o, 型, 是X ? (是Z ? "(XZ)" : "(X)") : "(Z)");
+            ++命中;
+        }
+    }
+    日志("猎2 %d 我=k%d 真(%d,%d) 距心%.0f 命中%d: %s",
+         猎2计, 我槽, 真X, 真Z, 我距, 命中, 命中 ? 串 : "无");
+}
+
+// 邻域变化：不管单位是什么，实时位置一定「每帧在变且单步幅度小」。每 5 秒对比一次。
+static unsigned char 邻前[12][0x8000];
+static int  邻长[12] = {0};
+static bool 邻就绪[24] = {false};
+static int  邻计 = 0;
+static void __attribute__((unused)) 邻域变化(uint64_t 数组, int 数量) {
+    if (邻计 >= 100) return;
+    static double 上次 = 0.0;
+    const double 现时 = CACurrentMediaTime();
+    if (现时 - 上次 < 5.0) return;
+    上次 = 现时;
+    ++邻计;
+    for (int k = 0; k < 数量 && k < 12; ++k) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (!IsValidAddr(e)) { 邻就绪[k] = false; continue; }
+        int 实长 = 0x8000;
+        while (实长 >= 0x400 && !readMemory(e, 猎2缓冲, 实长)) 实长 /= 2;
+        if (实长 < 0x400) { 邻就绪[k] = false; continue; }
+        if (!邻就绪[k] || 邻长[k] != 实长) {
+            memcpy(邻前[k], 猎2缓冲, 实长);
+            邻长[k] = 实长;
+            邻就绪[k] = true;
+            continue;
+        }
+        char 串[560] = {0}; int 位 = 0, 条 = 0;
+        for (int o = 0; o + 4 <= 实长 && 条 < 6; o += 4) {
+            int a, b;
+            memcpy(&a, 邻前[k] + o, 4);
+            memcpy(&b, 猎2缓冲 + o, 4);
+            if (a == b) continue;
+            if (b <= -110000 || b >= 110000) continue;
+            long long d = (long long)b - (long long)a;
+            if (d < 0) d = -d;
+            if (d < 50 || d > 6000) continue;
+            位 += snprintf(串 + 位, sizeof(串) - 位, "+0x%x %d->%d ", o, a, b);
+            ++条;
+        }
+        memcpy(邻前[k], 猎2缓冲, 实长);
+        日志("邻 %d k=%d 阵=%d 变%d: %s", 邻计, k, vm_read<int>(e + 52), 条, 条 ? 串 : "无");
+    }
+}
+
+// ==================== v52：层邻 —— 逐帧扫 一/二/三 三层，找「每帧都在动」的坐标字段 ====================
+// 依据 _ab_v51.log（21:47:34~21:53 联机局）：
+//  (1) 21:49:01~21:49:26（快照 4~9）A 组与 B 组逐采样完全相同，k1 从 (53395,56435) 连续跑到
+//      (3741,3972)，五个采样点线性下降 —— 这是真位置，也正是打离线人机时的状态；
+//  (2) 21:49:30 f=2888 同一帧，k1/k3/k8/k6 四个槽同时跳，A≠B，B 从此冻结在分叉瞬间的值
+//      （k1 的 B=(2649,2586) 整局一动不动），A 每 34~40 帧整块换成另一个位置；
+//  (3) 环 dump 1480 个样本：k1 有 5 段「34 帧一字未变」、2 段「40 帧一字未变」，
+//      而 k3 有 9 段只有 3 帧 —— 假值卡住不动、真值每帧微动，这是可以用来自动判别的指纹；
+//  (4) 实体本体 0x8000 内没有任何「变了 + 界内 + 单步 50~6000」的 X/Z 联动（450 行全是
+//      每次 +76 的计时器和 ±1000 的方向分量）→ 本体里没有实时坐标；
+//  (5) 链中间：k5 的链读末址 2c1c55c40 = k3 的「二」2c1c55c14 + 0x2C，所以 21:49:56 两槽读出
+//      完全相同的 (56368,53358) 不是巧合 —— k5 二读失败退化到链读，正好读到 k3 的字段。
+// 缺口：v51 只扫了实体本体，没扫 一/二/三。而游戏能把人画得平滑，必然存在一个「每帧更新」的
+// 位置。本探针就去这三层里找它：只统计「变了 + 新旧都界内 + 单步 1~3000」的偏移，
+// 每 5 秒按命中次数出一张 top 榜。10Hz 采样，纯读，不参与绘制。
+#define 层邻层数 3
+static const int   层长表[层邻层数] = {0x6000, 0x3000, 0x2000};   // 一 / 二 / 三
+static const char* 层名表[层邻层数] = {"一", "二", "三"};
+#define 层邻半长 0x1800
+static unsigned short 层次[层邻层数][层邻半长];
+static int            层旧[层邻层数][层邻半长];
+static int            层新[层邻层数][层邻半长];
+static unsigned char  层今[0x6000];
+static unsigned char  层前[4][层邻层数][0x6000];
+static bool           层有前[4][层邻层数];
+static int            层实长[4][层邻层数];
+static unsigned       层上帧 = 0;
+static int            层轮数 = 0;
+static int            层汇总计 = 0;
+
+static void 层邻汇总(void) {
+    ++层汇总计;
+    for (int t = 0; t < 层邻层数; ++t) {
+        char 串[600] = {0};
+        int 位 = 0, 打 = 0;
+        bool 用过[层邻半长];
+        memset(用过, 0, sizeof(用过));
+        while (打 < 8) {
+            int 最好 = -1, 最次 = 0;
+            for (int o = 0; o < 层邻半长; ++o) {
+                if (用过[o]) continue;
+                if (层次[t][o] > 最次) { 最次 = 层次[t][o]; 最好 = o; }
+            }
+            if (最好 < 0) break;
+            用过[最好] = true;
+            位 += snprintf(串 + 位, sizeof(串) - 位, "+0x%x %d/%d %d->%d  ",
+                         最好 * 4, (int)层次[t][最好], 层轮数, 层旧[t][最好], 层新[t][最好]);
+            ++打;
+        }
+        日志("层频 %d %s %s", 层汇总计, 层名表[t], 打 ? 串 : "无");
+    }
+}
+
+static void __attribute__((unused)) 层邻(uint64_t 数组, int 数量) {
+    if (层上帧++ % 6 != 0) return;                 // 10Hz 采样
+    if (层汇总计 >= 400) return;
+
+    uint64_t 实体[4] = {0, 0, 0, 0};
+    int n = 0;
+    for (int k = 0; k < 数量 && n < 4; ++k) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (IsValidAddr(e)) 实体[n++] = e;
+    }
+    if (n == 0) return;
+    ++层轮数;
+
+    static double 上次汇总 = 0.0;
+    const double 现时 = CACurrentMediaTime();
+    if (现时 - 上次汇总 >= 5.0) {
+        上次汇总 = 现时;
+        层邻汇总();
+    }
+
+    for (int i = 0; i < n; ++i) {
+        uint64_t 一 = vm_read<uint64_t>(实体[i] + 0xa8);
+        if (!IsValidAddr(一)) continue;
+        uint64_t 二 = vm_read<uint64_t>(一 + 0x10);
+        uint64_t 三 = IsValidAddr(二) ? vm_read<uint64_t>(二 + 0x0) : 0;
+        uint64_t 层址[层邻层数] = {一, 二, 三};
+
+        for (int t = 0; t < 层邻层数; ++t) {
+            if (!IsValidAddr(层址[t])) continue;
+            int 实长 = 层长表[t];
+            while (实长 >= 0x400 && !readMemory(层址[t], 层今, 实长)) 实长 /= 2;
+            if (实长 < 0x400) continue;
+            if (!层有前[i][t] || 层实长[i][t] != 实长) {
+                memcpy(层前[i][t], 层今, 实长);
+                层实长[i][t] = 实长;
+                层有前[i][t] = true;
+                continue;
+            }
+            for (int o = 0; o + 4 <= 实长; o += 4) {
+                int a, b;
+                memcpy(&a, 层前[i][t] + o, 4);
+                memcpy(&b, 层今 + o, 4);
+                if (a == b) continue;
+                if (a <= -60000 || a >= 60000) continue;   // 两端都要像坐标
+                if (b <= -60000 || b >= 60000) continue;
+                if (a == 0 || b == 0) continue;             // 0 是初始化，不是位置
+                long long d = (long long)b - (long long)a;
+                if (d < 0) d = -d;
+                if (d < 1 || d > 3000) continue;            // 单步 1~3 米
+                const int 格 = o / 4;
+                if (层次[t][格] < 65535) 层次[t][格]++;
+                层旧[t][格] = a; 层新[t][格] = b;
+            }
+            memcpy(层前[i][t], 层今, 实长);
+        }
+    }
+}
+
+// ==================== v39：锁定实体逐帧坐标序列 ====================
+// 扫描候选表要 20 秒才出，先打 200 帧原始序列，肉眼就能看出「交替」的周期，
+// 以及交替两组值里哪一组在连续。
 static uint64_t 序列键 = 0;
 static int      序列计 = 0;
 static void 记坐标序列(int k, uint64_t 实体, unsigned 原X, unsigned 原Z, int 链号,
@@ -4428,9 +5418,7 @@ static int 读野怪(uint64_t 模块, 野怪信息* 输出, int 上限) {
         if (!IsValidAddr(怪)) continue;
         int x = vm_read<int>(怪 + SDK::坐标X);
         int z = vm_read<int>(怪 + SDK::坐标Y);
-        // v78：收紧。单轴为 0 是「一半读失败」的典型垃圾（零与真值混装）→ 直接丢；
-        // 世界半程 ±103500，±115000 之外不可能是野怪（旧 ±200000 太松）。
-        if (x < -115000 || x > 115000 || z < -115000 || z > 115000 || !x || !z) continue;
+        if (x < -200000 || x > 200000 || z < -200000 || z > 200000 || (!x && !z)) continue;
         int cd = vm_read<int>(怪 + SDK::技能CD);
         int hp = vm_read<int>(怪 + 484);   // 野怪刷新原始值（0x1E4）
         if (hp <= 0 || hp > 600000) continue;
@@ -4442,110 +5430,6 @@ static int 读野怪(uint64_t 模块, 野怪信息* 输出, int 上限) {
         m.刷新 = hp / 1000 + 3;
     }
     return 数;
-}
-
-// ==================== v78：野怪营地本地计时状态机 ====================
-// 乱跳根因：怪对象 +0x240（技能CD）每帧直读直画，该字段在存活态常是乱值
-// （对象回收/字段并非重生计时），0.13 秒内数字全变随机值（24→58→74…）。
-// JS 原版（绘制.original.js L6583）与小美绘制.mm 都是「本地倒计时」：
-//   数字 = 死亡时刻 + 间隔 − 现在，绝不在每帧内存里读倒计时。
-// 这里按「营地位置键」（营地固定不动）建状态机，数字只在两种硬证据下出现：
-//   ① cd 字段连续 ≥10 帧非增、且总降幅 ≤ 实时 3 倍（乱值做不到单调）→ 锁定，
-//      显示平滑跟随的读数；读数一旦离谱只走本地倒数；
-//   ② 营地从数组里消失（曾连续在场 ≥15 帧、连失 ≥12 帧）→ 按本地死亡时刻+间隔倒数；
-//   其余一切情况画洋红点（存活样式）。刷新间隔首周期默认 75s，之后按实测学习。
-struct 营地槽 {
-    bool   用;
-    bool   本帧见;
-    int    世X, 世Z, 阵营;
-    int    态;            // 0 = 点（存活/未知）；1 = 数字（重生读秒）
-    int    单调帧, 连见帧, 消失帧, 存活帧;
-    double 上原始;        // 上帧原始剩余秒（-1 = 无效）
-    double 连起值, 连起时; // 单调段起点（判降幅用）
-    double 锁定值, 死时, 间隔, 显示剩余, 见时;
-};
-static 营地槽 营地表[24];
-static int   营地数 = 0;
-
-static 营地槽* 营地取(int x, int z) {
-    for (int i = 0; i < 营地数; ++i) {
-        long long dx = (long long)营地表[i].世X - x, dz = (long long)营地表[i].世Z - z;
-        if (dx * dx + dz * dz <= 2500LL * 2500LL) return &营地表[i];
-    }
-    if (营地数 >= 24) return NULL;
-    营地槽* s = &营地表[营地数++];
-    s->用 = true; s->本帧见 = false;
-    s->世X = x; s->世Z = z; s->阵营 = 0; s->态 = 0;
-    s->单调帧 = s->连见帧 = s->消失帧 = s->存活帧 = 0;
-    s->上原始 = -1.0; s->连起值 = 0; s->连起时 = 0;
-    s->锁定值 = 0; s->死时 = 0; s->间隔 = 0; s->显示剩余 = 0; s->见时 = 0;
-    return s;
-}
-
-// 每帧喂一次。raw = cd 字段原始剩余秒（cd/1000）；raw < 0 表示本帧没读到该营地。
-static void 营地喂(营地槽* s, double raw, double now) {
-    if (!s || !s->用) return;
-    if (raw >= 0.0) {
-        s->见时 = now;
-        s->消失帧 = 0;
-        if (++s->连见帧 > 1000000) s->连见帧 = 1000000;
-        const bool 合理 = (raw > 2.0 && raw < 595.0);
-        if (合理) {
-            // 单调段：非增（允许 0.7s 抖动）且总降幅 ≤ 实时 3 倍 + 2s 容差
-            if (s->上原始 > 2.0 && raw <= s->上原始 + 0.7) {
-                double 降 = s->连起值 - raw;
-                double 历时 = now - s->连起时;
-                if (降 <= 3.0 * 历时 + 2.0) s->单调帧++;
-                else { s->单调帧 = 1; s->连起值 = raw; s->连起时 = now; }
-            } else {
-                s->单调帧 = 1; s->连起值 = raw; s->连起时 = now;
-            }
-            s->上原始 = raw;
-            if (s->态 == 0) {
-                if (s->单调帧 >= 10) {
-                    s->态 = 1;
-                    s->锁定值 = raw; s->死时 = now; s->显示剩余 = raw;
-                }
-            } else {
-                double 本地 = s->锁定值 - (now - s->死时);
-                if (raw - 本地 > -6.0 && raw - 本地 < 6.0) {
-                    s->显示剩余 = s->显示剩余 * 0.5 + raw * 0.5;
-                    s->锁定值 = s->显示剩余; s->死时 = now;
-                } else {
-                    s->显示剩余 = 本地;   // 读数离谱：只走本地倒数
-                }
-            }
-            s->存活帧 = 0;
-        } else {
-            s->上原始 = -1.0; s->单调帧 = 0;
-            if (raw <= 2.0) {
-                // cd 字段回零 = 存活证据；连续 3 帧确认 → 回点，并学习刷新间隔
-                if (s->态 == 1 && ++s->存活帧 >= 3) {
-                    double 用时 = now - s->死时;
-                    if (用时 > 40.0 && 用时 < 300.0) s->间隔 = 用时;
-                    s->态 = 0; s->显示剩余 = 0;
-                }
-            } else if (s->态 == 1) {
-                s->显示剩余 = s->锁定值 - (now - s->死时);
-            }
-        }
-    } else {
-        // 本帧没读到：曾连续在场的营地突然消失 ≥12 帧（≈0.2s）→ 认死亡
-        if (++s->消失帧 == 12) {
-            if (s->态 == 0 && s->连见帧 >= 15 && s->见时 > 0.0 && now - s->见时 < 2.0) {
-                s->态 = 1;
-                s->死时 = now;
-                s->锁定值 = (s->间隔 > 0.0) ? s->间隔 : 75.0;
-                s->显示剩余 = s->锁定值;
-            }
-        }
-        if (s->消失帧 > 12) s->连见帧 = 0;
-        if (s->态 == 1) s->显示剩余 = s->锁定值 - (now - s->死时);
-    }
-    // 读完（含消失分支）统一收尾：倒数走完 → 回点
-    if (s->态 == 1 && s->显示剩余 <= 0.0) {
-        if (s->显示剩余 < -4.0) { s->态 = 0; s->显示剩余 = 0; }
-    }
 }
 
 // 世界半程：世界坐标取 ±世界半程 时正好落在小地图矩形边界上。
@@ -4648,35 +5532,6 @@ static void 底部文字(const ImVec2& 屏, const char* 文案) {
     });
 }
 
-// v75：帧内时间预算 —— 诊断/扫描机器超过 4ms 就让位，下一帧再跑。
-// 游戏数据开始流动后，全槽对比/我方自检/整局快照/锚扫描/找位扫/倒数扫描
-// 全在主线程渲染帧里做海量读，叠加起来足以把触摸事件饿死（悬浮球点不动）。
-// 这些都是诊断/学习通路，宁可少采一帧，不能卡住交互。
-static inline bool 帧超预算(double 帧起) {
-    return CACurrentMediaTime() - 帧起 > 0.004;
-}
-
-// v77：游戏被系统挂起（切回桌面/别的 app 后系统 task_suspend 冻结游戏）
-// 就整帧空转：不读实体、不跑扫描、不刷倒数。旧逻辑不管游戏在不在前台都按
-// 60fps 全速读它 —— 人不在游戏里 HUD 还在烧 CPU 读内存，整机发卡。
-// suspend_count>0 即挂起；拿不到任务端口/查询失败按"没挂起"处理，保持原行为。
-static bool 游戏被挂起() {
-    static double 上次查 = 0;
-    static bool 缓 = false;
-    double now = CACurrentMediaTime();
-    if (now - 上次查 < 0.5) return 缓;
-    上次查 = now;
-    缓 = false;
-    mach_port_t 端口 = 任务端口;
-    if (端口 == MACH_PORT_NULL) return 缓;
-    struct task_basic_info info;
-    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
-    if (task_info(端口, TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS) {
-        缓 = (info.suspend_count > 0);
-    }
-    return 缓;
-}
-
 // ==================== 主渲染 ====================
 
 void Draw::StartBooks() {
@@ -4687,7 +5542,6 @@ void Draw::StartBooks() {
 
     读限流计数 = 0;
     double now = CACurrentMediaTime();
-    const double 帧起 = now;   // v75：帧内时间预算基准（见 帧超预算）
 
     // 缩放系数 = 逻辑短边 / 物理短边
     CGRect 物理屏 = [UIScreen mainScreen].bounds;
@@ -4738,7 +5592,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v79 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v72 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -4768,12 +5622,6 @@ void Draw::StartBooks() {
     if (!模块基址) {
         状态浮层(2, "没拿到模块基址");
         底部文字(屏, "等待进入对局");
-        return;
-    }
-
-    // v77：游戏在后台被挂起 → 空转这一帧。绘制层随之空白（ESP 不会画到
-    // 桌面/别的 app 上），悬浮球不受影响，回到游戏自动恢复。
-    if (游戏被挂起()) {
         return;
     }
 
@@ -4828,10 +5676,10 @@ void Draw::StartBooks() {
         return;
     }
 
-    // v70：ActorManager 坐标链刷新（2Hz）
+    // v72：ActorManager 坐标链改为每帧刷新（原 2Hz 会让框最多落后 0.5 秒）
     {
         static double 上次AM刷 = 0;
-        if (now - 上次AM刷 > 0.5) {
+        if (now - 上次AM刷 > 0.0) {
             上次AM刷 = now;
             AM刷新();
         }
@@ -4865,10 +5713,10 @@ void Draw::StartBooks() {
                 for (int i = 0; i < 数量 && i < 3; ++i) {
                     uint64_t e = vm_read<uint64_t>(数组 + 24ULL * i);
                     unsigned eid = 无雾找ID(e);
-                    位 = 追加(行, sizeof(行), 位, "e%d=%llx/id=%u ", i, e, eid);
+                    位 += snprintf(行 + 位, sizeof(行) - 位, "e%d=%llx/id=%u ", i, e, eid);
                 }
                 for (int i = 0; i < 无雾数 && i < 3; ++i) {
-                    位 = 追加(行, sizeof(行), 位, "| n%d=%llx/id=%u ", i, 无雾表[i].演员, 无雾表[i].id);
+                    位 += snprintf(行 + 位, sizeof(行) - 位, "| n%d=%llx/id=%u ", i, 无雾表[i].演员, 无雾表[i].id);
                 }
                 日志("无雾对照 %s", 行);
             }
@@ -4940,36 +5788,72 @@ void Draw::StartBooks() {
     // 曾误传 cfg_mapX*缩放，导致坐标被乘两次，所有图标飞出小地图 3 倍远。
     ImVec4 地图 = ImVec4(cfg_mapX, cfg_mapY, cfg_mapSize, cfg_mapSize);
 
-    // ===== v28 倒数扫描学习态 =====
-    // 候选台：扫一遍 命中「连降 ≥3 秒落到 0」的候选；在「站定5秒+瞬移」确认回城时
-    // 消费掉并写入 回城位偏移（v62 关掉差分块后这条学习路径被一并埋掉，这里接回来）。
+    // ===== v24 回城位标定：内存差分 + 三连确认 =====
+    // 上一版「旗标」（只列 1..12 的整数）在真实对局里一条都没抓到 —— 回城状态要么是
+    // 位标志（整数值很大，比如 0x200），要么在 +0x400 之外。
+    // 改成差分：把实体 +0x0..+0x600 整块读出来和上一次比，记录所有「变化且像状态」的字段。
+    // 并且就地做自动标定，判据三连（缺一不可）：
+    //   ① 某偏移出现 0 → N（N ≤ 64）
+    //   ② 6~10 秒后该偏移回到 0        ← 回城读条正好 8 秒
+    //   ③ 紧接着这个实体坐标瞬移 > 25000 ← 传到泉水
+    // 三条同时命中才认定，之后就能做到「按下回城立刻提示」。
+    static const int 差分长 = 0x3000;
+    static unsigned char 差分旧[24][0x3000];
+    static unsigned char 差分已记[24][0x3000 / 4];
+    static unsigned char 差分新[0x3000];
+    static bool 差分就绪[24] = {false};
+    static int 差分实长[24] = {0};
+    static uint64_t 差分键[24] = {0};
+
+    static uint64_t 标定键[24] = {0};
+    static unsigned 标定X[24] = {0}, 标定Z[24] = {0};
+    static bool 标定有[24] = {false};
+
+    // v28：倒数扫描的基准表已提到文件作用域（扫表集 / 扫前池 / 扫计池 / 扫起池），
+    // 因为子链扫描也要用同一套逻辑，放函数里没法复用。
+
+    struct 开关项 { uint64_t 实体; int 偏移; int 值; double 开时; bool 浮点; };
+    static 开关项 开关台[96];
     struct 候选项 { uint64_t 实体; int 偏移; int 值; double 关时; bool 浮点; bool 倒数; };
     static 候选项 候选台[16];
-    static int 候选指针 = 0;
+    static int 开关指针 = 0, 候选指针 = 0;
     static int 回城位偏移 = -1;
     static int 回城位值 = 0;
     static bool 回城位是浮点 = false;
     static bool 回城位是倒数 = false;      // 学到的偏移是「读条计时器」而不是开关
 
+    static double 上次差分 = 0.0;
+    static int 本拍行数 = 0;                   // 一个采样周期内最多打 12 行，防日志爆掉
+    static int 本拍浮点行 = 0;                 // 浮点单独限额，免得读条时把整数行挤没
+    const bool 做差分 = false && cfg_recall && (CACurrentMediaTime() - 上次差分 > 0.2);   // v62：差分占日志 84%，先关掉腾地方
+    if (做差分) { 上次差分 = CACurrentMediaTime(); 本拍行数 = 0; 本拍浮点行 = 0; }
+
     // v45：全槽坐标对照（纯读、纯打印；2Hz 采 10 次，挑离屏幕中心最近的槽当「我」）
-    if (!帧超预算(帧起)) 全槽对比(数组, 数量, 矩阵, 屏.x, 屏.y);   // v75：挂每帧预算
+    全槽对比(数组, 数量, 矩阵, 屏.x, 屏.y);
     // v46：我方英雄自检（相机跟人走 = 免费真值，用来判定 二+0x44 是否真的可用）
-    if (!帧超预算(帧起)) 我方自检(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);   // v75：挂每帧预算
-    // v48：整局快照（每 5 秒 10 槽 阵/组A/组B）。
-    // （v47 两跳轨迹、野怪对照、v50/51 坐标猎人/邻域变化、v52 层邻 —— 结论已消化进
-    //   槽验/两组互证，诊断机器已随代码删除，不再保留。）
-    if (!帧超预算(帧起)) 整局快照(数组, 数量);   // v75：挂每帧预算
+    我方自检(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
+    // v48：整局快照（每 5 秒 10 槽 阵/组A/组B）。v47 的两跳轨迹 400 行已打满、
+    // 只覆盖开局 5 秒、且恰好错过抖动时段，停用；野怪对照每次都「根无效」，也停用。
+    整局快照(数组, 数量);
+    // v51：猎人2（扩范围 + int32/float 三解释）+ 邻域变化（只报「变了、界内、单步 50~6000」的偏移）
+    // v52 停用：本体 0x8000 已扫完（450 行全是每次 +76 的计时器和 ±1000 的方向分量），
+    // 结论是本体里没有实时坐标，继续扫只是重复。函数保留备查。
+    // 坐标猎人2(数组, 数量, 矩阵, 屏.x, 屏.y, (unsigned)我方阵营);
+    // 邻域变化(数组, 数量);
+    // v52：改成扫 一/二/三 三层（本体里没有实时坐标，但那三层里被证实有坐标副本），
+    // 逐帧比「变了 + 新旧都界内 + 单步 1~3000」，每 5 秒出一张命中次数榜。
     // v54：屏心投影锚定 —— 相机跟随我 ⇒ 我恒投在屏幕同一像素位置。
     // 加载期用「二」把这个位置量出来当基准，整局找投影落基准 ±80px 的字段。
     // v53 的「屏心点位移」判据已废（它混了相机旋转项，见函数头注释）。
-    if (!帧超预算(帧起)) 锚扫描(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);   // v75：挂每帧预算
+    // 层邻 停用：v52 已给出结论（一/三 前 8 名全是毫秒计时器，二 只有两对副本），函数保留备查。
+    锚扫描(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
     // v67：数组性质 + 全指针可达找位（仅对局中采样，避免加载期镜头未跟随时的假锚定）
-    if (在对局 && !帧超预算(帧起)) {   // v75：挂每帧预算
+    if (在对局) {
         槽性扫(数组, 数量);
         找位扫(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
     }
     // v52：同帧 4 槽对照（每 3 帧一行，400 行封顶），用来判定「跳后的新值是否等于别的槽的旧值」。
-    if (!帧超预算(帧起)) 四槽行(数组, 数量, 帧序);   // v75：挂每帧预算
+    四槽行(数组, 数量, 帧序);
 
     // v49：帧级诊断的帧号 / 毫秒推进，以及上一帧打标记的环 dump。
     // 放在逐槽循环外，保证一轮所有槽处理完才推进一帧 —— 环里的「相邻帧」是真正的相邻绘制帧。
@@ -4977,7 +5861,6 @@ void Draw::StartBooks() {
         if (时基 == 0.0) 时基 = CACurrentMediaTime();
         ++帧序;
         for (int j = 0; j < 24; ++j) 帧位有[j] = false;   // v65：同帧去重的表每帧清空
-        本帧数 = 0;   // v78：AM直画去重表每帧清空
         毫秒计 = (unsigned)((CACurrentMediaTime() - 时基) * 1000.0);
         for (int j = 0; j < 24; ++j) {
             if (待dump[j] && 帧序 >= 待dump[j]) {
@@ -5003,13 +5886,191 @@ void Draw::StartBooks() {
             首个阵营52 = vm_read<int>(实体 + 52);
         }
 
+        // ---- 回城位标定：内存差分（5 次/秒，覆盖实体 +0x0..+0x600）----
+        // 尾部跨页读不到时自动降档（0x600→0x300→0x180→0x100），保证一定有输出。
+        if (做差分) {
+            const double 现时 = CACurrentMediaTime();
+
+            // 1) 坐标：只为抓「瞬移」那一帧。自己人也跟，标定必须从自己的回城学。
+            bool 瞬移 = false;
+            unsigned 现X = 0, 现Z = 0;
+            if (读实体坐标(k, 实体, &现X, &现Z) >= 0) {
+                if (标定键[k] != 实体) {
+                    标定键[k] = 实体;
+                    标定X[k] = 现X; 标定Z[k] = 现Z; 标定有[k] = true;
+                } else if (标定有[k]) {
+                    long long 差X = (long long)现X - (long long)标定X[k];
+                    long long 差Z = (long long)现Z - (long long)标定Z[k];
+                    if ((double)差X * 差X + (double)差Z * 差Z > 25000.0 * 25000.0) 瞬移 = true;
+                    标定X[k] = 现X; 标定Z[k] = 现Z;
+                }
+            }
+
+            // 2) 瞬移 = 一次回城收尾。看候选台里有没有「3 秒内关上、时长 6~10 秒」的开关
+            if (瞬移 && 回城位偏移 < 0) {
+                for (int i = 0; i < 16; ++i) {
+                    if (候选台[i].实体 != 实体 || 候选台[i].值 == 0) continue;
+                    if (现时 - 候选台[i].关时 > 3.0) continue;
+                    // v27 的教训：整数开关那条路会把坐标噪声（实体+0x1160 0→71→0）学成
+                    // 「回城位」，横幅从此全是假的。v28 起只认倒数型候选。
+                    if (!候选台[i].倒数) continue;
+                    回城位偏移 = 候选台[i].偏移;
+                    回城位值 = 候选台[i].值;
+                    回城位是浮点 = 候选台[i].浮点;
+                    回城位是倒数 = 候选台[i].倒数;
+                    日志("★学到回城位 实体+0x%x 值=%d 类型=%s 瞬移距关=%.1fs k=%d",
+                         回城位偏移, 回城位值,
+                         回城位是倒数 ? (回城位是浮点 ? "浮点读条" : "毫秒读条") : "整数开关",
+                         现时 - 候选台[i].关时, k);
+                    break;
+                }
+            }
+
+            // 3) 全字段差分
+            if (差分键[k] != 实体) {          // 槽位换人了，旧快照作废
+                差分键[k] = 实体;
+                差分就绪[k] = false;
+                memset(差分已记[k], 0xFF, sizeof(差分已记[k]));
+            }
+            int 试长 = 差分实长[k] > 0 ? 差分实长[k] : 差分长;
+            bool 读到 = readMemory(实体, 差分新, 试长);
+            if (!读到) {
+                for (int 备 = 试长 / 2; 备 >= 0x100; 备 /= 2) {
+                    if (readMemory(实体, 差分新, 备)) {
+                        试长 = 备; 差分实长[k] = 备; 读到 = true;
+                        break;
+                    }
+                }
+            }
+            if (读到) {
+                if (差分就绪[k]) {
+                    int 记数 = 0, 省略 = 0;
+                    for (int o = 0; o + 4 <= 试长; o += 4) {
+                        int 旧值, 新值;
+                        memcpy(&旧值, 差分旧[k] + o, 4);
+                        memcpy(&新值, 差分新 + o, 4);
+                        if (旧值 == 新值) continue;
+
+                        // 台账：0→N 记开，N→0 记关并算时长（6~10 秒的进候选台）
+                        // v25：阈值 64 → 4096，位标志（0x200/0x800）现在也能进台账
+                        if (旧值 == 0 && 新值 > 0 && 新值 <= 4096) {
+                            int 位 = -1;
+                            for (int i = 0; i < 96; ++i)
+                                if (开关台[i].实体 == 实体 && 开关台[i].偏移 == o) { 位 = i; break; }
+                            if (位 < 0) { 位 = 开关指针; 开关指针 = (开关指针 + 1) % 96; }
+                            开关台[位].实体 = 实体; 开关台[位].偏移 = o;
+                            开关台[位].值 = 新值; 开关台[位].开时 = 现时;
+                            开关台[位].浮点 = false;
+                        } else if (旧值 > 0 && 旧值 <= 4096 && 新值 == 0) {
+                            for (int i = 0; i < 96; ++i) {
+                                if (开关台[i].实体 != 实体 || 开关台[i].偏移 != o) continue;
+                                double 时长 = 现时 - 开关台[i].开时;
+                                if (时长 >= 5.5 && 时长 <= 11.5) {
+                                    候选台[候选指针].实体 = 实体;
+                                    候选台[候选指针].偏移 = o;
+                                    候选台[候选指针].值 = 旧值;
+                                    候选台[候选指针].关时 = 现时;
+                                    候选台[候选指针].浮点 = false;
+                                    候选台[候选指针].倒数 = false;
+                                    候选指针 = (候选指针 + 1) % 16;
+                                    日志("候选开关 实体+0x%x 值=%d 时长%.1fs k=%d", o, 旧值, 时长, k);
+                                }
+                                开关台[i].实体 = 0;
+                                break;
+                            }
+                        }
+
+                        const int 旧绝 = 旧值 < 0 ? -旧值 : 旧值;
+                        const int 新绝 = 新值 < 0 ? -新值 : 新值;
+                        const unsigned 异或 = (unsigned)(旧值 ^ 新值);
+                        // v25：整数阈值从 64 放宽到 4096 —— 回城状态大概率是位标志
+                        // （0x200 / 0x800 这种），旧阈值把它们全挡了。
+                        const bool 小整数 = (旧绝 <= 4096 || 新绝 <= 4096);
+                        const bool 单位 = (异或 != 0) && ((异或 & (异或 - 1)) == 0)
+                                       && (新绝 <= 0x100000);
+                        if (!小整数 && !单位) {
+                            // v25 浮点捕获（这是本轮最关键的一条）：
+                            // 回城读条本质是一个 8.0 → 0.0 的浮点计时器，按整数解读是
+                            // 0x41000000（十亿级），上一条 continue 把它当垃圾扔了 ——
+                            // 连按两次回城只捞到朝向变化，根因就在这里。
+                            // 只扫 +0x000..+0x1C0：坐标在 +0x2B8、血量对象在 +0x1D0，都在范围外，
+                            // 不会把走动产生的坐标噪音带进来。
+                            if (o < 0x1C0) {
+                                float 旧f, 新f;
+                                memcpy(&旧f, 差分旧[k] + o, 4);
+                                memcpy(&新f, 差分新 + o, 4);
+                                if (旧f == 旧f && 新f == 新f) {          // 排除 NaN
+                                    const float 新绝f = 新f < 0 ? -新f : 新f;
+                                    if (新绝f > 0.0001f && 新绝f < 12000.0f) {
+                                        float 差f = 新f - 旧f;
+                                        if (差f < 0) 差f = -差f;
+                                        if (差f > 0.5f) {                 // 整数量级才记，滤掉抖动
+                                            // 浮点台账：读条计时器是 0→8→0，和整数开关同构，
+                                            // 所以走同一张台账，只多一个「浮点」标记。
+                                            const float 旧绝f2 = 旧f < 0 ? -旧f : 旧f;
+                                            if (旧绝f2 < 0.05f && 新绝f > 0.5f) {
+                                                int 位 = -1;
+                                                for (int i = 0; i < 96; ++i)
+                                                    if (开关台[i].实体 == 实体 && 开关台[i].偏移 == o) { 位 = i; break; }
+                                                if (位 < 0) { 位 = 开关指针; 开关指针 = (开关指针 + 1) % 96; }
+                                                开关台[位].实体 = 实体; 开关台[位].偏移 = o;
+                                                开关台[位].值 = 1; 开关台[位].开时 = 现时;
+                                                开关台[位].浮点 = true;
+                                            } else if (旧绝f2 > 0.5f && 新绝f < 0.05f) {
+                                                for (int i = 0; i < 96; ++i) {
+                                                    if (开关台[i].实体 != 实体 || 开关台[i].偏移 != o) continue;
+                                                    double 时长 = 现时 - 开关台[i].开时;
+                                                    if (开关台[i].浮点 && 时长 >= 5.5 && 时长 <= 11.5) {
+                                                        候选台[候选指针].实体 = 实体;
+                                                        候选台[候选指针].偏移 = o;
+                                                        候选台[候选指针].值 = 1;
+                                                        候选台[候选指针].关时 = 现时;
+                                                        候选台[候选指针].浮点 = true;
+                                                        候选台[候选指针].倒数 = false;
+                                                        候选指针 = (候选指针 + 1) % 16;
+                                                        日志("候选开关f 实体+0x%x 峰值%.2f 时长%.1fs k=%d",
+                                                             o, 旧f, 时长, k);
+                                                    }
+                                                    开关台[i].实体 = 0;
+                                                    break;
+                                                }
+                                            }
+                                            if (本拍浮点行 < 6 && 本拍行数 < 16) {
+                                                日志("差分f k=%d 阵=%d +0x%03x %.2f->%.2f",
+                                                     k, 阵营, o, 旧f, 新f);
+                                                ++本拍浮点行; ++本拍行数;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            continue;      // 整数条件不成立；浮点分支已在上面处理
+                        }
+                        const unsigned char 码 = (unsigned char)(新值 < 0 ? 0 : (新值 > 254 ? 254 : 新值));
+                        if (差分已记[k][o >> 2] == 码) continue;   // 同值不重复刷
+                        差分已记[k][o >> 2] = 码;
+                        if (记数 < 8 && 本拍行数 < 12) {
+                            日志("差分 k=%d 阵=%d +0x%03x %d->%d", k, 阵营, o, 旧值, 新值);
+                            ++本拍行数;
+                        } else {
+                            ++省略;
+                        }
+                        ++记数;
+                    }
+                    if (省略) 日志("差分 k=%d 阵=%d 另有 %d 条变化省略", k, 阵营, 省略);
+                }
+                memcpy(差分旧[k], 差分新, 试长);
+                差分就绪[k] = true;
+            } else {
+                差分就绪[k] = false;   // 这一帧读不到，下次重新建基准
+            }
+        }
 
         // ---- v28 倒数扫描（1Hz）：本体 16KB + 最多 4 条子链各 8KB ----
         // v27 只扫了本体 12KB、只认浮点，结果 0 条 —— 实体里没有 8→0 的浮点读条。
         // v28 一次读、两种解释（float / 毫秒整数），并且顺着实体里的堆指针
-        // 把组件对象也扫一遍。命中「连降 ≥3 秒且落到 0」就写进 候选台，
-        // 由「站定+瞬移」确认后锁存为 回城位偏移（见下方 ★回城位学习）。
-        if (cfg_recall && 回城位偏移 < 0 && !帧超预算(帧起)) {   // 学到之后就不用再每秒扫 48KB 了
+        // 把组件对象也扫一遍。命中「连降 ≥3 秒且落到 0」就回传，交给候选台/瞬移定标。
+        if (cfg_recall) {
             const double 现时2 = CACurrentMediaTime();
             if (扫实体键[k] != 实体) 扫绑定(k, 实体);
             for (int t = 0; t <= 扫子数; ++t) {
@@ -5033,6 +6094,8 @@ void Draw::StartBooks() {
 
         if (阵营 == (int)我方阵营) { if (k < 24) 槽阵跳[k]++; continue; }
 
+        // v41：自标定挪到「链读之后」，直接复用已经读到的坐标算活度，不额外增加系统调用
+
         int 血当前 = 读血量当前(实体);
         int 血上限 = 读血量上限(实体);
         int 原始上限 = (血上限 > 0 && 血上限 < 2000000) ? 血上限 : 0;  // 给槽位锁定用，别被下面的兜底 1 污染
@@ -5051,12 +6114,15 @@ void Draw::StartBooks() {
 
         unsigned 样X = 0, 样Z = 0;
         int 链 = 读实体坐标(k, 实体, &样X, &样Z);
+        // v69 诊断：统计无雾命中
+        if (链 == 5) { static int 无雾命中计 = 0; ++无雾命中计; }
         写环(k);            // v49：成功失败都记 —— 「读不到」本身就是这次要查的东西
         if (链 < 0 || 样X == 1000000) { if (k < 24) 槽无跳[k]++; continue; }
         const unsigned 原X = 样X, 原Z = 样Z;   // 原始值留着做诊断
         记坐标序列(k, 实体, 原X, 原Z, 链, 上次直X, 上次直Z, 上次直有);
-        // v46 自标定扫描已彻底删除（坐标已在 v43/v44 定位到 二+0x44，扫了也是白烧系统调用）
-        稳定坐标(k, &样X, &样Z);                // v59 起纯透传，门控只在 槽验 一处
+        // v46：自标定扫描已停用 —— 坐标已在 v43/v44 定位到 二+0x44，继续扫只是白烧系统调用
+        // （每 3 帧 4 对象 × 2KB），留着代码只为回溯。
+        稳定坐标(k, &样X, &样Z);                // 见下：新数据源若连续，稳定压计应为 0
 
         // v65：同帧坐标去重。两个槽读到同一个点（<400 世界单位）时只让槽号小的那个画。
         // 依据 _ab_v64.log：k1 与 k3 是不同对象，组A 从 09:29:48 起 12/12 完全相同。
@@ -5072,8 +6138,6 @@ void Draw::StartBooks() {
             if (k < 24) { 帧位X[k] = 样X; 帧位Z[k] = 样Z; 帧位有[k] = true; }
             if (重复) { if (k < 24) 槽重跳[k]++; continue; }
         }
-        // v78：记入「本帧已画」表，AM直画对同一实体不再补画（双影 = 乱跳观感）
-        if (本帧数 < 24) 本帧体[本帧数++] = 实体;
 
         // v34 诊断：世界坐标帧间位移。一帧 16ms 英雄最多走几百单位，
         // 超过 3000 只可能是脏读/链跳。同时记录本窗口最大值（不看阈值）。
@@ -5168,15 +6232,11 @@ void Draw::StartBooks() {
             轨.上X = (int)样X; 轨.上Z = (int)样Z;
             轨.静止起 = 现在时; 轨.确认到 = 0.0; 轨.候选 = false;
         }
-        bool 回城瞬移 = false;
         {
             long long 移X = (long long)样X - 轨.上X, 移Z = (long long)样Z - 轨.上Z;
             double 位移2 = (double)移X * 移X + (double)移Z * 移Z;
             if (位移2 > 25000.0 * 25000.0) {
-                if (现在时 - 轨.静止起 >= 5.0) {   // 站定够了才瞬移 = 回城
-                    轨.确认到 = 现在时 + 6.0;
-                    回城瞬移 = true;
-                }
+                if (现在时 - 轨.静止起 >= 5.0) 轨.确认到 = 现在时 + 6.0;   // 站定够了才瞬移 = 回城
                 轨.静止起 = 现在时;
             } else if (位移2 > 300.0 * 300.0) {
                 轨.静止起 = 现在时;                                        // 在走 = 不是回城
@@ -5186,26 +6246,6 @@ void Draw::StartBooks() {
         }
         const bool 轨迹确认 = (现在时 < 轨.确认到);
         const bool 轨迹候选 = 轨.候选;
-
-        // ★回城位学习（接回 v62 断掉的那条链）：v62 把内存差分块用 false && 关掉时，
-        // 「候选台 → 回城位偏移」的学习路径被一并埋在里面 —— 倒数扫描照旧写候选台，
-        // 但没人消费，回城位偏移 整局停在 -1，学到回城 恒假，横幅一次都不亮。
-        // 判据沿用当年的三连：倒数型候选 + 「站定≥5秒+瞬移」确认 + 距候选关闭 ≤3 秒。
-        if (回城瞬移 && 回城位偏移 < 0) {
-            for (int i = 0; i < 16; ++i) {
-                if (候选台[i].实体 != 实体 || !候选台[i].倒数 || 候选台[i].值 == 0) continue;
-                if (现在时 - 候选台[i].关时 > 3.0) continue;
-                回城位偏移 = 候选台[i].偏移;
-                回城位值 = 候选台[i].值;
-                回城位是浮点 = 候选台[i].浮点;
-                回城位是倒数 = true;
-                日志("★学到回城位 实体+0x%x 起值=%d 类型=%s 距关=%.1fs k=%d",
-                     回城位偏移, 回城位值,
-                     回城位是浮点 ? "浮点读条" : "毫秒读条",
-                     现在时 - 候选台[i].关时, k);
-                break;
-            }
-        }
 
         int 回城来源 = 读回城来源(实体);
         // v24：轨迹判定（站定 5 秒 + 瞬移 > 25000）本质上是「已经传到泉水了」才成立，
@@ -5347,7 +6387,7 @@ void Draw::StartBooks() {
 
         // 屏内：射线点 + 方框 + 血条 + 头像 + 文字
         if (cfg_line && 屏内) {
-            画线(0xFF00FFFF, 屏.x * 0.5f, 屏.y * 0.5f, sx, sy - 6.0f * 缩放, 1.0f * 缩放);   // v76：射线加细（2.0→1.0）
+            画线(0xFF00FFFF, 屏.x * 0.5f, 屏.y * 0.5f, sx, sy - 6.0f * 缩放, 2.0f * 缩放);
             画实心圆(0xFF0000FF, sx, sy - 6.0f * 缩放, 4.0f * 缩放);
         }
 
@@ -5435,90 +6475,105 @@ void Draw::StartBooks() {
         野怪信息 野怪[20];
         for (int i = 0; i < 20; ++i) 野怪[i] = {0, 0, 0, 0, 0};
         野怪计 = 读野怪(模块基址, 野怪, 20);
-        double 野怪日志时 = CACurrentMediaTime();
-        // ① 喂状态机：见得到的营地喂原始读数，见不到的喂「消失」
-        for (int i = 0; i < 营地数; ++i) 营地表[i].本帧见 = false;
-        for (int m = 0; m < 野怪计; ++m) {
-            营地槽* s = 营地取(野怪[m].x, 野怪[m].z);
-            if (!s) continue;
-            s->本帧见 = true;
-            s->阵营 = 野怪[m].camp;
-            营地喂(s, (double)野怪[m].cd - 3.0, 野怪日志时);
-        }
-        for (int i = 0; i < 营地数; ++i)
-            if (营地表[i].用 && !营地表[i].本帧见) 营地喂(&营地表[i], -1.0, 野怪日志时);
-        // ② 按营地槽绘制（位置跨帧不变 → 点/数字不再跟着乱值漂）
+        // 诊断日志：3 秒一次，打印前 4 个野怪的原始世界坐标 → 小图逻辑坐标，方便对照
         static double 上次野怪日志 = 0;
+        double 野怪日志时 = CACurrentMediaTime();
         bool 打野怪日志 = (野怪日志时 - 上次野怪日志 > 3.0);
         if (打野怪日志) 上次野怪日志 = 野怪日志时;
-        for (int i = 0; i < 营地数; ++i) {
-            营地槽& s = 营地表[i];
-            if (!s.用) continue;
+        for (int m = 0; m < 野怪计; ++m) {
             // 正 / 反两种朝向各算一次：野怪阵营字段（0/1/2）到底是哪边不确定，
             // 按阵营取一路，落框外就换另一路，两路都落框外说明坐标无效，直接不画。
             float 正X = 0.0f, 正Y = 0.0f, 反X = 0.0f, 反Y = 0.0f;
-            世界转小图(s.世X, s.世Z, 1.0f, 地图, &正X, &正Y);
-            世界转小图(s.世X, s.世Z, -1.0f, 地图, &反X, &反Y);
+            世界转小图(野怪[m].x, 野怪[m].z, 1.0f, 地图, &正X, &正Y);
+            世界转小图(野怪[m].x, 野怪[m].z, -1.0f, 地图, &反X, &反Y);
             float mx, my;
-            if (阵营符号(s.阵营) > 0.0f) { mx = 正X; my = 正Y; }
-            else                           { mx = 反X; my = 反Y; }
+            if (阵营符号(野怪[m].camp) > 0.0f) { mx = 正X; my = 正Y; }
+            else                                { mx = 反X; my = 反Y; }
             if (!在框内(地图, mx, my)) {
                 if (在框内(地图, 正X, 正Y))      { mx = 正X; my = 正Y; }
                 else if (在框内(地图, 反X, 反Y)) { mx = 反X; my = 反Y; }
                 else continue;
             }
+            // 全部野怪都记（原来只记前 4 个，导致截图里能看到的点没法逐个配对）
+            if (打野怪日志)
+                日志("野怪%d 世=(%d,%d) 阵=%d → 图=(%.1f,%.1f) 框=(%.1f,%.1f,%.1f) 缩=%.2f",
+                     m, 野怪[m].x, 野怪[m].z, 野怪[m].camp, mx, my,
+                     cfg_mapX, cfg_mapY, cfg_mapSize, 缩放);
+            // 缩放校正：v23 起「小图比例」已经在 世界转小图() 里统一乘过了，
+            // 这里再乘一次会变成平方 —— 删掉。
+            // 面板「野怪点位对齐微调」：手动平移，单位是逻辑点，最后一起乘缩放
             if (cfg_monsteroff_on) {
                 mx += cfg_monsterOffX;
                 my += cfg_monsterOffY;
             }
             mx *= 缩放;
             my *= 缩放;
-            // v76 语义保持：点与倒计时互斥。v78：数字只认状态机的硬证据，
-            // 其余画点 —— 存活/未知/垃圾一律点，被刷读秒才是数字。
-            if (s.态 == 1 && s.显示剩余 > 0.0) {
+            if (野怪[m].cd > 0 && 野怪[m].cd < 野怪[m].刷新 && 野怪[m].cd <= 600) {
                 char 秒串[16];
-                int 秒 = (int)(s.显示剩余 + 0.999);
-                if (秒 > 999) 秒 = 999;
-                snprintf(秒串, sizeof(秒串), "%d", 秒);
-                画文字(mx, my, 秒串, 0xFFFFFFFF, true, true);   // 数字占住点位
+                snprintf(秒串, sizeof(秒串), "%d", 野怪[m].cd);
+                画实心圆(0xFFFF00FF, mx, my, 3.0f * 缩放);   // 洋红底点：和游戏原生绿苗区分开
+                画文字(mx, my - 10.0f * 缩放, 秒串, 0xFFFFFFFF, true);
             } else {
-                画实心圆(0xFFFF00FF, mx, my, 3.0f * 缩放);   // 洋红底点
+                画实心圆(0xFFFF00FF, mx, my, 3.0f * 缩放);
             }
-            if (打野怪日志)
-                日志("营地%d 世=(%d,%d) 阵=%d 态=%d 剩=%.1f 单调=%d 连见=%d 图=(%.1f,%.1f)",
-                     i, s.世X, s.世Z, s.阵营, s.态, s.显示剩余,
-                     s.单调帧, s.连见帧, mx / 缩放, my / 缩放);
         }
     }
 
-    // ==================== v71：AM 直画敌方头像（绕过老实体数组）====================
-    // 老实体数组的坐标链不可靠（组A共享/组B冻结/链读兜底绕过门控），
-    // AM（ActorManager HeroActors）的坐标是引擎内部实时值，直接用它画。
-    // 我方阵营沿用 判定我方阵营 的结果（和 AM 阵营同量纲 1/2）。
+    // ==================== v72：AM 直画敌方头像（迷雾定格 + 灰显 + 复现缓动）====================
+    // 已实测：ActorLinker.position 是明文 Vector3，迷雾期被服务器停更（整对象静止）。
+    // 所以「跳」不是坐标读错，是出雾瞬间坐标从旧值刷成新值。这里在绘制层消除跳变。
     if (cfg_map && AM好 && AM数 > 0) {
+        const float dt = BBZGUI::GetIO().DeltaTime > 0.0f ? BBZGUI::GetIO().DeltaTime : 0.016f;
+        for (int j = 0; j < AM_MAX_HERO; j++) AM痕迹[j].本帧 = false;
+
+        int 敌计 = 0, 明计 = 0, 雾计 = 0;
         for (int i = 0; i < AM数; i++) {
-            if ((int)AM表[i].阵营 == (int)我方阵营) continue;   // 我方跳过
-            int wx = AM换算(AM表[i].x);
-            int wz = AM换算(AM表[i].z);
-            // v78：去重 —— 实体循环本帧已画的敌人不再补画。
-            // 双影根因：实体循环走实时链（60fps 平滑），AM直画走 2Hz 陈旧缓存，
-            // 同一英雄画两份、位置一分一合，肉眼就是「头像乱跳」。
-            {
-                bool 已画 = false;
-                for (int j = 0; j < 本帧数 && !已画; ++j)
-                    if (本帧体[j] == AM表[i].连接器) 已画 = true;
-                if (!已画) {
-                    for (int j = 0; j < 24 && !已画; ++j) {
-                        if (!帧位有[j]) continue;
-                        long long ddx = (long long)(int)wx - (long long)(int)帧位X[j];
-                        long long ddz = (long long)(int)wz - (long long)(int)帧位Z[j];
-                        if (ddx * ddx + ddz * ddz <= 6000LL * 6000LL) 已画 = true;
-                    }
-                }
-                if (已画) continue;
+            // 阵营 0（未知）也画：宁可多画，也不让敌方整槽被误判成我方而漏掉
+            if (AM表[i].阵营 != 0 && (int)AM表[i].阵营 == (int)我方阵营) continue;
+
+            int k = -1;
+            for (int j = 0; j < AM_MAX_HERO; j++)
+                if (AM痕迹[j].有 && AM痕迹[j].编号 == AM表[i].编号) { k = j; break; }
+            if (k < 0) {
+                for (int j = 0; j < AM_MAX_HERO; j++) if (!AM痕迹[j].有) { k = j; break; }
+                if (k < 0) k = 0;
+                AM痕迹[k].有 = true;
+                AM痕迹[k].编号 = AM表[i].编号;
+                AM痕迹[k].画X = AM表[i].x; AM痕迹[k].画Z = AM表[i].z;
+                AM痕迹[k].上次X = AM表[i].x; AM痕迹[k].上次Z = AM表[i].z;
+                AM痕迹[k].隐藏起 = 0; AM痕迹[k].消失起 = 0;
             }
+            AM痕迹槽& 痕 = AM痕迹[k];
+            痕.本帧 = true;
+            痕.消失起 = 0;
+
+            bool 现可见 = (AM表[i].可见 != 0);
+            if (现可见) {
+                痕.上次X = AM表[i].x; 痕.上次Z = AM表[i].z;
+                痕.隐藏起 = 0;
+                float dx = AM表[i].x - 痕.画X, dz = AM表[i].z - 痕.画Z;
+                float 距 = sqrtf(dx * dx + dz * dz);
+                if (距 > 25.0f) {
+                    // 传送/复活这类大跳直接落位，免得拖一条横贯地图的线
+                    痕.画X = AM表[i].x; 痕.画Z = AM表[i].z;
+                } else {
+                    float 别 = 1.0f - expf(-dt * 14.0f);   // ≈0.3 秒追平
+                    痕.画X += dx * 别; 痕.画Z += dz * 别;
+                }
+                明计++;
+            } else {
+                if (痕.隐藏起 <= 0) 痕.隐藏起 = now;
+                // 定格：画坐标保持最后已知位置，不跟冻结值走
+                雾计++;
+            }
+            敌计++;
+
+            int wx = AM换算(痕.画X);
+            int wz = AM换算(痕.画Z);
+            unsigned 画阵营 = AM表[i].阵营;
+            if (画阵营 != 1 && 画阵营 != 2) 画阵营 = (我方阵营 == 1 ? 2 : 1);
             float mx = 0, my = 0;
-            小图坐标(wx, wz, (int)AM表[i].阵营, 地图, &mx, &my);
+            小图坐标(wx, wz, 画阵营, 地图, &mx, &my);
             mx *= 缩放;
             my *= 缩放;
             if (!在框内(地图, mx / 缩放, my / 缩放)) continue;
@@ -5529,20 +6584,32 @@ void Draw::StartBooks() {
             char 编号[8] = {0};
             snprintf(编号, sizeof(编号), "%d", (int)(AM表[i].编号 % 1000));
             id 英雄纹理 = [图标缓存 英雄:(int)AM表[i].编号];
-            画图标(英雄纹理, 0x80000000, 英雄纹理 ? 编号 : nullptr,
-                   mx - 图标大小 * 0.5f, my - 图标大小 * 0.5f, 图标大小);
-            画血环(0xFF00FF00, mx, my, 环半径, 1.0f, 环粗);
-            // AM 诊断：每 5 秒打一行
-            static double AM画诊时 = 0;
-            static int AM画计 = 0;
-            AM画计++;
-            if (now - AM画诊时 > 5.0) {
-                AM画诊时 = now;
-                日志("AM画 敌=%d/%d 例=(%d,%d)→(%.0f,%.0f) camp=%u id=%u",
-                     AM画计, AM数, wx, wz, mx / 缩放, my / 缩放,
-                     AM表[i].阵营, AM表[i].编号);
-                AM画计 = 0;
+            if (现可见) {
+                画图标(英雄纹理, 0x80000000, 英雄纹理 ? 编号 : nullptr,
+                       mx - 图标大小 * 0.5f, my - 图标大小 * 0.5f, 图标大小);
+                画血环(0xFF00FF00, mx, my, 环半径, 1.0f, 环粗);
+            } else {
+                // 迷雾：半透明灰 + 细环，明确表示「最后已知位置」而不是实时位置
+                画图标(英雄纹理, 0x60C8C8C8, 英雄纹理 ? 编号 : nullptr,
+                       mx - 图标大小 * 0.5f, my - 图标大小 * 0.5f, 图标大小);
+                画血环(0x88A0A0A0, mx, my, 环半径, 1.0f, 环粗 * 0.75f);
             }
+        }
+
+        // 清理：从 AM 表消失超过 1.5 秒的痕迹
+        for (int j = 0; j < AM_MAX_HERO; j++) {
+            if (!AM痕迹[j].有 || AM痕迹[j].本帧) continue;
+            if (AM痕迹[j].消失起 <= 0) AM痕迹[j].消失起 = now;
+            if (now - AM痕迹[j].消失起 > 1.5) AM痕迹[j].有 = false;
+        }
+
+        static double AM画诊时 = 0;
+        static int AM画帧计 = 0;
+        AM画帧计++;
+        if (now - AM画诊时 > 5.0) {
+            AM画诊时 = now;
+            日志("AM画 v72 敌=%d 明=%d 雾=%d n=%d inst=%#llx", 敌计, 明计, 雾计, AM数, AM实例);
+            AM画帧计 = 0;
         }
     }
 
@@ -5581,7 +6648,7 @@ void Draw::StartBooks() {
             int 位 = 0;
             for (int i = 0; i < 10 && 位 < 270; ++i) {
                 if (!槽直遥有[i] && !槽稳有[i]) continue;
-                位 = 追加(串, sizeof(串), 位, "k%d直(%d,%d)[%d]出(%d,%d) ",
+                位 += snprintf(串 + 位, sizeof(串) - 位, "k%d直(%d,%d)[%d]出(%d,%d) ",
                                i, (int)槽直遥X[i], (int)槽直遥Z[i], 槽直分[i],
                                (int)槽稳X[i], (int)槽稳Z[i]);
             }
@@ -5593,7 +6660,7 @@ void Draw::StartBooks() {
             char 世串[240] = {0};
             int 写位 = 0;
             for (int i = 0; i < 10 && 写位 < 220; ++i) {
-                写位 = 追加(世串, sizeof(世串), 写位, "%d:%.0f ",
+                写位 += snprintf(世串 + 写位, sizeof(世串) - 写位, "%d:%.0f ",
                                  i, 槽世最大跳[i]);
                 槽世最大跳[i] = 0.0;      // 每窗口重置，下一窗口重新统计
             }
@@ -5604,7 +6671,7 @@ void Draw::StartBooks() {
             char 出串[240] = {0};
             int 写位2 = 0;
             for (int i = 0; i < 10 && 写位2 < 220; ++i) {
-                写位2 = 追加(出串, sizeof(出串), 写位2, "%d:%.0f ",
+                写位2 += snprintf(出串 + 写位2, sizeof(出串) - 写位2, "%d:%.0f ",
                                   i, 槽出最大跳[i]);
                 槽出最大跳[i] = 0.0;
             }
@@ -5620,7 +6687,7 @@ void Draw::StartBooks() {
             for (int i = 0; i < 10 && 位4 < 380; ++i) {
                 const int 总 = 槽画帧[i] + 槽阵跳[i] + 槽血跳[i] + 槽无跳[i] + 槽出框[i] + 槽重跳[i];
                 if (总 == 0) continue;
-                位4 = 追加(画串, sizeof(画串), 位4, "%d:%d/%d/%d/%d/%d/%d@%.0f ",
+                位4 += snprintf(画串 + 位4, sizeof(画串) - 位4, "%d:%d/%d/%d/%d/%d/%d@%.0f ",
                                 i, 槽画帧[i], 槽阵跳[i], 槽血跳[i], 槽无跳[i], 槽出框[i],
                                 槽重跳[i], 槽屏跳[i]);
                 槽画帧[i] = 0; 槽阵跳[i] = 0; 槽血跳[i] = 0; 槽无跳[i] = 0; 槽出框[i] = 0;
@@ -5636,7 +6703,7 @@ void Draw::StartBooks() {
             int 位6 = 0;
             for (int i = 0; i < 10 && 位6 < 400; ++i) {
                 if (槽屏末帧[i] == 0 || 帧序 < 槽屏末帧[i] || 帧序 - 槽屏末帧[i] > 60) continue;
-                位6 = 追加(框串, sizeof(框串), 位6, "%d:(%.0f,%.0f) ",
+                位6 += snprintf(框串 + 位6, sizeof(框串) - 位6, "%d:(%.0f,%.0f) ",
                                 i, 槽屏X[i], 槽屏Y[i]);
             }
             日志("框位 屏=%.0fx%.0f 心=(%.0f,%.0f) %s", 屏.x, 屏.y, 屏.x * 0.5f, 屏.y * 0.5f, 框串);
@@ -5670,7 +6737,7 @@ void Draw::StartBooks() {
                     const float ddx = sx - cxs, ddy = sy - cys;
                     if (ddx * ddx + ddy * ddy < 150.0f * 150.0f) continue;   // 屏心 = 我自己
                     if (位3 < 460)
-                        位3 = 追加(行, sizeof(行), 位3, " +%02x(%d,%d)>%.0f,%.0f",
+                        位3 += snprintf(行 + 位3, sizeof(行) - 位3, " +%02x(%d,%d)>%.0f,%.0f",
                                         o, vx, vz, sx, sy);
                 }
                 日志("定位扫 k=%d 二=%llx 保=(%d,%d)%s%s", k2, (unsigned long long)槽二址[k2],
