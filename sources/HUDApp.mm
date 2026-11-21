@@ -326,13 +326,17 @@ int main(int argc, char *argv[]) {
     // 在这跑一遍通道初始化纯属拖慢开关（-check 被限时 waitpid 2s 强杀）。
     if (getuid() == 0 && (argc <= 1 || (argv[1] && strcmp(argv[1], "-hud") == 0))) {
       extern "C" int exploit_init_jailbreak(void);
+      extern "C" const char* exploit_jb_channel_last_status(void);
       extern "C" void KernelLogLine(const char *line);
       int 通道 = exploit_init_jailbreak();
       setgid(501);
       setuid(501);
-      KernelLogLine(通道 == 0
-        ? "HUD: 越狱通道就绪（零内核利用），已降权至 mobile(501)"
-        : "HUD: 越狱通道未建成，已降权至 mobile(501)（kread 不可用，绘制走任务端口）");
+      char 行[320];
+      snprintf(行, sizeof(行), "HUD: %s，已降权至 mobile(501)",
+               通道 == 0 ? "越狱通道就绪（零内核利用）"
+                         : (exploit_jb_channel_last_status()[0] ? exploit_jb_channel_last_status()
+                                                               : "越狱通道未建成（kread 不可用，绘制走任务端口）"));
+      KernelLogLine(行);
     }
 
 #if !NO_TROLL

@@ -9,19 +9,22 @@
 
 uint64_t gKfd = 0;
 
-// 主程序日志通道（DOJailbreaker.m）：通道初始化的关键状态同步进终端，别只落文件
-extern void KernelLogLine(const char *line);
+// 通道状态（最近一条）：kfd.framework 是独立动态库 target，链不到主 app 的
+// KernelLogLine（DOJailbreaker.m 在主 target 里）——关键状态存下来，
+// 由调用方（DOJailbreaker / HUDApp）转进终端。同时照旧落 kfd_debug.log。
+static char gJB通道状态[256] = "";
+const char* exploit_jb_channel_last_status(void) { return gJB通道状态; }
 #include <sys/stat.h>
 
-// 通道日志：文件 + 终端双写（终端那份走 ab_hud.log 转发，出问题当场能看见）
+// 通道日志：更新状态串 + 落文件
 static void jb通道日志(const char *fmt, ...) {
-    char buf[512];
+    char buf[256];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    kfd_log("%s", buf);
-    KernelLogLine(buf);
+    snprintf(gJB通道状态, sizeof(gJB通道状态), "%s", buf);
+    kfd_log("%s\n", buf);
 }
 
 // 🔥 简单的文件日志功能
@@ -549,8 +552,7 @@ int exploit_init_jailbreak(void)
     // 幂等：本次已建好通道，或上次超时后 XPC 迟到完成（gPrimitives 已被填充）都直接复用
     if (gPrimitives.physreadbuf && gPrimitives.kreadbuf) {
         gUseJBChannel = true;
-        kfd_log("ℹ️ 越狱通道: 已初始化，跳过重复初始化\n");
-        KernelLogLine("[越狱通道] 已初始化，跳过重复初始化");
+        jb通道日志("[越狱通道] 已初始化，跳过重复初始化");
         return 0;
     }
 
