@@ -7,6 +7,7 @@
 
 #include "DrawView.hpp"
 #include <mutex>
+#include <atomic>
 #include <cstdint>
 #include <cmath>
 #include <mach/mach.h>
@@ -314,8 +315,8 @@ static inline bool IsKernelAddr(uint64_t address) {
     return address >= 0xffff000000000000ULL;
 }
 
-static double 上次限流窗口 = 0;
-static long 窗口读数 = 0;
+static std::atomic<double> 上次限流窗口{0};
+static std::atomic<long> 窗口读数{0};
 
 // ==================== 目标进程读取（任务端口优先） ====================
 // 关键：App 的 entitlements 里有 task_for_pid-allow（platform-application 生效），
@@ -341,7 +342,12 @@ static mach_port_t 取任务端口(pid_t pid) {
     return 任务端口;
 }
 
-// 跨进程读：有任务端口就走 vm_read_overwrite，失败再退回内核页表路线
+// 跨进程读：有任务端口就走 vm_read_overwrite。
+// v75：vm_read 失败直接认失败，不再退回内核页表慢路径 —— 扫描机常态探测无效
+// 地址，旧逻辑每次都触发 exploit_mach_readbuf（页表翻译 + physrw 往返），
+// 游戏数据一开读主线程就被打爆：触摸事件排队饿死、画面冻结。无效地址两条路
+// 都读不到，快速失败既对又快；只有拿不到任务端口（task_for_pid 被拒）才走
+// 内核页表路线兜底。
 static bool 目标读(pid_t pid, uint64_t 地址, void* 输出, size_t 大小) {
     mach_port_t 端口 = 取任务端口(pid);
     if (端口) {
@@ -349,6 +355,7 @@ static bool 目标读(pid_t pid, uint64_t 地址, void* 输出, size_t 大小) {
         if (vm_read_overwrite(端口, (vm_address_t)地址, (vm_size_t)大小,
                               (vm_address_t)输出, &读出) == KERN_SUCCESS && 读出 == (vm_size_t)大小)
             return true;
+        return false;
     }
     return exploit_mach_readbuf(pid, 地址, 输出, 大小);
 }
@@ -356,29 +363,19 @@ static bool 目标读(pid_t pid, uint64_t 地址, void* 输出, size_t 大小) {
 bool readMemory(uint64_t address, void* buffer, size_t size) {
     if (!IsValidAddr(address) || size == 0 || 游戏pid <= 0) return false;
     double now = CACurrentMediaTime();
-    if (now - 上次限流窗口 > 0.1) {
-        上次限流窗口 = now;
-        窗口读数 = 0;
+    if (now - 上次限流窗口.load(std::memory_order_relaxed) > 0.1) {
+        上次限流窗口.store(now, std::memory_order_relaxed);
+        窗口读数.store(0, std::memory_order_relaxed);
     }
-    if (++窗口读数 > 8000) {   // 0.1 秒内最多 8000 次读取
+    if (窗口读数.fetch_add(1, std::memory_order_relaxed) + 1 > 8000) {   // 0.1 秒内最多 8000 次读取
         读限流计数++;
         return false;
     }
     读总数++;
-    char* dst = (char*)buffer;
-    uint64_t src = address;
-    size_t remain = size;
-    while (remain > 0) {
-        uint64_t 页内 = 4096 - (src & 0xFFF);
-        uint64_t chunk = remain < 页内 ? remain : 页内;
-        uint64_t step = chunk > 0x100 ? 0x100 : chunk;   // 单次最多 256 字节
-        if (!step) return false;
-        if (!目标读(游戏pid, src, dst, step)) return false;
-        dst += step;
-        src += step;
-        remain -= step;
-    }
-    return true;
+    // v75：整段一次读完。旧逻辑按 256 字节碎切（16KB 要 64 次系统调用），
+    // 实体扫描每帧上千次碎读直接把主线程吃光。vm_read_overwrite / vreadbuf
+    // 本身都能一次处理跨页长读，失败语义不变（中途有无效页照样整段失败）。
+    return 目标读(游戏pid, address, buffer, size);
 }
 
 // 前向声明
@@ -463,6 +460,20 @@ static void 日志入环(const char* line) {
     std::atomic_flag_clear_explicit(&日志锁, std::memory_order_release);
 }
 
+// v75：日志落盘挪到串行队列。旧逻辑每行 fprintf+fflush×2（ab_draw.log）再加
+// KernelLogLine 的 ab_hud.log fflush，全部同步在调用线程（多数在主线程渲染帧内），
+// 转储/扫描一次打几十行就能把整帧打停 —— 触摸失效、画面冻结的元凶之一。
+// 行内容复制到堆后异步写；环形缓冲（日志入环）仍在原线程即时更新。
+static dispatch_queue_t 日志队列(void) {
+    static dispatch_queue_t 队列;
+    static dispatch_once_t 一次;
+    dispatch_once(&一次, ^{
+        队列 = dispatch_queue_create("slwz.ablog", DISPATCH_QUEUE_SERIAL);
+    });
+    return 队列;
+}
+static std::atomic<int> 日志排队{0};
+
 void 日志(const char* fmt, ...) {
     static bool 日志初始化 = false;
     va_list va;
@@ -475,20 +486,32 @@ void 日志(const char* fmt, ...) {
     vsnprintf(line, sizeof(line), fmt, va);
     va_end(va);
     日志入环(line);
-    KernelLogLine(line);
-    if (日志文件 || 日志文件2) {
-        time_t now = time(nullptr);
-        struct tm tmv;
-        localtime_r(&now, &tmv);
-        if (日志文件) {
-            fprintf(日志文件, "%02d:%02d:%02d %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, line);
-            fflush(日志文件);
-        }
-        if (日志文件2) {
-            fprintf(日志文件2, "%02d:%02d:%02d %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, line);
-            fflush(日志文件2);
-        }
+    // 背压：积压超 2000 行就丢弃落盘（环里还留着最近 12 行），防止扫描风暴
+    // 把日志队列撑爆成新的卡顿源。
+    if (日志排队.fetch_add(1, std::memory_order_relaxed) >= 2000) {
+        日志排队.fetch_sub(1, std::memory_order_relaxed);
+        return;
     }
+    char* 堆行 = strdup(line);
+    dispatch_async(日志队列(), ^{
+        日志排队.fetch_sub(1, std::memory_order_relaxed);
+        if (!堆行) return;
+        KernelLogLine(堆行);
+        if (日志文件 || 日志文件2) {
+            time_t now = time(nullptr);
+            struct tm tmv;
+            localtime_r(&now, &tmv);
+            if (日志文件) {
+                fprintf(日志文件, "%02d:%02d:%02d %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, 堆行);
+                fflush(日志文件);
+            }
+            if (日志文件2) {
+                fprintf(日志文件2, "%02d:%02d:%02d %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, 堆行);
+                fflush(日志文件2);
+            }
+        }
+        free(堆行);
+    });
 }
 
 // 安全追加：snprintf 截断时返回值是「想写的长度」，直接累加会让 位 越过缓冲区，
@@ -4498,6 +4521,14 @@ static void 底部文字(const ImVec2& 屏, const char* 文案) {
     });
 }
 
+// v75：帧内时间预算 —— 诊断/扫描机器超过 4ms 就让位，下一帧再跑。
+// 游戏数据开始流动后，全槽对比/我方自检/整局快照/锚扫描/找位扫/倒数扫描
+// 全在主线程渲染帧里做海量读，叠加起来足以把触摸事件饿死（悬浮球点不动）。
+// 这些都是诊断/学习通路，宁可少采一帧，不能卡住交互。
+static inline bool 帧超预算(double 帧起) {
+    return CACurrentMediaTime() - 帧起 > 0.004;
+}
+
 // ==================== 主渲染 ====================
 
 void Draw::StartBooks() {
@@ -4508,6 +4539,7 @@ void Draw::StartBooks() {
 
     读限流计数 = 0;
     double now = CACurrentMediaTime();
+    const double 帧起 = now;   // v75：帧内时间预算基准（见 帧超预算）
 
     // 缩放系数 = 逻辑短边 / 物理短边
     CGRect 物理屏 = [UIScreen mainScreen].bounds;
@@ -4558,7 +4590,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v71 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v75 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -4766,24 +4798,24 @@ void Draw::StartBooks() {
     static bool 回城位是倒数 = false;      // 学到的偏移是「读条计时器」而不是开关
 
     // v45：全槽坐标对照（纯读、纯打印；2Hz 采 10 次，挑离屏幕中心最近的槽当「我」）
-    全槽对比(数组, 数量, 矩阵, 屏.x, 屏.y);
+    if (!帧超预算(帧起)) 全槽对比(数组, 数量, 矩阵, 屏.x, 屏.y);   // v75：挂每帧预算
     // v46：我方英雄自检（相机跟人走 = 免费真值，用来判定 二+0x44 是否真的可用）
-    我方自检(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
+    if (!帧超预算(帧起)) 我方自检(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);   // v75：挂每帧预算
     // v48：整局快照（每 5 秒 10 槽 阵/组A/组B）。
     // （v47 两跳轨迹、野怪对照、v50/51 坐标猎人/邻域变化、v52 层邻 —— 结论已消化进
     //   槽验/两组互证，诊断机器已随代码删除，不再保留。）
-    整局快照(数组, 数量);
+    if (!帧超预算(帧起)) 整局快照(数组, 数量);   // v75：挂每帧预算
     // v54：屏心投影锚定 —— 相机跟随我 ⇒ 我恒投在屏幕同一像素位置。
     // 加载期用「二」把这个位置量出来当基准，整局找投影落基准 ±80px 的字段。
     // v53 的「屏心点位移」判据已废（它混了相机旋转项，见函数头注释）。
-    锚扫描(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
+    if (!帧超预算(帧起)) 锚扫描(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);   // v75：挂每帧预算
     // v67：数组性质 + 全指针可达找位（仅对局中采样，避免加载期镜头未跟随时的假锚定）
-    if (在对局) {
+    if (在对局 && !帧超预算(帧起)) {   // v75：挂每帧预算
         槽性扫(数组, 数量);
         找位扫(数组, 数量, 矩阵, 屏.x, 屏.y, 我方阵营);
     }
     // v52：同帧 4 槽对照（每 3 帧一行，400 行封顶），用来判定「跳后的新值是否等于别的槽的旧值」。
-    四槽行(数组, 数量, 帧序);
+    if (!帧超预算(帧起)) 四槽行(数组, 数量, 帧序);   // v75：挂每帧预算
 
     // v49：帧级诊断的帧号 / 毫秒推进，以及上一帧打标记的环 dump。
     // 放在逐槽循环外，保证一轮所有槽处理完才推进一帧 —— 环里的「相邻帧」是真正的相邻绘制帧。
@@ -4822,7 +4854,7 @@ void Draw::StartBooks() {
         // v28 一次读、两种解释（float / 毫秒整数），并且顺着实体里的堆指针
         // 把组件对象也扫一遍。命中「连降 ≥3 秒且落到 0」就写进 候选台，
         // 由「站定+瞬移」确认后锁存为 回城位偏移（见下方 ★回城位学习）。
-        if (cfg_recall && 回城位偏移 < 0) {   // 学到之后就不用再每秒扫 48KB 了
+        if (cfg_recall && 回城位偏移 < 0 && !帧超预算(帧起)) {   // 学到之后就不用再每秒扫 48KB 了
             const double 现时2 = CACurrentMediaTime();
             if (扫实体键[k] != 实体) 扫绑定(k, 实体);
             for (int t = 0; t <= 扫子数; ++t) {
