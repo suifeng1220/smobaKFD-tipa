@@ -357,7 +357,17 @@ int main(int argc, char *argv[]) {
       log_debug(OS_LOG_DEFAULT, "HUD pid %d, pgid %d", pid, pgid);
       
       NSString *pidString = [NSString stringWithFormat:@"%d", pid];
-      [pidString writeToFile:ROOT_PATH_NS(PID_PATH) atomically:YES encoding:NSUTF8StringEncoding error:nil];
+      NSError *写错 = nil;
+      BOOL 写上 = [pidString writeToFile:ROOT_PATH_NS(PID_PATH) atomically:YES
+                               encoding:NSUTF8StringEncoding error:&写错];
+      {
+        char 行[280];
+        snprintf(行, sizeof(行), "HUD: pid=%d 文件写入 %s（%s）",
+                 pid, 写上 ? "成功" : "失败",
+                 写上 ? ROOT_PATH_NS(PID_PATH).UTF8String
+                      : (写错 ? 写错.localizedDescription.UTF8String : "?"));
+        KernelLogLine(行);
+      }
       
       [UIScreen initialize];
       CFRunLoopGetCurrent();
@@ -394,50 +404,20 @@ int main(int argc, char *argv[]) {
       CFRunLoopRun();
       return EXIT_SUCCESS;
     } else if (strcmp(argv[1], "-exit") == 0) {
-      NSString *pidString = [NSString stringWithContentsOfFile:ROOT_PATH_NS(PID_PATH)
-                                                      encoding:NSUTF8StringEncoding
-                                                         error:nil];
-      
-      if (pidString) {
-        pid_t pid = (pid_t)[pidString intValue];
-        kill(pid, SIGKILL);
-        unlink([ROOT_PATH_NS(PID_PATH) UTF8String]);
+      // v77：pid 文件只是快路径 —— 沙盒拒写时 -hud 根本没写进去，旧逻辑
+      // 读到 nil 直接放过，浮层永远关不掉。HUDKillOverlay = pid 文件杀 +
+      // 全进程扫描杀（argv[1]=="-hud"），两条都走。
+      int 杀 = HUDKillOverlay("-exit");
+      {
+        char 行[96];
+        snprintf(行, sizeof(行), "-exit: 杀掉 %d 个浮层实例", 杀);
+        KernelLogLine(行);
       }
-      
       return EXIT_SUCCESS;
     } else if (strcmp(argv[1], "-check") == 0) {
-      NSString *pidString = [NSString stringWithContentsOfFile:ROOT_PATH_NS(PID_PATH)
-                                                      encoding:NSUTF8StringEncoding
-                                                         error:nil];
-
-      if (pidString) {
-        pid_t pid = (pid_t)[pidString intValue];
-        int killed = kill(pid, 0);
-        BOOL 活 = (killed == 0);
-        if (活) {
-          // kill(pid,0) 对僵尸进程也返回 0：被 -exit 杀掉的浮层若还没被回收，
-          // 这里会误判「还在跑」→ 关了重开永远不拉新浮层（黑屏卡死）。
-          // 再用 sysctl 核对：僵尸不算活、pid 被别的程序复用也不算活。
-          struct kinfo_proc kp;
-          size_t len = sizeof(kp);
-          int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
-          if (sysctl(mib, 4, &kp, &len, NULL, 0) != 0 || len == 0) {
-            活 = NO;
-          } else if (kp.kp_proc.p_stat == SZOMB) {
-            活 = NO;
-          } else {
-            // 进程名必须是本可执行文件（p_comm 截断到 16 字节，比 basename 前缀）
-            char 自名[64] = {0};
-            uint32_t sz = sizeof(自名) - 1;
-            _NSGetExecutablePath(自名, &sz);
-            const char *base = strrchr(自名, '/');
-            base = base ? base + 1 : 自名;
-            if (strncmp(kp.kp_proc.p_comm, base, 16) != 0) 活 = NO;
-          }
-        }
-        return (活 ? EXIT_FAILURE : EXIT_SUCCESS);
-      } else
-        return EXIT_SUCCESS; // No PID file, so HUD is not running
+      // v77：判定同样走扫描（pid 文件缺失/过期也算得准），别再误报
+      // "没在跑" → 重复拉起堆实例。
+      return (HUDFindOverlayPID() > 0 ? EXIT_FAILURE : EXIT_SUCCESS);
     }
 #else
     return UIApplicationMain(argc, argv, @"MainApplication", @"MainApplicationDelegate");

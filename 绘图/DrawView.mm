@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cmath>
 #include <mach/mach.h>
+#include <mach/task_info.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <cstring>
@@ -4529,6 +4530,27 @@ static inline bool 帧超预算(double 帧起) {
     return CACurrentMediaTime() - 帧起 > 0.004;
 }
 
+// v77：游戏被系统挂起（切回桌面/别的 app 后系统 task_suspend 冻结游戏）
+// 就整帧空转：不读实体、不跑扫描、不刷倒数。旧逻辑不管游戏在不在前台都按
+// 60fps 全速读它 —— 人不在游戏里 HUD 还在烧 CPU 读内存，整机发卡。
+// suspend_count>0 即挂起；拿不到任务端口/查询失败按"没挂起"处理，保持原行为。
+static bool 游戏被挂起() {
+    static double 上次查 = 0;
+    static bool 缓 = false;
+    double now = CACurrentMediaTime();
+    if (now - 上次查 < 0.5) return 缓;
+    上次查 = now;
+    缓 = false;
+    mach_port_t 端口 = 任务端口;
+    if (端口 == MACH_PORT_NULL) return 缓;
+    struct task_basic_info info;
+    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
+    if (task_info(端口, TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS) {
+        缓 = (info.suspend_count > 0);
+    }
+    return 缓;
+}
+
 // ==================== 主渲染 ====================
 
 void Draw::StartBooks() {
@@ -4590,7 +4612,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v75 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v77 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -4620,6 +4642,12 @@ void Draw::StartBooks() {
     if (!模块基址) {
         状态浮层(2, "没拿到模块基址");
         底部文字(屏, "等待进入对局");
+        return;
+    }
+
+    // v77：游戏在后台被挂起 → 空转这一帧。绘制层随之空白（ESP 不会画到
+    // 桌面/别的 app 上），悬浮球不受影响，回到游戏自动恢复。
+    if (游戏被挂起()) {
         return;
     }
 
