@@ -52,14 +52,6 @@ static NSString* JVR_取配置路径() {
     return @"/var/mobile/Library/Preferences/com.map.settings.plist";
 }
 
-static void JVR_保存开关(NSString* key, BOOL val) {
-    NSString *path = JVR_取配置路径();
-    NSMutableDictionary *cfg = [NSMutableDictionary dictionaryWithContentsOfFile:path];
-    if (!cfg) cfg = [NSMutableDictionary dictionary];
-    [cfg setObject:@(val) forKey:key];
-    [cfg writeToFile:path atomically:YES];
-}
-
 static BOOL JVR_读取开关(NSString* key) {
     NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:JVR_取配置路径()];
     return cfg ? [[cfg objectForKey:key] boolValue] : NO;

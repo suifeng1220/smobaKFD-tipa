@@ -35,6 +35,11 @@ int kwritebuf(uint64_t where, const void *buf, size_t size);
 int exploit_init(const char *flavor);
 int exploit_deinit(void);
 
+// 越狱通道：已越狱（多巴胺/roothide 等）时不跑 KFD/PUAF，
+// 直接用越狱守护进程的内核读写原语（jbclient_initialize_primitives）。
+// 成功返回 0；失败返回 -1（调用方降级，绝不回退跑内核利用）。
+int exploit_init_jailbreak(void);
+
 // kfd 在 info_run 里通过 current_proc() 拿到的本进程 proc 地址（内核态）。
 // 用作 allproc 符号失效时的遍历起点 —— 本进程必然挂在 allproc 链表上。
 uint64_t kfd_get_current_proc(void);

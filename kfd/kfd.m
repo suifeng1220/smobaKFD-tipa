@@ -99,28 +99,91 @@ void kfd_log(const char *format, ...) {
     va_end(args);
 }
 
+// ==================== 越狱通道 ====================
+// 已越狱（多巴胺/roothide 等）时不跑 KFD/PUAF，直接用越狱守护进程的内核读写。
+// 原理：jbclient_initialize_primitives 走 jbserver root 域拿 physrw（守护进程把
+// 物理地址空间映射进本进程 pmap），再挂 translation/IOSurface 层，全程零 bug 触发。
+// 入口见 exploit_init_jailbreak()。
+extern int jbclient_initialize_primitives(void);   // libjailbreak.dylib 导出（要求 getuid()==0）
+
+static bool gUseJBChannel = false;     // 越狱通道已建立：读写走 gPrimitives.phys*
+static uint64_t gJB_current_proc = 0;  // 越狱通道下的本进程 proc（exploit_init_jailbreak 沿 allproc 找出）
+
+// 越狱通道读：va→pa（gPrimitives.vtophys）后走守护进程映射的 physrw 窗口。
+// 按 0x1000 分块：4K/16K 内核页下都能保证块不跨翻译页。
+static int jb_kreadbuf(uint64_t kaddr, void *output, size_t size)
+{
+    if (!gPrimitives.physreadbuf || !gPrimitives.vtophys) return -1;
+    uint8_t *out = (uint8_t *)output;
+    size_t done = 0;
+    while (done < size) {
+        uint64_t cur = kaddr + done;
+        size_t chunk = 0x1000 - (size_t)(cur & 0xFFF);
+        if (chunk > size - done) chunk = size - done;
+        uint64_t pa = gPrimitives.vtophys(kconstant(cpuTTEP), cur);
+        if (!pa) return -1;
+        if (gPrimitives.physreadbuf(pa, out + done, chunk) != 0) return -1;
+        done += chunk;
+    }
+    return 0;
+}
+
+static int jb_kwritebuf(uint64_t kaddr, const void *input, size_t size)
+{
+    if (!gPrimitives.physwritebuf || !gPrimitives.vtophys) return -1;
+    const uint8_t *in = (const uint8_t *)input;
+    size_t done = 0;
+    while (done < size) {
+        uint64_t cur = kaddr + done;
+        size_t chunk = 0x1000 - (size_t)(cur & 0xFFF);
+        if (chunk > size - done) chunk = size - done;
+        uint64_t pa = gPrimitives.vtophys(kconstant(cpuTTEP), cur);
+        if (!pa) return -1;
+        if (gPrimitives.physwritebuf(pa, (void *)(in + done), chunk) != 0) return -1;
+        done += chunk;
+    }
+    return 0;
+}
+
+// 统一读写入口：越狱通道走 physrw 窗口，否则走 KFD 原语
+static int kread_ex(uint64_t where, void *buf, size_t size)
+{
+    if (gUseJBChannel) return jb_kreadbuf(where, buf, size);
+    if (!gKfd) { memset(buf, 0, size); return -1; }   // 无内核通路（降级/未初始化）：安全失败
+    kread(gKfd, where, buf, size);
+    return 0;
+}
+
+static int kwrite_ex(uint64_t where, const void *buf, size_t size)
+{
+    if (gUseJBChannel) return jb_kwritebuf(where, buf, size);
+    if (!gKfd) return -1;   // 无内核通路：安全失败
+    kwrite(gKfd, (void *)buf, where, size);
+    return 0;
+}
+
 uint8_t kread8(uint64_t where)
 {
   uint64_t out;
-  kread(gKfd, where, &out, sizeof(uint64_t));
+  kread_ex(where, &out, sizeof(uint64_t));
   return (uint8_t)out;
 }
 uint16_t kread16(uint64_t where)
 {
   uint64_t out;
-  kread(gKfd, where, &out, sizeof(uint64_t));
+  kread_ex(where, &out, sizeof(uint64_t));
   return (uint16_t)out;
 }
 uint32_t kread32(uint64_t where)
 {
   uint64_t out;
-  kread(gKfd, where, &out, sizeof(uint64_t));
+  kread_ex(where, &out, sizeof(uint64_t));
   return (uint32_t)out;
 }
 uint64_t kread64(uint64_t where)
 {
   uint64_t out;
-  kread(gKfd, where, &out, sizeof(uint64_t));
+  kread_ex(where, &out, sizeof(uint64_t));
   return out;
 }
 
@@ -135,7 +198,7 @@ void kwrite8(uint64_t where, uint8_t what)
   _buf[5] = kread8(where+5);
   _buf[6] = kread8(where+6);
   _buf[7] = kread8(where+7);
-  kwrite((u64)(gKfd), &_buf, where, sizeof(u64));
+  kwrite_ex(where, &_buf, sizeof(u64));
 }
 void kwrite16(uint64_t where, uint16_t what)
 {
@@ -144,20 +207,20 @@ void kwrite16(uint64_t where, uint16_t what)
   _buf[1] = kread16(where+2);
   _buf[2] = kread16(where+4);
   _buf[3] = kread16(where+6);
-  kwrite((u64)(gKfd), &_buf, where, sizeof(u64));
+  kwrite_ex(where, &_buf, sizeof(u64));
 }
 void kwrite32(uint64_t where, uint32_t what)
 {
   u32 _buf[2] = {};
   _buf[0] = what;
   _buf[1] = kread32(where+4);
-  kwrite((u64)(gKfd), &_buf, where, sizeof(u64));
+  kwrite_ex(where, &_buf, sizeof(u64));
 }
 void kwrite64(uint64_t where, uint64_t what)
 {
   u64 _buf[1] = {};
   _buf[0] = what;
-  kwrite((u64)(gKfd), &_buf, where, sizeof(u64));
+  kwrite_ex(where, &_buf, sizeof(u64));
 }
 
 int kreadbuf(uint64_t where, void *buf, size_t size)
@@ -178,10 +241,10 @@ int kreadbuf(uint64_t where, void *buf, size_t size)
         if (start + sizeToUse > size) {
           sizeToUse = (size - start);
         }
-        kread((u64)(gKfd), where+start, ((uint8_t *)buf)+start, sizeToUse);
+        kread_ex(where+start, ((uint8_t *)buf)+start, sizeToUse);
       }
     } else {
-      kread((u64)(gKfd), where, buf, size);
+      kread_ex(where, buf, size);
     }
   }
   return 0;
@@ -205,10 +268,10 @@ int kwritebuf(uint64_t where, const void *buf, size_t size)
         if (start + sizeToUse > size) {
           sizeToUse = (size - start);
         }
-        kwrite((u64)(gKfd), (void*)((uint8_t *)buf)+start, where+start, sizeToUse);
+        kwrite_ex(where+start, (void*)((uint8_t *)buf)+start, sizeToUse);
       }
     } else {
-      kwrite((u64)(gKfd), (void*)buf, where, size);
+      kwrite_ex(where, (void*)buf, size);
     }
   }
   return 0;
@@ -453,8 +516,77 @@ int exploit_init(const char *flavor)
 
 uint64_t kfd_get_current_proc(void)
 {
-    if (!gKfd) return 0;
+    if (!gKfd) return gJB_current_proc;   // 越狱通道：exploit_init_jailbreak 已沿 allproc 找好
     return ((struct kfd *)gKfd)->info.kaddr.current_proc;
+}
+
+
+// 越狱通道初始化：已越狱时用越狱守护进程的内核读写替代 KFD/PUAF。
+// - 完整通道（需 getuid()==0）：jbclient_initialize_primitives 建 physrw + 取符号表，
+//   全程零内核 bug 触发，不会产生脏页表/内核 panic。
+// - 失败返回 -1，由调用方降级（只做符号解析），绝不回退跑内核利用。
+int exploit_init_jailbreak(void)
+{
+    if (gUseJBChannel && gPrimitives.physreadbuf) {
+        kfd_log("ℹ️ 越狱通道: 已初始化，跳过重复初始化\n");
+        return 0;
+    }
+
+    // jbclient_initialize_primitives 要求 getuid()==0：
+    // -hud 进程本就是 root（persona 拉起）；UI 进程尝试 setuid 提权。
+    uid_t 原uid = getuid();
+    gid_t 原gid = getgid();
+    if (原uid != 0) {
+        if (setgid(0) != 0 || setuid(0) != 0) {
+            kfd_log("⚠️ 越狱通道: 提权失败 uid=%d euid=%d，走降级模式\n", getuid(), geteuid());
+            return -1;
+        }
+    }
+
+    int r = jbclient_initialize_primitives();
+
+    // 权限用完即降：physrw 窗口已映射进本进程，读写不再需要 root；
+    // 降回去避免 UI 进程以 root 身份写文件改变属主。
+    if (原uid != 0) {
+        setuid(原uid);
+        setgid(原gid);
+    }
+
+    if (r != 0) {
+        kfd_log("❌ 越狱通道: jbclient_initialize_primitives 失败 r=%d\n", r);
+        return -1;
+    }
+
+    gUseJBChannel = true;
+
+    // 内核自检：kernel base 头必须是 Mach-O magic，确认通路真的通了
+    uint64_t 基 = kconstant(base);
+    if (!基) 基 = kconstant(staticBase) + kconstant(slide);
+    uint32_t magic = kread32(基);
+    if (magic != 0xFEEDFACF) {
+        kfd_log("❌ 越狱通道: 内核自检失败 base=0x%llx magic=0x%08x\n", 基, magic);
+        gUseJBChannel = false;
+        return -1;
+    }
+
+    // current_proc：沿 allproc 链表找本进程 proc（KFD 路径由 info_run 提供，这里自己走）
+    gJB_current_proc = 0;
+    uint64_t allproc = ksymbol(allproc);
+    if (allproc) {
+        int 我的pid = getpid();
+        uint64_t p = kread64(allproc);
+        for (int i = 0; i < 8192 && (p >> 48) == 0xFFFF; i++) {
+            if ((int)kread32(p + koffsetof(proc, pid)) == 我的pid) {
+                gJB_current_proc = p;
+                break;
+            }
+            p = kread64(p + koffsetof(proc, list_next));
+        }
+    }
+
+    kfd_log("✅ 越狱通道: physrw 就绪 base=0x%llx current_proc=0x%llx allproc=0x%llx\n",
+            基, gJB_current_proc, ksymbol(allproc));
+    return 0;
 }
 
 
