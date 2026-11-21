@@ -61,6 +61,24 @@ static int HUD执行Spawn(const char *程序, const char *参数, unsigned 策�
     return rc;
 }
 
+// 限时 waitpid：子进程（-check/-exit/launchctl）如果卡在 jbserver XPC 上，
+// 无界 waitpid 会把调用方（多数时候是 UI 主线程）一起拖死 —— 表现就是
+// 「开关悬浮之后整个 app 卡住」。这里最多等 毫秒上限，超时强杀后不再等。
+static int 限时waitpid(pid_t pid, int 毫秒上限) {
+    int status = 0;
+    for (int 等 = 0; 等 < 毫秒上限; 等 += 20) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid || r == -1) return status;
+        usleep(20000);
+    }
+    kill(pid, SIGKILL);
+    for (int 等 = 0; 等 < 300; 等 += 20) {
+        if (waitpid(pid, &status, WNOHANG) == pid) return status;
+        usleep(20000);
+    }
+    return status;
+}
+
 BOOL IsHUDEnabled(void)
 {
     static char *executablePath = NULL;
@@ -82,15 +100,12 @@ BOOL IsHUDEnabled(void)
     posix_spawnattr_destroy(&attr);
     log_debug(OS_LOG_DEFAULT, "spawned %{public}s -check pid = %{public}d", executablePath, task_pid);
     
-    int status;
-    do {
-        if (waitpid(task_pid, &status, 0) != -1)
-        {
-            log_debug(OS_LOG_DEFAULT, "child status %d", WEXITSTATUS(status));
-        }
-    } while (!WIFEXITED(status) && !WIFSIGNALED(status));
-
-    return WEXITSTATUS(status) != 0;
+    int status = 限时waitpid(task_pid, 2000);
+    if (WIFEXITED(status)) {
+        log_debug(OS_LOG_DEFAULT, "child status %d", WEXITSTATUS(status));
+        return WEXITSTATUS(status) != 0;
+    }
+    return NO;   // 超时被杀/异常退出：当作没在跑，宁可重拉也别卡死调用方
 }
 
 #define LAUNCH_DAEMON_PATH ROOT_PATH("/Library/LaunchDaemons/ch.xxtou.hudservices.plist")
@@ -154,13 +169,10 @@ void SetHUDEnabled(BOOL isEnabled)
             KernelLogLine(行);
         }
 
-        int status;
-        do {
-            if (waitpid(task_pid, &status, 0) != -1)
-            {
-                log_debug(OS_LOG_DEFAULT, "child status %d", WEXITSTATUS(status));
-            }
-        } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+        int status = 限时waitpid(task_pid, 3000);
+        if (WIFEXITED(status)) {
+            log_debug(OS_LOG_DEFAULT, "child status %d", WEXITSTATUS(status));
+        }
 
         return;
     }
@@ -218,8 +230,7 @@ void SetHUDEnabled(BOOL isEnabled)
         for (int i = 0; i < 3; ++i) {
             pid_t 退出pid = 0;
             if (HUD执行Spawn(executablePath, "-exit", 策略序列[i], &退出pid) == 0) {
-                int status = 0;
-                waitpid(退出pid, &status, 0);
+                限时waitpid(退出pid, 2000);
                 return;
             }
         }

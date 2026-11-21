@@ -10,6 +10,7 @@
 #import <notify.h>
 #import <objc/runtime.h>
 #import <sys/utsname.h>
+#import <sys/sysctl.h>
 
 #if !NO_TROLL
 #import "AXEventRepresentation.h"
@@ -302,14 +303,19 @@ int main(int argc, char *argv[]) {
     {
       // If systemhook isn't loaded and we are already jailbroken, we need to do the checkin ourselves
       // This can happen when the jailbreak is hidden or when tweak injection into the Dopamine app is disabled via Choicy
-      jbclient_process_checkin(NULL, NULL, NULL, NULL);
-      
+      // ★ 只在「真正要做事」的进程里 checkin（主 UI / -hud）。-check/-exit 只查一下
+      //   pid 文件就退出，不需要 jbserver 会签；XPC 对面挂死时会把调用方一起拖死
+      //   （SetHUDEnabled 在主线程 waitpid 这些子进程 → UI 整个卡住）。
+      if (argc <= 1 || (argv[1] && strcmp(argv[1], "-hud") == 0)) {
+        jbclient_process_checkin(NULL, NULL, NULL, NULL);
+      }
+
       if ([DOEnvironmentManager sharedManager].isJailbroken) {
         setenv("PATH", "/sbin:/bin:/usr/sbin:/usr/bin:/var/jb/sbin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/usr/bin", 1);
         setenv("TERM", "xterm-256color", 1);
       }
     }
-    
+
 #if !NO_TROLL
     if (argc <= 1) {
       return UIApplicationMain(argc, argv, @"MainApplication", @"MainApplicationDelegate");
@@ -376,11 +382,33 @@ int main(int argc, char *argv[]) {
       NSString *pidString = [NSString stringWithContentsOfFile:ROOT_PATH_NS(PID_PATH)
                                                       encoding:NSUTF8StringEncoding
                                                          error:nil];
-      
+
       if (pidString) {
         pid_t pid = (pid_t)[pidString intValue];
         int killed = kill(pid, 0);
-        return (killed == 0 ? EXIT_FAILURE : EXIT_SUCCESS);
+        BOOL 活 = (killed == 0);
+        if (活) {
+          // kill(pid,0) 对僵尸进程也返回 0：被 -exit 杀掉的浮层若还没被回收，
+          // 这里会误判「还在跑」→ 关了重开永远不拉新浮层（黑屏卡死）。
+          // 再用 sysctl 核对：僵尸不算活、pid 被别的程序复用也不算活。
+          struct kinfo_proc kp;
+          size_t len = sizeof(kp);
+          int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+          if (sysctl(mib, 4, &kp, &len, NULL, 0) != 0 || len == 0) {
+            活 = NO;
+          } else if (kp.kp_proc.p_stat == SZOMB) {
+            活 = NO;
+          } else {
+            // 进程名必须是本可执行文件（p_comm 截断到 16 字节，比 basename 前缀）
+            char 自名[64] = {0};
+            uint32_t sz = sizeof(自名) - 1;
+            _NSGetExecutablePath(自名, &sz);
+            const char *base = strrchr(自名, '/');
+            base = base ? base + 1 : 自名;
+            if (strncmp(kp.kp_proc.p_comm, base, 16) != 0) 活 = NO;
+          }
+        }
+        return (活 ? EXIT_FAILURE : EXIT_SUCCESS);
       } else
         return EXIT_SUCCESS; // No PID file, so HUD is not running
     }

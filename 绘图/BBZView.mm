@@ -2509,7 +2509,10 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
         __strong typeof(weakSelf) s = weakSelf;
         if (!s) return;
 
-        if (((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess) {
+        // 越狱设备：通道初始化是零利用、幂等的，允许重跑（开机缓存恢复出来的
+        // 「已就绪」可能是假的——进程内 kread 早已归零）。KFD 设备保持拦截，
+        // 防止同一开机周期二次跑 PUAF。
+        if (((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess && !JBDeviceJailbroken()) {
             [s->_terminal appendLog:@"内核已就绪，无需重复初始化"];
             [s slk_showToast:@"内核已就绪"];
             return;
@@ -2683,6 +2686,7 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
             [strongSelf->_terminal appendLog:line];
         }
     });
+    JBStartHudLogTailer();   // 把 HUD 进程落盘的 ab_hud.log 实时转发进终端
     KernelLogLine("王者内核已启动");
 }
 

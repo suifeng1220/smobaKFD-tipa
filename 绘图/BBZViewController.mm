@@ -96,11 +96,15 @@ static unsigned 上次HUDContextId = 0;
     // 应用启动回调
     //log_debug(OS_LOG_DEFAULT, "- [BBZViewController application:%{public}@ didFinishLaunchingWithOptions:%{public}@]", application, launchOptions); // 记录日志
     @autoreleasepool {
-        // HUD 进程：在窗口创建前优先确保内核环境准备好（与原先未拆分时保持一致）
-        KernelLogLine("HUD: 准备内核环境...");
-        [DOJailbreaker.sharedInstance run];
-        BOOL kernelReady = ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess;
-        KernelLogLine(kernelReady ? "HUD: 内核就绪" : "HUD: 内核初始化完成（可能未成功）");
+        // HUD 进程：内核环境准备放后台跑。以前这里同步 run()，jbserver XPC 一挂
+        // didFinishLaunching 就再也回不来 —— 窗口创建排在它后面，浮层整个起不来
+        // （表现为「绘制不到」），重开悬浮 = 新进程再挂一次（「卡住」）。
+        KernelLogLine("HUD: 准备内核环境（后台执行，不阻塞窗口）...");
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            [DOJailbreaker.sharedInstance run];
+            BOOL kernelReady = ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess;
+            KernelLogLine(kernelReady ? "HUD: 内核就绪" : "HUD: 内核初始化完成（可能未成功）");
+        });
         // 无论状态如何，启动数据线程（内部会自行重试）
         //StartDataThreads();
         NSLog(@"DH666 DOJailbreaker");

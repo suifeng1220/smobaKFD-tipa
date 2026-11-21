@@ -527,7 +527,9 @@ uint64_t kfd_get_current_proc(void)
 // - 失败返回 -1，由调用方降级（只做符号解析），绝不回退跑内核利用。
 int exploit_init_jailbreak(void)
 {
-    if (gUseJBChannel && gPrimitives.physreadbuf) {
+    // 幂等：本次已建好通道，或上次超时后 XPC 迟到完成（gPrimitives 已被填充）都直接复用
+    if (gPrimitives.physreadbuf && gPrimitives.kreadbuf) {
+        gUseJBChannel = true;
         kfd_log("ℹ️ 越狱通道: 已初始化，跳过重复初始化\n");
         return 0;
     }
@@ -543,7 +545,18 @@ int exploit_init_jailbreak(void)
         }
     }
 
-    int r = jbclient_initialize_primitives();
+    // XPC 到越狱守护进程：对面挂死时不能把 HUD 启动卡死在这里，8s 超时按失败处理
+    __block int r = -999;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        r = jbclient_initialize_primitives();
+        dispatch_semaphore_signal(sem);
+    });
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)8 * NSEC_PER_SEC)) != 0) {
+        kfd_log("❌ 越狱通道: jbclient_initialize_primitives 超时(8s)，按失败处理\n");
+        if (原uid != 0) { setuid(原uid); setgid(原gid); }
+        return -1;
+    }
 
     // 权限用完即降：physrw 窗口已映射进本进程，读写不再需要 root；
     // 降回去避免 UI 进程以 root 身份写文件改变属主。
