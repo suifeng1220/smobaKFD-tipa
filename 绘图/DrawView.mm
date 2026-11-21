@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <cstring>
 #include <cstdio>
+#include <dlfcn.h>          // v80：dlopen/dlsym 取 il2cpp 导出，替代写死 RVA
 #include "BBZGui.h"
 #include "游戏/SDK.h"
 
@@ -2058,7 +2059,9 @@ static void 校验链() {
 #define AM_LINKER_POS   0x4C4ULL         // ActorLinker → position (3×float)
 #define AM_LINKER_ID    0x4ACULL         // ActorLinker → ObjID
 #define AM_LINKER_VIS   0x505ULL         // ActorLinker → _logicVisible
-#define AM_LINKER_CAMP  0x40CULL         // ActorLinker → 阵营 (1=队A, 2=队B)
+#define AM_LINKER_CAMP  0x40CULL         // 旧：填充区野值，仅兜底（0x408=EffectControl, 0x410=BuffControl）
+#define AM_LINKER_META  0x548ULL         // v80：ActorLinker → theMeta (ActorMeta*)
+#define AM_META_CAMP    0x24ULL          // v80：ActorMeta → ActorCamp (1=队A, 2=队B)
 #define AM_MAX_HERO     16
 
 struct AM英雄 {
@@ -2078,19 +2081,125 @@ static double  AM上次 = 0;
 static int     AM失败连 = 0;
 static char    AM诊[160] = "";
 
+// ===== v80：用 il2cpp 元数据取 ActorManager 单例 =====
+// 旧写法写死 AM_INST_RVA，换构建就偏（v70 偏 0x20000 直接全废）。
+// 这里让引擎自己解析：找 ActorManager 类（带 HeroActors 字段的那个）→ s_instance 静态字段。
+// 偏移完全不参与，构建变化免疫；失败才回落写死 RVA。
+typedef void*       (*t_dom_get)(void);
+typedef void*       (*t_dom_asms)(void*, uint32_t*);
+typedef void*       (*t_asm_img)(void*);
+typedef uint32_t    (*t_img_cnt)(void*);
+typedef void*       (*t_img_cls)(void*, uint32_t);
+typedef const char* (*t_cls_name)(void*);
+typedef void*       (*t_cls_field)(void*, const char*);
+typedef void        (*t_fld_static)(void*, void*);
+typedef void*       (*t_cls_parent)(void*);
+
+static void* AM导出(const char* 名) {
+    static bool 初始化 = false;
+    static void* 句柄 = NULL;
+    if (!初始化) {
+        初始化 = true;
+        句柄 = dlopen("UnityFramework", RTLD_LAZY | RTLD_NOLOAD);
+        if (!句柄) 句柄 = dlopen("@rpath/UnityFramework.framework/UnityFramework", RTLD_LAZY);
+    }
+    void* p = 句柄 ? dlsym(句柄, 名) : NULL;
+    if (!p) p = dlsym(RTLD_DEFAULT, 名);
+    return p;
+}
+
+static uint64_t AM静态实例 = 0;
+
+static void AM解析失败(char* 诊) {
+    if (诊) strcpy(诊, "il2cpp miss");
+    AM静态实例 = 0;
+}
+
+static uint64_t 查AM单例_il2cpp(void) {
+    static double 上次试 = 0;
+    static void*  kAM = NULL;                 // 缓存 ActorManager klass
+    double t = CACurrentMediaTime();
+    if (AM静态实例 && t - 上次试 < 15.0) return AM静态实例;   // 成功过就复用
+    if (t - 上次试 < 1.0) return AM静态实例;                  // 失败后 1 秒内不重试，避免每帧遍历元数据
+    上次试 = t;
+
+    static t_dom_get    f_dom   = NULL;
+    static t_dom_asms   f_asms  = NULL;
+    static t_asm_img    f_img   = NULL;
+    static t_img_cnt    f_cnt   = NULL;
+    static t_img_cls    f_cls   = NULL;
+    static t_cls_name   f_cname = NULL;
+    static t_cls_field  f_field = NULL;
+    static t_fld_static f_sget  = NULL;
+    static t_cls_parent f_par   = NULL;
+    static bool 绑定 = false;
+    static int  绑定失败 = 0;
+    if (!绑定) {
+        绑定 = true;
+        f_dom   = (t_dom_get)AM导出("il2cpp_domain_get");
+        f_asms  = (t_dom_asms)AM导出("il2cpp_domain_get_assemblies");
+        f_img   = (t_asm_img)AM导出("il2cpp_assembly_get_image");
+        f_cnt   = (t_img_cnt)AM导出("il2cpp_image_get_class_count");
+        f_cls   = (t_img_cls)AM导出("il2cpp_image_get_class");
+        f_cname = (t_cls_name)AM导出("il2cpp_class_get_name");
+        f_field = (t_cls_field)AM导出("il2cpp_class_get_field_from_name");
+        f_sget  = (t_fld_static)AM导出("il2cpp_field_static_get_value");
+        f_par   = (t_cls_parent)AM导出("il2cpp_class_get_parent");
+    }
+    if (!f_dom || !f_asms || !f_img || !f_cnt || !f_cls || !f_cname || !f_field || !f_sget) {
+        if (++绑定失败 > 30) { 绑定 = false; 绑定失败 = 0; }   // 允许重新 dlsym（UnityFramework 可能还没加载完）
+        return 0;
+    }
+    if (!kAM) {
+        void* 域 = f_dom();
+        uint32_t 数 = 0;
+        void* 集 = 域 ? f_asms(域, &数) : NULL;
+        if (!集) { AM解析失败(NULL); return 0; }
+        void* 首个 = NULL;
+        for (uint32_t i = 0; i < 数 && !kAM; i++) {
+            uint64_t 表项 = ((uint64_t*)集)[i];
+            if (表项 < 0x1000) continue;
+            void* 图 = f_img((void*)表项);
+            if (!图) continue;
+            uint32_t 类数 = f_cnt(图);
+            for (uint32_t j = 0; j < 类数; j++) {
+                void* 类 = f_cls(图, j);
+                if (!类) continue;
+                const char* 名 = f_cname(类);
+                if (!名 || strcmp(名, "ActorManager") != 0) continue;
+                if (!首个) 首个 = 类;
+                if (f_field(类, "HeroActors")) { kAM = 类; break; }   // 必须是带 HeroActors 的那个
+            }
+        }
+        if (!kAM) kAM = 首个;
+        if (!kAM) { AM解析失败(NULL); return 0; }
+    }
+    for (void* 类 = kAM; 类; 类 = f_par ? f_par(类) : NULL) {
+        for (int n = 0; n < 2; n++) {
+            void* 字段 = f_field(类, n == 0 ? "s_instance" : "_instance");
+            if (!字段) continue;
+            unsigned char 缓冲[16] = {0};
+            f_sget(字段, 缓冲);
+            uint64_t 值 = *(uint64_t*)缓冲;
+            if (值 > 0x1000) { AM静态实例 = 值; return 值; }
+        }
+    }
+    return 0;
+}
+
 // 世界坐标(±54.5) → 内部坐标(±103500)
 static inline int AM换算(float w) {
     return (int)(w * (103500.0f / 109.0f));
 }
 
-// 刷新 ActorManager 英雄表（~2Hz 即可）
+// 刷新 ActorManager 英雄表（v80：每帧刷新，并保留上次好数据，避免单帧失败导致头像闪没）
 static void AM刷新() {
-    AM好 = false;
     if (!IsValidAddr(模块基址)) { strcpy(AM诊, "no base"); return; }
     AM基址 = 模块基址;
 
-    // 读 ActorManager 实例
-    unsigned long long 实例 = vm_read<unsigned long long>(模块基址 + AM_INST_RVA);
+    // v80：优先 il2cpp 静态字段；失败才回落写死 RVA
+    unsigned long long 实例 = 查AM单例_il2cpp();
+    if (实例 < 0x1000) 实例 = vm_read<unsigned long long>(模块基址 + AM_INST_RVA);
     if (!IsValidAddr(实例)) {
         snprintf(AM诊, sizeof(AM诊), "inst@+%#llx=0", AM_INST_RVA);
         AM失败连++;
@@ -2129,7 +2238,19 @@ static void AM刷新() {
         readMemory(连接器 + AM_LINKER_POS + 4, &y, 4);
         readMemory(连接器 + AM_LINKER_POS + 8, &z, 4);
         readMemory(连接器 + AM_LINKER_VIS, &可见, 1);
-        readMemory(连接器 + AM_LINKER_CAMP, &阵营值, 4);
+        // v80：阵营走真字段 theMeta@0x548 → ActorCamp@0x24；0x40C 是填充区野值，仅兜底
+        {
+            unsigned long long 元 = 0;
+            if (readMemory(连接器 + AM_LINKER_META, &元, 8) && 元 > 0x1000) {
+                unsigned 元阵营 = 0;
+                if (readMemory(元 + AM_META_CAMP, &元阵营, 4) && (元阵营 == 1 || 元阵营 == 2)) 阵营值 = 元阵营;
+            }
+            if (阵营值 != 1 && 阵营值 != 2) {
+                阵营值 = 0;
+                readMemory(连接器 + AM_LINKER_CAMP, &阵营值, 4);
+                if (阵营值 != 1 && 阵营值 != 2) 阵营值 = 0;
+            }
+        }
 
         // 校验：坐标在 ±130 范围内，编号非零（v78：±60 → ±130，世界域 ±109，
         // 旧值把地图边缘的英雄整批踢出 AM表，只能落到旧链上）
@@ -4575,6 +4696,46 @@ static void 世界转小图(int x, int z, float 翻转, const ImVec4& 地图, fl
     *出Y = 图心Y - ((z * 翻转) / 世界半程) * 地图.w * 比;
 }
 
+// ===== v80：坐标跳变抑制（迷雾定格 / 出雾缓动）=====
+// 已实测：迷雾期服务器停更敌人坐标，ActorLinker.position 冻结；敌人出雾瞬间
+// 坐标从旧值直接刷成新值（单帧跳 95 世界单位 ≈ 横穿小地图 88%）——这就是「跳来跳去」。
+// 这里按英雄ID保留上帧绘制位置：
+//   小位移（正常走位）→ 直接跟随，不引入延迟；
+//   大位移（出雾 / 传送 / 复活）→ 12/s 阻尼滑过去（≈0.35 秒追平），不再「啪」地跳。
+struct 投迹槽 { unsigned 编号; float X, Z; bool 有; };
+static 投迹槽 投迹[40];
+
+static void 平滑坐标(unsigned 编号, float* X, float* Z) {
+    if (!编号) return;
+    float dt = BBZGUI::GetIO().DeltaTime;
+    if (!(dt > 0.0f) || dt > 0.25f) dt = 0.016f;
+
+    int k = -1;
+    for (int i = 0; i < 40; i++) if (投迹[i].有 && 投迹[i].编号 == 编号) { k = i; break; }
+    if (k < 0) {
+        for (int i = 0; i < 40; i++) if (!投迹[i].有) { k = i; break; }
+        if (k < 0) k = 0;
+        投迹[k].有 = true;
+        投迹[k].编号 = 编号;
+        投迹[k].X = *X;
+        投迹[k].Z = *Z;
+        return;
+    }
+    float dx = *X - 投迹[k].X;
+    float dz = *Z - 投迹[k].Z;
+    const float 直跟2 = 3000.0f * 3000.0f;      // ≈1.6 世界单位：正常走位直接跟
+    if (dx * dx + dz * dz <= 直跟2) {
+        投迹[k].X = *X;
+        投迹[k].Z = *Z;
+    } else {
+        float 别 = 1.0f - expf(-dt * 12.0f);
+        投迹[k].X += dx * 别;
+        投迹[k].Z += dz * 别;
+    }
+    *X = 投迹[k].X;
+    *Z = 投迹[k].Z;
+}
+
 // 小图坐标（英雄）
 static void 小图坐标(int x, int z, unsigned 阵营, const ImVec4& 地图, float* 出X, float* 出Y) {
     世界转小图(x, z, 阵营符号(阵营), 地图, 出X, 出Y);
@@ -4738,7 +4899,7 @@ void Draw::StartBooks() {
         if (!已记启动) {
             已记启动 = true;
             初始化日志();
-            日志("=== smobaKFD v79 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
+            日志("=== smobaKFD v80 启动 日志=%s 缩放=%.3f 屏=%.0fx%.0f 短边=%.0f",
                  日志可用 ? 日志路径串 : "失败", 缩放, 屏.x, 屏.y, 短边);
         }
     }
@@ -4828,10 +4989,10 @@ void Draw::StartBooks() {
         return;
     }
 
-    // v70：ActorManager 坐标链刷新（2Hz）
+    // v80：ActorManager 坐标链逐帧刷新（原 2Hz 会让 AM 路径最多落后 0.5 秒）
     {
         static double 上次AM刷 = 0;
-        if (now - 上次AM刷 > 0.5) {
+        if (now - 上次AM刷 > 0.0) {
             上次AM刷 = now;
             AM刷新();
         }
@@ -5299,7 +5460,10 @@ void Draw::StartBooks() {
         // 小地图图标
         if (cfg_map) {
             float mx = 0.0f, my = 0.0f;
-            小图坐标((int)样X, (int)样Z, 阵营, 地图, &mx, &my);
+            // v80：出雾/传送瞬间的坐标跳变在这里被抹平（实体循环是主路径）
+            float 画X = 样X, 画Z = 样Z;
+            平滑坐标((unsigned)英雄ID, &画X, &画Z);
+            小图坐标((int)画X, (int)画Z, 阵营, 地图, &mx, &my);
             mx *= 缩放;
             my *= 缩放;
             // 敌方头像 + 绿环的整体外径对齐游戏原生小地图头像。
@@ -5500,6 +5664,8 @@ void Draw::StartBooks() {
             if ((int)AM表[i].阵营 == (int)我方阵营) continue;   // 我方跳过
             int wx = AM换算(AM表[i].x);
             int wz = AM换算(AM表[i].z);
+            // v80：与实体循环共用同一份投迹状态，两条路径画出的位置永远一致
+            { float 投X = (float)wx, 投Z = (float)wz; 平滑坐标(AM表[i].编号, &投X, &投Z); wx = (int)投X; wz = (int)投Z; }
             // v78：去重 —— 实体循环本帧已画的敌人不再补画。
             // 双影根因：实体循环走实时链（60fps 平滑），AM直画走 2Hz 陈旧缓存，
             // 同一英雄画两份、位置一分一合，肉眼就是「头像乱跳」。
