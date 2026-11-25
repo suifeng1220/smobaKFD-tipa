@@ -1866,6 +1866,168 @@ static void 取证3(uint64_t 世界, uint64_t 容器, uint64_t 数组, int 数�
     }
 }
 
+// ==================== 取证 v4（实时坐标动态搜索） ====================
+//
+// v3 的硬结论（782 份快照 / 6.5 分钟，10 个槽全部稳定）：
+//   * 实体指针 10/10 恒定不变
+//   * +0x278/+0x280 的 X/Z 在这 6.5 分钟里各自只有 1 个取值 → 那不是实时位置，
+//     是静态数据（出生点/配置）；旧链 0xa8→0x10→0x0→0x78→+0x2B8 也已证伪
+//   * 实体 0x0..0x380 内随时间变化的只有 +0x8(递增计数)、+0xC、+0x28(ID)、+0x10C(阶段)
+//     → 位置不在实体前 0x380 里
+// 所以 v4 只做一件事：动态找位置。
+//   A. 实体 0x0..0x1200 直扫，找「地图量级」的 int32
+//   B. 实体持有一级指针（0x0..0x600 步长 8）解引用后 0x0..0x200 直扫，同条件
+// 相隔约 15 秒采三次样，交叉比对，只把「值变过」的候选写进文件。
+// 人在走，位置一定在动；不动的一律不是位置。
+struct 坐标候选 {
+    uint64_t 实体;
+    int      槽;
+    int32_t  指针偏移;    // -1 = 实体自身
+    uint64_t 子对象;
+    int32_t  内偏移;
+    int32_t  a, b, c;
+};
+
+#define 取证4候选上限 6000
+static 坐标候选* 取证4当轮 = nullptr;
+static int       取证4当轮数 = 0;
+static 坐标候选* 取证4上轮 = nullptr;
+static int       取证4上轮数 = 0;
+static FILE*     取证4文件 = nullptr;
+static int       取证4帧计 = 0;
+static int       取证4等帧 = 0;
+static int       取证4采样序 = 0;
+static bool      取证4完成 = false;
+static int       取证4变化数 = 0;
+
+static inline bool 地图量级(int32_t v) {
+    return (v > 100 && v < 250000) || (v < -100 && v > -250000);
+}
+
+static void 记候选(uint64_t 实体, int 槽, int32_t 指针偏移, uint64_t 子对象,
+                   int32_t 内偏移, const unsigned char* p) {
+    if (!取证4当轮 || 取证4当轮数 >= 取证4候选上限) return;
+    int32_t a = *(const int32_t*)(p);
+    int32_t b = *(const int32_t*)(p + 4);
+    int32_t c = *(const int32_t*)(p + 8);
+    if (!地图量级(a)) return;
+    // x 与 z 之间常常夹一个 Y，所以比较 a 与 b、a 与 c
+    if (!地图量级(b) && !地图量级(c)) return;
+    坐标候选& q = 取证4当轮[取证4当轮数++];
+    q.实体 = 实体; q.槽 = 槽; q.指针偏移 = 指针偏移; q.子对象 = 子对象;
+    q.内偏移 = 内偏移; q.a = a; q.b = b; q.c = c;
+}
+
+static void 扫缓冲(uint64_t 实体, int 槽, int32_t 指针偏移, uint64_t 子对象,
+                   const unsigned char* buf, int 长度) {
+    for (int off = 0; off + 12 <= 长度; off += 4)
+        记候选(实体, 槽, 指针偏移, 子对象, off, buf + off);
+}
+
+static void 取证4采样(uint64_t 数组, int 数量) {
+    取证4当轮数 = 0;
+    unsigned char buf[0x200];
+    for (int k = 0; k < 数量 && k < 32; ++k) {
+        uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)k);
+        if (!IsValidAddr(实体)) continue;
+
+        // A. 实体自身 0x0..0x1200
+        for (int base = 0; base < 0x1200; base += 0x200) {
+            if (!readMemory(实体 + (uint64_t)base, buf, 0x200)) continue;
+            扫缓冲(实体, k, -1, 0, buf, 0x200);
+        }
+
+        // B. 一级指针解引用
+        for (int po = 0; po < 0x600; po += 8) {
+            uint64_t 子 = vm_read<uint64_t>(实体 + (uint64_t)po);
+            if (!IsValidAddr(子)) continue;
+            if (!readMemory(子, buf, 0x200)) continue;
+            扫缓冲(实体, k, po, 子, buf, 0x200);
+        }
+    }
+}
+
+static void 取证4对比(void) {
+    if (!取证4文件 || !取证4当轮 || !取证4上轮) return;
+    for (int i = 0; i < 取证4当轮数; ++i) {
+        坐标候选& n = 取证4当轮[i];
+        // 按 (槽, 指针偏移, 子对象, 内偏移) 找上一轮的同一条
+        for (int j = 0; j < 取证4上轮数; ++j) {
+            坐标候选& o = 取证4上轮[j];
+            if (o.槽 != n.槽 || o.指针偏移 != n.指针偏移 ||
+                o.子对象 != n.子对象 || o.内偏移 != n.内偏移) continue;
+            if (o.a == n.a && o.b == n.b && o.c == n.c) break;   // 没变
+            取证4变化数++;
+            if (n.指针偏移 < 0) {
+                fprintf(取证4文件, "[D] 槽%d ent=%#llx self +%#05x  (%d,%d,%d) -> (%d,%d,%d)\n",
+                        n.槽, (unsigned long long)n.实体, n.内偏移,
+                        o.a, o.b, o.c, n.a, n.b, n.c);
+            } else {
+                fprintf(取证4文件, "[P] 槽%d ent=%#llx @+%#05x->%#llx +%#05x  (%d,%d,%d) -> (%d,%d,%d)\n",
+                        n.槽, (unsigned long long)n.实体, n.指针偏移,
+                        (unsigned long long)n.子对象, n.内偏移,
+                        o.a, o.b, o.c, n.a, n.b, n.c);
+            }
+            break;
+        }
+    }
+    fflush(取证4文件);
+}
+
+static void 取证4(uint64_t 世界, uint64_t 容器, uint64_t 数组, int 数量) {
+    if (取证4完成) return;
+    if (++取证4帧计 % 30) return;   // 0.5 秒一次
+    if (取证4采样序 > 0) {          // 首次立即采样，之后每 30 个节拍（约 15 秒）一次
+        if (++取证4等帧 < 30) return;
+        取证4等帧 = 0;
+    }
+
+    if (!取证4文件) {
+        const char* 家 = getenv("HOME");
+        if (!家) return;
+        if (!取证4当轮) 取证4当轮 = (坐标候选*)malloc(sizeof(坐标候选) * 取证4候选上限);
+        if (!取证4上轮) 取证4上轮 = (坐标候选*)malloc(sizeof(坐标候选) * 取证4候选上限);
+        if (!取证4当轮 || !取证4上轮) return;
+        char 路径[512];
+        snprintf(路径, sizeof(路径), "%s/Documents/fields_dump4.txt", 家);
+        取证4文件 = fopen(路径, "w");
+        if (!取证4文件) return;
+        setvbuf(取证4文件, nullptr, _IOLBF, 0);
+        fprintf(取证4文件, "=== 取证 v4（实时坐标动态搜索）===\n");
+        fprintf(取证4文件, "pid=%d 模块基址=%#llx 世界=%#llx 容器=%#llx 数组=%#llx 数量=%d\n",
+                游戏pid, (unsigned long long)模块基址,
+                (unsigned long long)世界, (unsigned long long)容器,
+                (unsigned long long)数组, 数量);
+        fprintf(取证4文件, "只输出「相隔约 15 秒、值发生过变化」的地图量级候选\n");
+        fprintf(取证4文件, "[D]=实体自身字段  [P]=一级指针解引用  self +off = 实体+off\n");
+        fflush(取证4文件);
+    }
+
+    int 序号 = 取证4采样序++;
+    取证4采样(数组, 数量);
+    if (序号 == 0) {
+        memcpy(取证4上轮, 取证4当轮, sizeof(坐标候选) * (size_t)取证4当轮数);
+        取证4上轮数 = 取证4当轮数;
+        fprintf(取证4文件, "--- 采样0（基准）候选 %d 条 ---\n", 取证4当轮数);
+        fflush(取证4文件);
+        return;
+    }
+
+    取证4对比();
+    memcpy(取证4上轮, 取证4当轮, sizeof(坐标候选) * (size_t)取证4当轮数);
+    取证4上轮数 = 取证4当轮数;
+    fprintf(取证4文件, "--- 采样%d 候选 %d 条，累计变化 %d 条 ---\n",
+            序号, 取证4当轮数, 取证4变化数);
+    fflush(取证4文件);
+
+    if (序号 >= 7) {   // 8 次采样 × 15 秒 ≈ 105 秒
+        取证4完成 = true;
+        fprintf(取证4文件, "\n=== 取证结束：%d 次采样，变化候选 %d 条 ===\n", 序号 + 1, 取证4变化数);
+        fclose(取证4文件);
+        取证4文件 = nullptr;
+    }
+}
+
 // ==================== 主渲染 ====================
 
 static bool 点在小地图(const ImVec4& 地图, float x, float y) {
@@ -1980,10 +2142,10 @@ void Draw::StartBooks() {
     // 每 0.5 秒一行/槽（ID/阵营/+0x278 坐标/血量），第 20/80/200 份快照整块导出。
     static bool 已提示取证 = false;
     if (数量 >= 2) {
-        取证3(根世界, 容器, 数组, 数量);
-        if (!已提示取证 && 取证3文件) {
+        取证4(根世界, 容器, 数组, 数量);
+        if (!已提示取证 && 取证4文件) {
             已提示取证 = true;
-            日志("取证v3 已开跑 → Documents/fields_dump3.txt（坐标走 +0x278 直读）");
+            日志("取证v4 已开跑 → Documents/fields_dump4.txt（实时坐标动态搜索）");
         }
     }
 
