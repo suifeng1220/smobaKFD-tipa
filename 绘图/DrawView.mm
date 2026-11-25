@@ -958,12 +958,44 @@ static void 链打分(uint64_t 数组, int 数量) {
 }
 
 static const char* 链名(int i) {
+    if (i == 4) return "直读";
     if (i < 0 || i >= 3) return "-";
     return SDK::坐标链表[i].名字;
 }
 
-// 读实体坐标（走当前链，无效时兜底链[0]）
+// ===== 实测坐标偏移（证据来自 fields_dump2.txt，10 英雄 × 555 快照）=====
+//
+//   实体 +0x278 = X，+0x27C = Y，+0x280 = Z   （三个 int32，即 VInt3）
+//
+// 判定依据（全部可在 dump 里复核）：
+//   1. 10 个英雄在同一时刻的 +0x278/+0x280 两两不同；
+//   2. 数值全部落在 ±60000（地图量级），且没有一个等于 INT_MAX / 0；
+//   3. 阵营 1 的槽（0/2/4/6/8）X、Z 全为负，阵营 2 的槽（1/3/5/7/9）全为正
+//      —— 正好是两个对角出生角，与 5v5 地图几何一致。
+//
+// 为什么废弃旧的四段指针链（0xa8→0x10→0x0→0x78→+0x2B8）：
+//   同一批 555 份快照里，那条链给的值是 -2144158520、998836568、2147483645 这类垃圾，
+//   只有 158/555 份"碰巧"落进区间校验，且值恒定不变（681/685 一路不变）。
+//   它中间每段解引用落到的是 0x60/0x78 这种 24 字节结构体数组元素上，读 +0x2B8 是越界读。
+static const uint64_t 坐标偏移X = 0x278;
+static const uint64_t 坐标偏移Y = 0x27C;
+static const uint64_t 坐标偏移Z = 0x280;
+
+static bool 读实测坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
+    if (!IsValidAddr(实体)) return false;
+    int x = vm_read<int>(实体 + 坐标偏移X);
+    int z = vm_read<int>(实体 + 坐标偏移Z);
+    if (坐标合理(x) && 坐标合理(z) && (x || z)) {
+        *X = (unsigned)x;
+        *Z = (unsigned)z;
+        return true;
+    }
+    return false;
+}
+
+// 读实体坐标：实测直读优先，旧的链只当兜底
 static int 读实体坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
+    if (读实测坐标(实体, X, Z)) return 4;
     if (当前链 < 0 || 当前链 >= 3) {
         if (读坐标某链(实体, SDK::坐标链表[0], X, Z)) return 0;
         return -1;
@@ -1738,25 +1770,17 @@ static bool 字段取证(uint64_t 数组, int 数量) {
     return 打印类 > 0;
 }
 
-// ==================== 全量取证 v2（原始字节 + 逐槽有效性） ====================
+// ==================== 取证 v3（坐标时序 + 活局原始字节对拍） ====================
 //
-// v1（找 FieldInfo 表）已经给出硬结论，这里必须基于它而不是绕过它：
-//   实体 +0 那个指针 0x13b59eb28 在 10575 次采样里恒定，但 类+16 / 类+24 处读不到
-//   任何一对相邻的可读 ASCII 字符串，0x800 字节里也没有 —— 它不是标准 Il2CppClass，
-//   所以 v1 永远找不到 FieldInfo 表（不是校验太严，是方向不对）。
-// v1 第二个硬结论：数组里只有槽 0 的实体能过 IsValidAddr，槽 1..9 全被跳过，
-//   而 数量=10 一直很稳 —— 说明「槽距 24」这条假设本身需要拿原始字节来验。
-//
-// 这一轮只做两件事：把字节原样拿出来，把模块基址记下来。
-//   * 容器 / 数组区原始字节 → 槽距是 24 还是 8、数组指针是否 4 字节错位，一眼可判
-//   * 每个槽：实体指针 / 类指针 / 阵营 / 血量 / ID / 三条链每一步的指针 → 哪一步断的
-//   * 有效实体的 0x380 字节 → 离线找 lastVisibleLocation、campVisible 这类字段
-//   * 模块基址 → 「类 - 模块基址」就是 UnityFramework 里的静态偏移，可直接丢进 IDA
-static FILE* 取证2文件 = nullptr;
-static int   取证2帧计 = 0;
-static int   取证2快照 = 0;
-static bool  取证2完成 = false;
-static bool  取证2类已打 = false;
+// v2 已经交出了硬结论，v3 只做验证和补盲，不再重复扫类结构：
+//   * 每 0.5 秒一行/槽：英雄ID(+0x28)、阵营(+0x34)、坐标(+0x278/+0x27C/+0x280)、
+//     0x288/0x290 那对小值、血量 —— 用来看坐标是否随走位变化、槽位和英雄ID 是否对得上
+//   * 在第 20/21、80/81、200/201 份快照时把这 10 个实体各 0x380 字节整块导出，
+//     两两对拍就能列出「活局里真正在变的字段」，位置/视野/朝向都在里面
+static FILE* 取证3文件 = nullptr;
+static int   取证3帧计 = 0;
+static int   取证3快照 = 0;
+static bool  取证3完成 = false;
 
 static void 原始十六进制(FILE* fp, uint64_t 址, int 字节数) {
     if (!IsValidAddr(址) || 字节数 <= 0) {
@@ -1776,121 +1800,69 @@ static void 原始十六进制(FILE* fp, uint64_t 址, int 字节数) {
     }
 }
 
-// 走一条坐标链，把每一段的指针都记下来，最后读 X/Z
-static void 链轨迹(FILE* fp, uint64_t 实体, const SDK::坐标链& 链) {
-    uint64_t 段[6] = {0};
-    int 到 = 0;
-    段[0] = 实体;
-    uint64_t p = 实体;
-    uint64_t 偏[4] = {链.一, 链.二, 链.三, 链.四};
-    for (int i = 0; i < 4; ++i) {
-        if (!IsValidAddr(p)) break;
-        p = vm_read<uint64_t>(p + 偏[i]);
-        段[i + 1] = p;
-        到 = i + 1;
-        if (!IsValidAddr(p)) break;
-    }
-    fprintf(fp, "     %-6s +%#llx=%#llx +%#llx=%#llx +%#llx=%#llx +%#llx=%#llx",
-            链.名字,
-            (unsigned long long)链.一, (unsigned long long)段[1],
-            (unsigned long long)链.二, (unsigned long long)段[2],
-            (unsigned long long)链.三, (unsigned long long)段[3],
-            (unsigned long long)链.四, (unsigned long long)段[4]);
-    if (到 == 4 && IsValidAddr(段[4])) {
-        int x = vm_read<int>(段[4] + SDK::坐标X);
-        int z = vm_read<int>(段[4] + SDK::坐标Y);
-        fprintf(fp, "  X=%d Z=%d %s\n", x, z, (坐标合理(x) && 坐标合理(z)) ? "√" : "×");
-    } else {
-        fprintf(fp, "  链在第%d段断开\n", 到 + 1);
-    }
-}
+static void 取证3(uint64_t 世界, uint64_t 容器, uint64_t 数组, int 数量) {
+    if (取证3完成) return;
+    if (++取证3帧计 % 30) return;
 
-// 每 30 帧（约 0.5 秒）落一份快照，最多 900 份（约 7 分钟），之后自动停
-static void 全量取证(uint64_t 世界, uint64_t 容器, uint64_t 数组, int 数量) {
-    if (取证2完成) return;
-    if (++取证2帧计 % 30) return;
-
-    if (!取证2文件) {
+    if (!取证3文件) {
         const char* 家 = getenv("HOME");
         if (!家) return;
         char 路径[512];
-        snprintf(路径, sizeof(路径), "%s/Documents/fields_dump2.txt", 家);
-        取证2文件 = fopen(路径, "w");
-        if (!取证2文件) return;
-        setvbuf(取证2文件, nullptr, _IOLBF, 0);
-        fprintf(取证2文件, "=== 全量取证 v2 ===\n");
-        fprintf(取证2文件, "pid=%d  模块基址=%#llx  世界槽=%#llx  相机槽=%#llx\n",
-                游戏pid,
-                (unsigned long long)模块基址,
-                (unsigned long long)(模块基址 + SDK::根世界),
-                (unsigned long long)(模块基址 + SDK::根相机));
-        fprintf(取证2文件, "世界=%#llx  容器=%#llx  数组=%#llx  数量=%d\n",
+        snprintf(路径, sizeof(路径), "%s/Documents/fields_dump3.txt", 家);
+        取证3文件 = fopen(路径, "w");
+        if (!取证3文件) return;
+        setvbuf(取证3文件, nullptr, _IOLBF, 0);
+        fprintf(取证3文件, "=== 取证 v3（坐标时序）===\n");
+        fprintf(取证3文件, "pid=%d  模块基址=%#llx  世界槽=%#llx\n",
+                游戏pid, (unsigned long long)模块基址,
+                (unsigned long long)(模块基址 + SDK::根世界));
+        fprintf(取证3文件, "世界=%#llx  容器=%#llx  数组=%#llx  数量=%d  跳=%s\n",
                 (unsigned long long)世界, (unsigned long long)容器,
-                (unsigned long long)数组, 数量);
-        fprintf(取证2文件, "数组 %#llx 是否 8 字节对齐: %s（&7=%d）\n",
-                (unsigned long long)数组, (数组 & 7) ? "否" : "是", (int)(数组 & 7));
-        fprintf(取证2文件, "\n--- 容器 %#llx 前 0x100 字节 ---\n", (unsigned long long)容器);
-        原始十六进制(取证2文件, 容器, 0x100);
-        if (IsValidAddr(数组) && 数组 > 0x20) {
-            fprintf(取证2文件, "\n--- 数组区 %#llx 起 0x1a0 字节（含 -0x20 前置）---\n",
-                    (unsigned long long)(数组 - 0x20));
-            原始十六进制(取证2文件, 数组 - 0x20, 0x1a0);
-        }
+                (unsigned long long)数组, 数量,
+                (数组 & 7) ? "错位" : "对齐");
+        fprintf(取证3文件, "格式: [槽] ent id camp p=(x,y,z)@0x278 q=(a,b)@0x288 hp\n");
     }
 
-    fprintf(取证2文件, "\n### 快照 %d\n", 取证2快照);
+    fprintf(取证3文件, "### 快照 %d\n", 取证3快照);
     for (int k = 0; k < 数量 && k < 32; ++k) {
-        uint64_t 槽址 = 数组 + 24ULL * (uint64_t)k;
-        unsigned char 项[24] = {0};
-        if (!readMemory(槽址, 项, 24)) {
-            fprintf(取证2文件, " [%2d] 槽 %#llx 读失败\n", k, (unsigned long long)槽址);
-            continue;
-        }
-        uint64_t 实体 = 0, 第二 = 0, 第三 = 0;
-        memcpy(&实体, 项, 8);
-        memcpy(&第二, 项 + 8, 8);
-        memcpy(&第三, 项 + 16, 8);
+        uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)k);
         if (!IsValidAddr(实体)) {
-            fprintf(取证2文件, " [%2d] 槽=%#llx 实体无效  三项={%#llx %#llx %#llx}\n",
-                    k, (unsigned long long)槽址,
-                    (unsigned long long)实体, (unsigned long long)第二, (unsigned long long)第三);
+            fprintf(取证3文件, " [%2d] 实体无效\n", k);
             continue;
         }
-        uint64_t 类 = vm_read<uint64_t>(实体);
-        int 阵52 = vm_read<int>(实体 + 52);
-        int 阵C0 = vm_read<int>(实体 + 192);
-        long long id40 = vm_read<long long>(实体 + 40);
-        int 血 = 读血量当前(实体), 血上 = 读血量上限(实体);
-        fprintf(取证2文件,
-                " [%2d] 槽=%#llx 实体=%#llx 类=%#llx  阵+52=%d 阵+0xC0=%d id+40=%lld 血=%d/%d\n",
-                k, (unsigned long long)槽址, (unsigned long long)实体,
-                (unsigned long long)类, 阵52, 阵C0, id40, 血, 血上);
-        for (int c = 0; c < 3; ++c) 链轨迹(取证2文件, 实体, SDK::坐标链表[c]);
+        int id   = vm_read<int>(实体 + 0x28);
+        int camp = vm_read<int>(实体 + 0x34);
+        int px   = vm_read<int>(实体 + 0x278);
+        int py   = vm_read<int>(实体 + 0x27C);
+        int pz   = vm_read<int>(实体 + 0x280);
+        int qa   = vm_read<int>(实体 + 0x288);
+        int qb   = vm_read<int>(实体 + 0x290);
+        int 血   = 读血量当前(实体), 血上 = 读血量上限(实体);
+        fprintf(取证3文件,
+                " [%2d] %#llx id=%-4d camp=%d p=(%d,%d,%d) q=(%d,%d) hp=%d/%d\n",
+                k, (unsigned long long)实体, id, camp, px, py, pz, qa, qb, 血, 血上);
+    }
 
-        // 类只打一次：类 - 模块基址 = UnityFramework 内静态偏移，可直接进 IDA
-        if (!取证2类已打 && IsValidAddr(类)) {
-            取证2类已打 = true;
-            fprintf(取证2文件, "   >> 类=%#llx  模块基址=%#llx  类-基址=%#llx（IDA 里就查这个地址）\n",
-                    (unsigned long long)类, (unsigned long long)模块基址,
-                    (unsigned long long)(类 - 模块基址));
-            fprintf(取证2文件, "   --- 类前 0x600 字节 ---\n");
-            原始十六进制(取证2文件, 类, 0x600);
-        }
-
-        // 前 4 份快照里，把阵营合理的实体整块原样导出（0x380 够覆盖枪位/视野字段）
-        if (取证2快照 < 4 && 阵52 >= -1 && 阵52 <= 7) {
-            fprintf(取证2文件, "   --- 实体 %#llx 前 0x380 字节 ---\n",
-                    (unsigned long long)实体);
-            原始十六进制(取证2文件, 实体, 0x380);
+    // 活局对拍：这两份相邻快照的整块内存差异 = 真正在更新的字段
+    bool 要整块 = (取证3快照 == 20 || 取证3快照 == 21 ||
+                   取证3快照 == 80 || 取证3快照 == 81 ||
+                   取证3快照 == 200 || 取证3快照 == 201);
+    if (要整块) {
+        for (int k = 0; k < 数量 && k < 32; ++k) {
+            uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)k);
+            if (!IsValidAddr(实体)) continue;
+            fprintf(取证3文件, "  --- 实体 %#llx 整块 0x380（快照 %d）---\n",
+                    (unsigned long long)实体, 取证3快照);
+            原始十六进制(取证3文件, 实体, 0x380);
         }
     }
 
-    取证2快照++;
-    if (取证2快照 >= 900) {
-        取证2完成 = true;
-        fprintf(取证2文件, "\n=== 取证结束（%d 份快照）===\n", 取证2快照);
-        fclose(取证2文件);
-        取证2文件 = nullptr;
+    取证3快照++;
+    if (取证3快照 >= 900) {
+        取证3完成 = true;
+        fprintf(取证3文件, "\n=== 取证结束（%d 份快照）===\n", 取证3快照);
+        fclose(取证3文件);
+        取证3文件 = nullptr;
     }
 }
 
@@ -2004,16 +1976,14 @@ void Draw::StartBooks() {
         return;
     }
 
-    // 全量取证 v2：进对局/大厅都跑，每 0.5 秒一份快照，导出原始字节到
-    // Documents/fields_dump2.txt。只走我们自己的跨进程读，不碰游戏进程。
-    // v1 的 FieldInfo 路线已证伪（实体 +0 不是标准 Il2CppClass），这里不再调用。
+    // 取证 v3：坐标时序 + 活局整块对拍 → Documents/fields_dump3.txt
+    // 每 0.5 秒一行/槽（ID/阵营/+0x278 坐标/血量），第 20/80/200 份快照整块导出。
     static bool 已提示取证 = false;
-    if (数量 >= 8) {
-        全量取证(根世界, 容器, 数组, 数量);
-        if (!已提示取证 && 取证2文件) {
+    if (数量 >= 2) {
+        取证3(根世界, 容器, 数组, 数量);
+        if (!已提示取证 && 取证3文件) {
             已提示取证 = true;
-            日志("取证v2 已开跑 → Documents/fields_dump2.txt（模块基址=%#llx）",
-                 (unsigned long long)模块基址);
+            日志("取证v3 已开跑 → Documents/fields_dump3.txt（坐标走 +0x278 直读）");
         }
     }
 
@@ -2072,6 +2042,7 @@ void Draw::StartBooks() {
     // 同一英雄ID 只画一次：联机数组里同一英雄可能有多个实体（影子/预测体/重复槽），
     // 不去重就会出现"一个英雄两个图标、位置还不一样"，看起来就是乱跳。
     long long 已画ID[20] = {0};
+    int 已画X[20] = {0}, 已画Z[20] = {0};
     int 已画数 = 0;
 
     // 诊断采样：每 5 秒把画出来的敌方逐条打进日志（含槽位号），用来判断
@@ -2093,13 +2064,9 @@ void Draw::StartBooks() {
 
         if (阵营 == (int)我方阵营) continue;
 
-        long long 英雄ID = vm_read<long long>(实体 + 40);
-        if (cfg_id_pick && 英雄ID > 0 && 英雄ID < 1000) {
-            bool 重复 = false;
-            for (int d = 0; d < 已画数; ++d) if (已画ID[d] == 英雄ID) { 重复 = true; break; }
-            if (重复) continue;
-            if (已画数 < 20) 已画ID[已画数++] = 英雄ID;
-        }
+        // 英雄ID 实测在 +0x28，是 32 位（紧跟的 +0x2C 是另一个小整数 25/8/13）。
+        // 原来读 8 字节会把 +0x2C 一起吞进来，值必然 > 1000，去重条件永远不成立。
+        long long 英雄ID = vm_read<int>(实体 + 0x28);
 
         int 血当前 = 读血量当前(实体);
         int 血上限 = 读血量上限(实体);
@@ -2111,6 +2078,26 @@ void Draw::StartBooks() {
         unsigned 样X = 0, 样Z = 0;
         int 链 = 读实体坐标(实体, &样X, &样Z);
         if (链 < 0 || 样X == 1000000) continue;
+
+        // 同一英雄只画一次：必须「ID 相同 + 位置几乎重合」才算重复。
+        // 依据 fields_dump2.txt：奇数槽（阵营 2）的 +0x28 会在 {110,111,175,506,581}
+        // 之间来回变，光按 ID 去重会把真实敌人整批吞掉；带上位置条件才不会误杀。
+        if (cfg_id_pick && 英雄ID > 0 && 英雄ID < 1000) {
+            bool 重复 = false;
+            for (int d = 0; d < 已画数; ++d) {
+                if (已画ID[d] != 英雄ID) continue;
+                long long dx = (long long)(int)样X - 已画X[d];
+                long long dz = (long long)(int)样Z - 已画Z[d];
+                if (dx * dx + dz * dz < 8000LL * 8000LL) { 重复 = true; break; }
+            }
+            if (重复) continue;
+            if (已画数 < 20) {
+                已画ID[已画数] = 英雄ID;
+                已画X[已画数] = (int)样X;
+                已画Z[已画数] = (int)样Z;
+                已画数++;
+            }
+        }
 
         有坐标实体++;
         if (!有首个) {
