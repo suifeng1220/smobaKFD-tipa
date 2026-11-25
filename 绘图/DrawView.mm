@@ -8,6 +8,9 @@
 #include "DrawView.hpp"
 #include <mutex>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
 #include <cmath>
 #include <mach/mach.h>
 #include <sys/sysctl.h>
@@ -1553,6 +1556,188 @@ static void 底部文字(const ImVec2& 屏, const char* 文案) {
     });
 }
 
+// ==================== 运行时字段取证 ====================
+//
+// 依据（可自校验，不是推断）：
+//   il2cpp 对象头 [+0] = Il2CppClass*
+//   Il2CppClass 内部存有 FieldInfo* 字段表
+//   FieldInfo = { const char* name;          // +0
+//                 const Il2CppType* type;    // +8
+//                 Il2CppClass* parent;       // +16
+//                 int32_t offset;            // +24  ← 真实 C# 字段偏移
+//                 uint32_t token; }          // +28      共 32 字节
+// 所以从任意实体指针出发，就能反推它所属类的全部字段名与真实偏移。
+//
+// 校验手段（三条同时成立才认）：
+//   1. 字段名指针指向可读 ASCII 字符串（0x20~0x7E，40 字节内有结束符）
+//   2. offset 落在 [-0x100, 0x20000]
+//   3. 连续 6 项都满足，且 FieldInfo.parent 多数等于本类指针
+// 命中的表会把真实名字打印出来，名字对不上就说明没命中——不存在“看起来对”。
+static bool 读字段名(uint64_t 地址, char* 出, int 上限) {
+    if (!IsValidAddr(地址) || 上限 < 2) return false;
+    char 缓冲[64];
+    int 需 = 上限 < 64 ? 上限 : 64;
+    if (!readMemory(地址, 缓冲, 需)) return false;
+    for (int i = 0; i < 需; ++i) {
+        unsigned char c = (unsigned char)缓冲[i];
+        if (c == 0) {
+            出[i] = 0;
+            return i > 0;
+        }
+        if (c < 0x20 || c > 0x7E) return false;   // 字段名只可能是可见 ASCII
+        出[i] = (char)c;
+    }
+    return false;                                  // 无结束符，不像字段名
+}
+
+// 在 klass 内存里找 FieldInfo 表，返回表地址；*出字段数 为连续有效项数
+static uint64_t 找字段表(uint64_t 类, int* 出字段数) {
+    unsigned char 类体[0x800];
+    if (!readMemory(类, 类体, sizeof(类体))) return 0;
+
+    uint64_t 最佳 = 0;
+    int 最佳分 = 0, 最佳数 = 0;
+
+    for (int 位 = 0x40; 位 + 8 <= 0x800; 位 += 8) {
+        uint64_t 表 = 0;
+        memcpy(&表, 类体 + 位, 8);
+        if (!IsValidAddr(表) || (表 & 7)) continue;
+
+        // 先只读一项做快速筛查，避免无谓的大块读
+        unsigned char 首项[32];
+        if (!readMemory(表, 首项, 32)) continue;
+        uint64_t 名0;
+        int32_t 偏0;
+        memcpy(&名0, 首项, 8);
+        memcpy(&偏0, 首项 + 24, 4);
+        if (偏0 < -0x100 || 偏0 > 0x20000) continue;
+        char 试名[48];
+        if (!读字段名(名0, 试名, 40)) continue;
+
+        // 连续 64 项逐项验证
+        unsigned char 全表[32 * 64];
+        if (!readMemory(表, 全表, sizeof(全表))) continue;
+        int 好 = 0, 父命中 = 0;
+        for (int i = 0; i < 64; ++i) {
+            unsigned char* e = 全表 + i * 32;
+            uint64_t 名p, 父p;
+            int32_t 偏;
+            memcpy(&名p, e, 8);
+            memcpy(&父p, e + 16, 8);
+            memcpy(&偏, e + 24, 4);
+            if (偏 < -0x100 || 偏 > 0x20000) break;
+            char 名[48];
+            if (!读字段名(名p, 名, 40)) break;
+            好++;
+            if (父p == 类) 父命中++;
+        }
+        if (好 < 6) continue;
+        int 分 = 好 * 2 + 父命中;
+        if (分 > 最佳分) {
+            最佳分 = 分;
+            最佳 = 表;
+            最佳数 = 好;
+        }
+    }
+    if (出字段数) *出字段数 = 最佳数;
+    return 最佳;
+}
+
+// 从 klass 取 名称 + 命名空间
+static bool 读类名(uint64_t 类, char* 名, char* 空间) {
+    char a[64] = {0}, b[64] = {0};
+    if (读字段名(vm_read<uint64_t>(类 + 16), a, 48)
+        && 读字段名(vm_read<uint64_t>(类 + 24), b, 48)) {
+        strncpy(名, a, 63); strncpy(空间, b, 63);
+        return true;
+    }
+    // 兜底：klass 头部找相邻的两个字符串指针
+    for (int 位 = 0; 位 < 0x100; 位 += 8) {
+        uint64_t p1 = vm_read<uint64_t>(类 + 位);
+        uint64_t p2 = vm_read<uint64_t>(类 + 位 + 8);
+        if (!IsValidAddr(p1) || !IsValidAddr(p2)) continue;
+        if (读字段名(p1, a, 48) && 读字段名(p2, b, 48)) {
+            strncpy(名, a, 63); strncpy(空间, b, 63);
+            return true;
+        }
+    }
+    名[0] = 0;
+    空间[0] = 0;
+    return false;
+}
+
+// 一次性导出实体的类结构到 Documents/fields_dump.txt
+static bool 字段取证(uint64_t 数组, int 数量) {
+    const char* 家 = getenv("HOME");
+    if (!家 || !IsValidAddr(数组) || 数量 <= 0) return false;
+    char 路径[512];
+    snprintf(路径, sizeof(路径), "%s/Documents/fields_dump.txt", 家);
+    FILE* fp = fopen(路径, "a");
+    if (!fp) return false;
+
+    fprintf(fp, "\n########## 字段取证 ##########\n");
+    fprintf(fp, "数组=%#llx  槽数=%d\n", (unsigned long long)数组, 数量);
+
+    uint64_t 见过[8] = {0};
+    int 见过数 = 0, 打印类 = 0;
+
+    for (int i = 0; i < 数量 && 打印类 < 4; ++i) {
+        uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * i);
+        if (!IsValidAddr(实体)) continue;
+        uint64_t 类 = vm_read<uint64_t>(实体);
+        if (!IsValidAddr(类)) continue;
+
+        bool 重复 = false;
+        for (int k = 0; k < 见过数; ++k) if (见过[k] == 类) 重复 = true;
+        if (重复) continue;
+        if (见过数 < 8) 见过[见过数++] = 类;
+
+        char 名[64] = {0}, 空间[64] = {0};
+        读类名(类, 名, 空间);
+        int 字段数 = 0;
+        uint64_t 表 = 找字段表(类, &字段数);
+        if (!表) {
+            fprintf(fp, "\n--- 槽%d 实体=%#llx 类=%#llx %s.%s ：未找到 FieldInfo 表 ---\n",
+                    i, (unsigned long long)实体, (unsigned long long)类, 空间, 名);
+            continue;
+        }
+
+        fprintf(fp, "\n--- 槽%d  实体=%#llx  类=%#llx  %s.%s  有效项=%d  表=%#llx ---\n",
+                i, (unsigned long long)实体, (unsigned long long)类, 空间, 名,
+                字段数, (unsigned long long)表);
+
+        // 代码里正在用的五个偏移，把当时的值一起打出来做对照
+        fprintf(fp, "  对照 +0x28(id64)=%lld  +0x34(camp32)=%d  +0xC0(camp32)=%d  +0x1D0=%#llx  +0x1E8=%#llx\n",
+                (long long)vm_read<long long>(实体 + 0x28),
+                vm_read<int>(实体 + 0x34),
+                vm_read<int>(实体 + 0xC0),
+                (unsigned long long)vm_read<uint64_t>(实体 + 0x1D0),
+                (unsigned long long)vm_read<uint64_t>(实体 + 0x1E8));
+
+        for (int f = 0; f < 512; ++f) {
+            unsigned char e[32];
+            if (!readMemory(表 + 32ULL * f, e, 32)) break;
+            uint64_t 名p, 父p;
+            int32_t 偏;
+            memcpy(&名p, e, 8);
+            memcpy(&父p, e + 16, 8);
+            memcpy(&偏, e + 24, 4);
+            if (偏 < -0x100 || 偏 > 0x20000) break;
+            char 字段[48] = {0};
+            if (!读字段名(名p, 字段, 40)) break;
+            const char* 标 = "";
+            if (偏 == 0x28 || 偏 == 0x34 || 偏 == 0xC0 || 偏 == 0x1D0 || 偏 == 0x1E8) 标 = "   <<< 代码在用的偏移";
+            fprintf(fp, "   [%3d] +%#06x  %-34s %s%s\n", f, (unsigned)偏, 字段,
+                    (父p == 类 ? "本类" : "他类"), 标);
+        }
+        打印类++;
+    }
+
+    fprintf(fp, "########## 结束 ##########\n");
+    fclose(fp);
+    return 打印类 > 0;
+}
+
 // ==================== 主渲染 ====================
 
 static bool 点在小地图(const ImVec4& 地图, float x, float y) {
@@ -1661,6 +1846,14 @@ void Draw::StartBooks() {
         状态浮层(4, "实体数组无效");
         if (!在对局) 底部文字(屏, "等待进入对局");
         return;
+    }
+
+    // 字段取证：进对局后自动跑一次（成功一次即停），导出实体的类结构与真实字段偏移。
+    // 不注入游戏进程、不碰反外挂检测面，只走我们自己的跨进程读。
+    static bool 已字段取证 = false;
+    if (!已字段取证 && 数量 >= 8) {
+        已字段取证 = 字段取证(数组, 数量);
+        if (已字段取证) 日志("字段取证完成 → Documents/fields_dump.txt");
     }
 
     // 我方阵营：配置指定 or 按相机朝向猜（矩阵[0]<=0 → 2，否则 1）
