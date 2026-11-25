@@ -1738,6 +1738,162 @@ static bool 字段取证(uint64_t 数组, int 数量) {
     return 打印类 > 0;
 }
 
+// ==================== 全量取证 v2（原始字节 + 逐槽有效性） ====================
+//
+// v1（找 FieldInfo 表）已经给出硬结论，这里必须基于它而不是绕过它：
+//   实体 +0 那个指针 0x13b59eb28 在 10575 次采样里恒定，但 类+16 / 类+24 处读不到
+//   任何一对相邻的可读 ASCII 字符串，0x800 字节里也没有 —— 它不是标准 Il2CppClass，
+//   所以 v1 永远找不到 FieldInfo 表（不是校验太严，是方向不对）。
+// v1 第二个硬结论：数组里只有槽 0 的实体能过 IsValidAddr，槽 1..9 全被跳过，
+//   而 数量=10 一直很稳 —— 说明「槽距 24」这条假设本身需要拿原始字节来验。
+//
+// 这一轮只做两件事：把字节原样拿出来，把模块基址记下来。
+//   * 容器 / 数组区原始字节 → 槽距是 24 还是 8、数组指针是否 4 字节错位，一眼可判
+//   * 每个槽：实体指针 / 类指针 / 阵营 / 血量 / ID / 三条链每一步的指针 → 哪一步断的
+//   * 有效实体的 0x380 字节 → 离线找 lastVisibleLocation、campVisible 这类字段
+//   * 模块基址 → 「类 - 模块基址」就是 UnityFramework 里的静态偏移，可直接丢进 IDA
+static FILE* 取证2文件 = nullptr;
+static int   取证2帧计 = 0;
+static int   取证2快照 = 0;
+static bool  取证2完成 = false;
+static bool  取证2类已打 = false;
+
+static void 原始十六进制(FILE* fp, uint64_t 址, int 字节数) {
+    if (!IsValidAddr(址) || 字节数 <= 0) {
+        fprintf(fp, "  <地址无效 %#llx>\n", (unsigned long long)址);
+        return;
+    }
+    if (字节数 > 0x600) 字节数 = 0x600;
+    unsigned char 缓冲[0x600];
+    if (!readMemory(址, 缓冲, (size_t)字节数)) {
+        fprintf(fp, "  <读失败 %#llx>\n", (unsigned long long)址);
+        return;
+    }
+    for (int i = 0; i < 字节数; i += 16) {
+        fprintf(fp, "  %04x:", i);
+        for (int j = 0; j < 16 && i + j < 字节数; ++j) fprintf(fp, " %02x", 缓冲[i + j]);
+        fprintf(fp, "\n");
+    }
+}
+
+// 走一条坐标链，把每一段的指针都记下来，最后读 X/Z
+static void 链轨迹(FILE* fp, uint64_t 实体, const SDK::坐标链& 链) {
+    uint64_t 段[6] = {0};
+    int 到 = 0;
+    段[0] = 实体;
+    uint64_t p = 实体;
+    uint64_t 偏[4] = {链.一, 链.二, 链.三, 链.四};
+    for (int i = 0; i < 4; ++i) {
+        if (!IsValidAddr(p)) break;
+        p = vm_read<uint64_t>(p + 偏[i]);
+        段[i + 1] = p;
+        到 = i + 1;
+        if (!IsValidAddr(p)) break;
+    }
+    fprintf(fp, "     %-6s +%#llx=%#llx +%#llx=%#llx +%#llx=%#llx +%#llx=%#llx",
+            链.名字,
+            (unsigned long long)链.一, (unsigned long long)段[1],
+            (unsigned long long)链.二, (unsigned long long)段[2],
+            (unsigned long long)链.三, (unsigned long long)段[3],
+            (unsigned long long)链.四, (unsigned long long)段[4]);
+    if (到 == 4 && IsValidAddr(段[4])) {
+        int x = vm_read<int>(段[4] + SDK::坐标X);
+        int z = vm_read<int>(段[4] + SDK::坐标Y);
+        fprintf(fp, "  X=%d Z=%d %s\n", x, z, (坐标合理(x) && 坐标合理(z)) ? "√" : "×");
+    } else {
+        fprintf(fp, "  链在第%d段断开\n", 到 + 1);
+    }
+}
+
+// 每 30 帧（约 0.5 秒）落一份快照，最多 900 份（约 7 分钟），之后自动停
+static void 全量取证(uint64_t 世界, uint64_t 容器, uint64_t 数组, int 数量) {
+    if (取证2完成) return;
+    if (++取证2帧计 % 30) return;
+
+    if (!取证2文件) {
+        const char* 家 = getenv("HOME");
+        if (!家) return;
+        char 路径[512];
+        snprintf(路径, sizeof(路径), "%s/Documents/fields_dump2.txt", 家);
+        取证2文件 = fopen(路径, "w");
+        if (!取证2文件) return;
+        setvbuf(取证2文件, nullptr, _IOLBF, 0);
+        fprintf(取证2文件, "=== 全量取证 v2 ===\n");
+        fprintf(取证2文件, "pid=%d  模块基址=%#llx  世界槽=%#llx  相机槽=%#llx\n",
+                游戏pid,
+                (unsigned long long)模块基址,
+                (unsigned long long)(模块基址 + SDK::根世界),
+                (unsigned long long)(模块基址 + SDK::根相机));
+        fprintf(取证2文件, "世界=%#llx  容器=%#llx  数组=%#llx  数量=%d\n",
+                (unsigned long long)世界, (unsigned long long)容器,
+                (unsigned long long)数组, 数量);
+        fprintf(取证2文件, "数组 %#llx 是否 8 字节对齐: %s（&7=%d）\n",
+                (unsigned long long)数组, (数组 & 7) ? "否" : "是", (int)(数组 & 7));
+        fprintf(取证2文件, "\n--- 容器 %#llx 前 0x100 字节 ---\n", (unsigned long long)容器);
+        原始十六进制(取证2文件, 容器, 0x100);
+        if (IsValidAddr(数组) && 数组 > 0x20) {
+            fprintf(取证2文件, "\n--- 数组区 %#llx 起 0x1a0 字节（含 -0x20 前置）---\n",
+                    (unsigned long long)(数组 - 0x20));
+            原始十六进制(取证2文件, 数组 - 0x20, 0x1a0);
+        }
+    }
+
+    fprintf(取证2文件, "\n### 快照 %d\n", 取证2快照);
+    for (int k = 0; k < 数量 && k < 32; ++k) {
+        uint64_t 槽址 = 数组 + 24ULL * (uint64_t)k;
+        unsigned char 项[24] = {0};
+        if (!readMemory(槽址, 项, 24)) {
+            fprintf(取证2文件, " [%2d] 槽 %#llx 读失败\n", k, (unsigned long long)槽址);
+            continue;
+        }
+        uint64_t 实体 = 0, 第二 = 0, 第三 = 0;
+        memcpy(&实体, 项, 8);
+        memcpy(&第二, 项 + 8, 8);
+        memcpy(&第三, 项 + 16, 8);
+        if (!IsValidAddr(实体)) {
+            fprintf(取证2文件, " [%2d] 槽=%#llx 实体无效  三项={%#llx %#llx %#llx}\n",
+                    k, (unsigned long long)槽址,
+                    (unsigned long long)实体, (unsigned long long)第二, (unsigned long long)第三);
+            continue;
+        }
+        uint64_t 类 = vm_read<uint64_t>(实体);
+        int 阵52 = vm_read<int>(实体 + 52);
+        int 阵C0 = vm_read<int>(实体 + 192);
+        long long id40 = vm_read<long long>(实体 + 40);
+        int 血 = 读血量当前(实体), 血上 = 读血量上限(实体);
+        fprintf(取证2文件,
+                " [%2d] 槽=%#llx 实体=%#llx 类=%#llx  阵+52=%d 阵+0xC0=%d id+40=%lld 血=%d/%d\n",
+                k, (unsigned long long)槽址, (unsigned long long)实体,
+                (unsigned long long)类, 阵52, 阵C0, id40, 血, 血上);
+        for (int c = 0; c < 3; ++c) 链轨迹(取证2文件, 实体, SDK::坐标链表[c]);
+
+        // 类只打一次：类 - 模块基址 = UnityFramework 内静态偏移，可直接进 IDA
+        if (!取证2类已打 && IsValidAddr(类)) {
+            取证2类已打 = true;
+            fprintf(取证2文件, "   >> 类=%#llx  模块基址=%#llx  类-基址=%#llx（IDA 里就查这个地址）\n",
+                    (unsigned long long)类, (unsigned long long)模块基址,
+                    (unsigned long long)(类 - 模块基址));
+            fprintf(取证2文件, "   --- 类前 0x600 字节 ---\n");
+            原始十六进制(取证2文件, 类, 0x600);
+        }
+
+        // 前 4 份快照里，把阵营合理的实体整块原样导出（0x380 够覆盖枪位/视野字段）
+        if (取证2快照 < 4 && 阵52 >= -1 && 阵52 <= 7) {
+            fprintf(取证2文件, "   --- 实体 %#llx 前 0x380 字节 ---\n",
+                    (unsigned long long)实体);
+            原始十六进制(取证2文件, 实体, 0x380);
+        }
+    }
+
+    取证2快照++;
+    if (取证2快照 >= 900) {
+        取证2完成 = true;
+        fprintf(取证2文件, "\n=== 取证结束（%d 份快照）===\n", 取证2快照);
+        fclose(取证2文件);
+        取证2文件 = nullptr;
+    }
+}
+
 // ==================== 主渲染 ====================
 
 static bool 点在小地图(const ImVec4& 地图, float x, float y) {
@@ -1848,12 +2004,17 @@ void Draw::StartBooks() {
         return;
     }
 
-    // 字段取证：进对局后自动跑一次（成功一次即停），导出实体的类结构与真实字段偏移。
-    // 不注入游戏进程、不碰反外挂检测面，只走我们自己的跨进程读。
-    static bool 已字段取证 = false;
-    if (!已字段取证 && 数量 >= 8) {
-        已字段取证 = 字段取证(数组, 数量);
-        if (已字段取证) 日志("字段取证完成 → Documents/fields_dump.txt");
+    // 全量取证 v2：进对局/大厅都跑，每 0.5 秒一份快照，导出原始字节到
+    // Documents/fields_dump2.txt。只走我们自己的跨进程读，不碰游戏进程。
+    // v1 的 FieldInfo 路线已证伪（实体 +0 不是标准 Il2CppClass），这里不再调用。
+    static bool 已提示取证 = false;
+    if (数量 >= 8) {
+        全量取证(根世界, 容器, 数组, 数量);
+        if (!已提示取证 && 取证2文件) {
+            已提示取证 = true;
+            日志("取证v2 已开跑 → Documents/fields_dump2.txt（模块基址=%#llx）",
+                 (unsigned long long)模块基址);
+        }
     }
 
     // 我方阵营：配置指定 or 按相机朝向猜（矩阵[0]<=0 → 2，否则 1）
