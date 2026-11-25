@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- iOS 14+ 兼容版本 - 移除了 iOS 15+ 才有的权限 -->
+    
+    <key>platform-application</key>
+    <true/>
+    <key>com.apple.QuartzCore.displayable-context</key>
+    <true/>
+    <key>com.apple.QuartzCore.secure-mode</key>
+    <true/>
+    <key>com.apple.accessibility.zoom.client</key>
+    <true/>
+    <key>com.apple.developer.ubiquity-kvstore-identifier</key>
+    <string>com.apple.iBooks</string>
+    <key>com.apple.hid.manager.user-access-device</key>
+    <true/>
+    <key>com.apple.hid.manager.user-access-keyboard</key>
+    <true/>
+    <key>com.apple.private.hid.client.event-dispatch</key>
+    <true/>
+    <key>com.apple.private.hid.client.event-filter</key>
+    <true/>
+    <key>com.apple.private.hid.client.event-monitor</key>
+    <true/>
+    <key>com.apple.private.hid.client.service-protected</key>
+    <true/>
+    <key>com.apple.private.hid.manager.client</key>
+    <true/>
+    <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+    <key>com.apple.private.ubiquity-additional-kvstore-identifiers</key>
+    <array>
+        <string>com.apple.AssistiveTouch</string>
+        <string>com.apple.Accessibility.SwitchControl</string>
+        <string>com.apple.Accessibility</string>
+    </array>
+    <key>com.apple.security.iokit-user-client-class</key>
+    <array>
+        <string>IOSurfaceRootUserClient</string>
+        <string>AGXDeviceUserClient</string>
+        <string>IOPMPowerSourceClient</string>
+    </array>
+    <key>com.apple.springboard-ui.client</key>
+    <true/>
+    <key>com.apple.springboard.CFUserNotification</key>
+    <true/>
+    <key>com.apple.springboard.accessibility-window-hosting</key>
+    <true/>
+    <key>com.apple.springboard.launchapplications</key>
+    <true/>
+    <key>com.apple.system.diagnostics.iokit-properties</key>
+    <true/>
+    <!-- 关键：跨进程拿 task 端口（参考包 AB_WZRY_S45重建版 就是靠这一条） -->
+    <key>task_for_pid-allow</key>
+    <true/>
+    <key>com.apple.private.persona-mgmt</key>
+    <true/>
+</dict>
+</plist>

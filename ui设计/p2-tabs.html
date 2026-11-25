@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>P2 · 胶囊分页</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{background:#040507;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:40px 0;
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif;color:#F2F4F8}
+.phone{position:relative;width:390px;height:844px;border-radius:48px;overflow:hidden;
+  background:#07080B;box-shadow:0 50px 130px -30px #000,0 0 0 1px rgba(255,255,255,.07)}
+.glow{position:absolute;inset:0;pointer-events:none;background:
+  radial-gradient(60% 36% at 18% 0%,rgba(53,224,161,.14),transparent 70%),
+  radial-gradient(50% 30% at 88% 4%,rgba(70,120,255,.12),transparent 70%)}
+.app{position:absolute;inset:0;display:flex;flex-direction:column}
+
+/* 顶栏 */
+.hd{flex:none;height:62px;display:flex;align-items:center;gap:10px;padding:0 16px}
+.logo{width:32px;height:32px;border-radius:9px;display:grid;place-items:center;flex:none;
+  background:#0F1116;border:1px solid rgba(255,255,255,.1);box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}
+.logo:before{content:"";width:9px;height:9px;background:#35E0A1;transform:rotate(45deg);border-radius:2px;
+  box-shadow:0 0 10px rgba(53,224,161,.8)}
+.tt{flex:1;min-width:0}
+.tt b{display:block;font-size:14px;font-weight:600;letter-spacing:-.015em}
+.tt span{display:block;font-size:9px;letter-spacing:.13em;color:#61697D;font-weight:600;margin-top:2px}
+.fold{width:31px;height:31px;border-radius:50%;flex:none;display:grid;place-items:center;cursor:pointer;
+  border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.04);color:#9AA2B6;transition:.18s}
+.fold:active{transform:scale(.9)}
+
+/* Tabs */
+.tabs{flex:none;display:flex;gap:4px;margin:2px 16px 0;padding:4px;border-radius:13px;
+  background:#0D0F13;border:1px solid rgba(255,255,255,.06)}
+.tabs button{flex:1;height:34px;border:0;border-radius:9px;background:transparent;color:#6E7688;
+  font-size:12.5px;font-weight:600;font-family:inherit;cursor:pointer;transition:.2s;letter-spacing:-.01em}
+.tabs button.on{background:#F2F4F8;color:#0A0C10;box-shadow:0 2px 8px rgba(0,0,0,.4)}
+
+.pages{flex:1;position:relative;min-height:0}
+.page{position:absolute;inset:0;overflow-y:auto;padding:16px 16px 28px;scrollbar-width:none;
+  opacity:0;pointer-events:none;transform:translateY(6px);transition:.24s}
+.page::-webkit-scrollbar{display:none}
+#p-log{display:flex;flex-direction:column;overflow:hidden}
+.page.on{opacity:1;pointer-events:auto;transform:none}
+
+/* 主开关卡 */
+.hero{border-radius:20px;padding:18px 18px 16px;position:relative;overflow:hidden;
+  background:linear-gradient(160deg,#14171D,#0C0E12);border:1px solid rgba(255,255,255,.08);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.07)}
+.hero.top{background:linear-gradient(160deg,#0F2B22,#0B1216);border-color:rgba(53,224,161,.26);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.09),0 16px 40px -26px rgba(53,224,161,.7)}
+.hero .k{font-size:10px;font-weight:640;letter-spacing:.1em;color:#656D80}
+.hero .v{font-size:33px;font-weight:280;letter-spacing:-.035em;margin-top:9px;line-height:1;color:#8A93A8;transition:.24s}
+.hero.top .v{color:#F4FFF9}
+.hero .bar{height:3px;border-radius:3px;background:rgba(255,255,255,.08);margin-top:16px;overflow:hidden}
+.hero .bar i{display:block;height:100%;width:0;border-radius:3px;background:#35E0A1;
+  box-shadow:0 0 12px rgba(53,224,161,.9);transition:width .5s cubic-bezier(.3,.9,.2,1)}
+.hero .sw{position:absolute;right:18px;top:18px;width:50px;height:29px;border-radius:15px;cursor:pointer;
+  background:rgba(255,255,255,.1);transition:.26s;box-shadow:inset 0 1px 2px rgba(0,0,0,.4)}
+.hero .sw i{position:absolute;top:2.5px;left:2.5px;width:24px;height:24px;border-radius:50%;background:#E7EAF0;
+  transition:transform .3s cubic-bezier(.36,1.4,.52,1);box-shadow:0 2px 6px rgba(0,0,0,.5)}
+.hero .sw.on{background:#35E0A1;box-shadow:0 0 0 1px rgba(53,224,161,.5),0 0 18px rgba(53,224,161,.5)}
+.hero .sw.on i{transform:translateX(21px)}
+.hero .foot{display:flex;align-items:center;gap:6px;margin-top:14px;font-size:11px;color:#6B7386}
+.hero .foot b{color:#A8B1C4;font-weight:560}
+.live{width:6px;height:6px;border-radius:50%;background:#39414F}
+.live.on{background:#35E0A1;box-shadow:0 0 8px #35E0A1}
+
+/* 指标网格 */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:9px}
+.cell{border-radius:15px;padding:13px 14px;background:#0E1014;border:1px solid rgba(255,255,255,.065)}
+.cell .k{font-size:10.5px;color:#61697C;font-weight:520}
+.cell .v{font-size:15.5px;font-weight:560;letter-spacing:-.02em;margin-top:6px;font-variant-numeric:tabular-nums}
+.cell .v small{font-size:10px;color:#6B7386;font-weight:500;margin-left:3px}
+
+/* 分段说明 */
+.sec{margin-top:22px}
+.sec h4{font-size:10.5px;font-weight:640;letter-spacing:.09em;color:#5E6679;margin:0 2px 9px}
+.list{border-radius:17px;overflow:hidden;background:#0E1014;border:1px solid rgba(255,255,255,.065)}
+.li{display:flex;align-items:center;gap:11px;padding:14px;min-height:58px;position:relative;cursor:pointer;transition:background .16s}
+.li+.li:before{content:"";position:absolute;top:0;left:14px;right:14px;height:1px;background:rgba(255,255,255,.055)}
+.li:active{background:rgba(255,255,255,.045)}
+.li .ic{width:32px;height:32px;border-radius:9px;flex:none;display:grid;place-items:center;
+  background:rgba(53,224,161,.1);color:#35E0A1;border:1px solid rgba(53,224,161,.18)}
+.li .ic.red{background:rgba(255,110,120,.09);color:#FF7A85;border-color:rgba(255,110,120,.18)}
+.li .tx{flex:1;min-width:0}
+.li .tx b{display:block;font-size:13.5px;font-weight:540;letter-spacing:-.01em}
+.li .tx span{display:block;font-size:10.5px;color:#6B7386;margin-top:3px;line-height:1.35}
+.li .go{color:#454C5C;flex:none}
+
+/* 按钮 */
+.btn{width:100%;height:46px;border-radius:14px;border:0;cursor:pointer;font-family:inherit;
+  font-size:14px;font-weight:600;letter-spacing:-.01em;margin-top:10px;transition:.16s}
+.btn.primary{background:#35E0A1;color:#04150F;box-shadow:0 10px 24px -12px rgba(53,224,161,.85)}
+.btn.primary:active{transform:translateY(1px);background:#2BCB90}
+.btn.ghost{background:rgba(255,255,255,.05);color:#C3CAD8;border:1px solid rgba(255,255,255,.09)}
+.btn.ghost:active{background:rgba(255,255,255,.1)}
+.btn[disabled]{opacity:.55;pointer-events:none}
+
+/* 日志 */
+.log{flex:1;min-height:120px;border-radius:17px;background:#080A0D;border:1px solid rgba(255,255,255,.06);
+  padding:13px;overflow-y:auto;font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:10.5px;
+  line-height:1.85;color:#7C8699;scrollbar-width:none}
+.log::-webkit-scrollbar{display:none}
+.ln{white-space:pre-wrap;word-break:break-all}
+.ln .tm{color:#3E4757}
+.ln.ok{color:#42E0A4}
+.ln.warn{color:#E5B45F}
+.logbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px}
+.logbar span{font-size:10.5px;font-weight:640;letter-spacing:.09em;color:#5E6679}
+.logbar button{border:0;background:rgba(255,255,255,.06);color:#98A0B2;font-size:11px;font-weight:560;
+  padding:5px 10px;border-radius:8px;font-family:inherit;cursor:pointer}
+
+/* 弹窗 / toast */
+.mask{position:absolute;inset:0;background:rgba(3,4,6,.66);backdrop-filter:blur(7px);display:grid;place-items:center;
+  opacity:0;pointer-events:none;transition:.24s;z-index:40}
+.mask.show{opacity:1;pointer-events:auto}
+.mbox{width:266px;border-radius:22px;padding:24px 22px 18px;text-align:center;background:#12141A;
+  border:1px solid rgba(255,255,255,.11);box-shadow:0 30px 70px -24px #000,inset 0 1px 0 rgba(255,255,255,.1);
+  transform:scale(.9);transition:.3s cubic-bezier(.32,1.3,.5,1)}
+.mask.show .mbox{transform:scale(1)}
+.mck{width:46px;height:46px;margin:0 auto 14px;border-radius:50%;display:grid;place-items:center;
+  background:rgba(53,224,161,.12);border:1px solid rgba(53,224,161,.4);color:#35E0A1}
+.mbox h3{font-size:16px;font-weight:620;letter-spacing:-.02em}
+.mbox p{font-size:11.5px;color:#8B93A6;line-height:1.55;margin-top:7px}
+.mbox button{width:100%;height:42px;margin-top:18px;border:0;border-radius:12px;background:#35E0A1;color:#04150F;
+  font-size:14px;font-weight:640;font-family:inherit;cursor:pointer}
+.toast{position:absolute;left:50%;bottom:44px;transform:translate(-50%,14px);padding:10px 17px;border-radius:12px;
+  font-size:12.5px;font-weight:520;white-space:nowrap;background:rgba(20,23,29,.97);color:#E9EDF5;
+  border:1px solid rgba(255,255,255,.12);box-shadow:0 16px 34px -14px #000;opacity:0;pointer-events:none;
+  transition:.28s cubic-bezier(.32,1.2,.5,1);z-index:50}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+</style>
+</head>
+<body>
+<div class="phone">
+  <div class="glow"></div>
+  <div class="app">
+    <header class="hd">
+      <div class="logo"></div>
+      <div class="tt"><b>王者内核</b><span>S45 · KERNEL CONSOLE</span></div>
+      <div class="fold"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 15l6-6 6 6"/></svg></div>
+    </header>
+
+    <div class="tabs">
+      <button class="on" data-p="p-core">内核</button>
+      <button data-p="p-work">维护</button>
+      <button data-p="p-log">日志</button>
+    </div>
+
+    <div class="pages">
+      <!-- 内核页 -->
+      <div class="page on" id="p-core">
+        <div class="hero" id="hero">
+          <div class="k">主开关</div>
+          <div class="v" id="heroV">关闭</div>
+          <div class="sw" id="sw"><i></i></div>
+          <div class="bar"><i id="bar"></i></div>
+          <div class="foot"><span class="live" id="liveDot"></span><b id="liveTxt">内核未加载</b><span>·</span><span id="liveSub">222 项偏移待校验</span></div>
+        </div>
+
+        <div class="grid">
+          <div class="cell"><div class="k">偏移项</div><div class="v">222 <small>项</small></div></div>
+          <div class="cell"><div class="k">世界地址</div><div class="v">13E5C698</div></div>
+          <div class="cell"><div class="k">运行环境</div><div class="v">iOS 14.4.1</div></div>
+          <div class="cell"><div class="k">悬浮球</div><div class="v" id="ballV">未挂载</div></div>
+        </div>
+
+        <div class="sec">
+          <h4>维护</h4>
+          <div class="list">
+            <div class="li" id="btnInit">
+              <div class="ic"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5L4.6 13.2h6.1L10.6 21.5l8.8-11.1h-6.4z"/></svg></div>
+              <div class="tx"><b id="initTxt">初始化内核</b><span>校验偏移表并写入内核镜像</span></div>
+              <svg class="go" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M9 5l7 7-7 7"/></svg>
+            </div>
+            <div class="li" id="btnClear">
+              <div class="ic red"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9.5 7V4.6h5V7M6.6 7l.9 13.4h9l.9-13.4"/></svg></div>
+              <div class="tx"><b>清除内核残留</b><span>移除偏好配置与临时镜像</span></div>
+              <svg class="go" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M9 5l7 7-7 7"/></svg>
+            </div>
+          </div>
+        </div>
+        <div class="sec">
+          <h4>设备</h4>
+          <div class="list">
+            <div class="li" style="cursor:default">
+              <div class="tx"><b>iPhone X · arm64</b><span>iOS 14.4.1 · TrollStore 已越权</span></div>
+              <div style="font-size:11px;color:#4E5566">DEVICE</div>
+            </div>
+            <div class="li" style="cursor:default">
+              <div class="tx"><b>内核段 0x100000000</b><span>镜像 3.8 MB · 缓存 120 KB</span></div>
+              <div style="font-size:11px;color:#4E5566">IMAGE</div>
+            </div>
+          </div>
+        </div>
+        <div style="height:10px"></div>
+      </div>
+
+      <!-- 维护页 -->
+      <div class="page" id="p-work">
+        <div class="sec" style="margin-top:0">
+          <h4>内核维护</h4>
+          <div class="list">
+            <div class="li"><div class="ic"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3v18M3 12h18"/></svg></div>
+              <div class="tx"><b>偏移表版本</b><span>S45 · 2026-11 归档</span></div><div style="font-size:11.5px;color:#5E6679">v4.2.1</div></div>
+            <div class="li"><div class="ic"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg></div>
+              <div class="tx"><b>镜像大小</b><span>内核段 3.8 MB · 缓存 120 KB</span></div></div>
+          </div>
+        </div>
+        <button class="btn primary" id="btnInit2">初始化内核</button>
+        <button class="btn ghost" id="btnClear2">清除内核残留</button>
+        <div class="sec">
+          <h4>说明</h4>
+          <div style="font-size:11.5px;line-height:1.7;color:#6E7688;padding:0 2px">
+            初始化会校验 222 项偏移并写入内核镜像；清除残留会移除偏好配置、临时镜像与图标缓存，游戏内悬浮球会一并卸载。绘制、视觉与自瞄参数请在悬浮球里调整。
+          </div>
+        </div>
+      </div>
+
+      <!-- 日志页 -->
+      <div class="page" id="p-log">
+        <div class="logbar"><span>SYSTEM OUTPUT</span><button id="btnLogClear">清空</button></div>
+        <div class="log" id="log"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mask" id="mask">
+    <div class="mbox">
+      <div class="mck"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.6l5.2 5.2L20 6.4"/></svg></div>
+      <h3>初始化完成</h3>
+      <p>内核已就绪，现在可以打开主开关</p>
+      <button id="btnModalOk">好</button>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+</div>
+
+<script>
+(function(){
+  var sw=document.getElementById('sw'), hero=document.getElementById('hero'), heroV=document.getElementById('heroV'),
+      bar=document.getElementById('bar'), liveDot=document.getElementById('liveDot'), liveTxt=document.getElementById('liveTxt'),
+      ballV=document.getElementById('ballV'), logEl=document.getElementById('log'),
+      mask=document.getElementById('mask'), toastEl=document.getElementById('toast');
+  var on=false, ready=false, busy=false, t1=null, t2=null;
+
+  function now(){var d=new Date(),p=function(n){return ('0'+n).slice(-2)};return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())}
+  function add(m,c){var d=document.createElement('div');d.className='ln '+(c||'');
+    var t=document.createElement('span');t.className='tm';t.textContent='['+now()+'] ';
+    d.appendChild(t);d.appendChild(document.createTextNode(m));logEl.appendChild(d);
+    while(logEl.children.length>90)logEl.removeChild(logEl.firstChild);logEl.scrollTop=logEl.scrollHeight;}
+  function toast(s){toastEl.textContent=s;toastEl.classList.add('show');clearTimeout(t1);t1=setTimeout(function(){toastEl.classList.remove('show')},1900)}
+
+  document.querySelectorAll('.tabs button').forEach(function(b){
+    b.addEventListener('click',function(){
+      document.querySelectorAll('.tabs button').forEach(function(x){x.classList.remove('on')});
+      document.querySelectorAll('.page').forEach(function(x){x.classList.remove('on')});
+      b.classList.add('on');document.getElementById(b.dataset.p).classList.add('on');
+    });
+  });
+
+  sw.addEventListener('click',function(){
+    if(!ready){toast('请先初始化内核');add('主开关被拦截 · 内核未初始化','warn');return}
+    on=!on;
+    sw.classList.toggle('on',on);hero.classList.toggle('top',on);
+    heroV.textContent=on?'开启':'关闭';
+    bar.style.width=on?'100%':'0%';
+    ballV.textContent=on?'已挂载':'未挂载';
+    if(on){liveDot.classList.add('on');liveTxt.textContent='内核运行中';document.getElementById('liveSub').textContent='222 项偏移已校验';add('主开关已开启 · 悬浮球已挂载','ok')}
+    else{liveDot.classList.remove('on');liveTxt.textContent='内核已停止';document.getElementById('liveSub').textContent='222 项偏移待校验';add('主开关已关闭 · 绘制已停止','warn')}
+  });
+
+  function doInit(){
+    if(busy||ready)return;busy=true;
+    document.getElementById('initTxt').textContent='初始化中…';
+    add('开始初始化 · 校验 S45 偏移表');
+    var s=['世界 0x13E5C698 · 相机 0x138A2848','皮肤补丁 3 处 · hook 6 处','222/222 项校验通过','写入内核镜像','内核已就绪'];
+    var i=0,iv=setInterval(function(){
+      add(s[i],i>=s.length-1?'ok':'');i++;
+      if(i>=s.length){clearInterval(iv);busy=false;ready=true;
+        document.getElementById('initTxt').textContent='初始化内核';
+        liveDot.classList.add('on');liveTxt.textContent='内核已就绪';document.getElementById('liveSub').textContent='222 项偏移已校验';
+        mask.classList.add('show');}
+    },340);
+  }
+  function doClear(){
+    add('清除内核残留 · 偏好 / 镜像 / 缓存','warn');
+    ready=false;on=false;sw.classList.remove('on');hero.classList.remove('top');
+    heroV.textContent='关闭';bar.style.width='0%';ballV.textContent='未挂载';
+    liveDot.classList.remove('on');liveTxt.textContent='内核未加载';
+    setTimeout(function(){add('已清除 3 项残留 · 建议重新初始化','ok');toast('内核残留已清除')},500);
+  }
+  document.getElementById('btnInit').addEventListener('click',doInit);
+  document.getElementById('btnInit2').addEventListener('click',doInit);
+  document.getElementById('btnClear').addEventListener('click',doClear);
+  document.getElementById('btnClear2').addEventListener('click',doClear);
+  document.getElementById('btnLogClear').addEventListener('click',function(){logEl.innerHTML='';add('日志已清空')});
+  document.getElementById('btnModalOk').addEventListener('click',function(){mask.classList.remove('show')});
+
+  add('内核引导器 v4.2.1 · S45');
+  add('设备 iPhone X · iOS 14.4.1 · arm64');
+  add('检测到 TrollStore 环境 · 已越权');
+  add('偏移表已载入 · 222 项待校验');
+  add('等待初始化…');
+})();
+</script>
+</body>
+</html>

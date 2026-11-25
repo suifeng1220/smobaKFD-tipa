@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>P5 · 细线工程</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{background:#03060C;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:40px 0;
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif;color:#DCE6F2}
+.phone{position:relative;width:390px;height:844px;border-radius:48px;overflow:hidden;
+  box-shadow:0 50px 130px -30px #000,0 0 0 1px rgba(120,200,220,.12)}
+.wall{position:absolute;inset:0;background:
+  radial-gradient(66% 40% at 16% 0%,rgba(24,110,140,.4),transparent 66%),
+  radial-gradient(60% 34% at 92% 6%,rgba(30,60,140,.36),transparent 64%),
+  radial-gradient(90% 50% at 46% 104%,rgba(10,50,80,.55),transparent 72%),
+  linear-gradient(178deg,#081020,#05080F 55%,#03060C)}
+.grid{position:absolute;inset:0;opacity:.35;background-image:
+  linear-gradient(rgba(120,200,220,.055) 1px,transparent 1px),
+  linear-gradient(90deg,rgba(120,200,220,.055) 1px,transparent 1px);
+  background-size:26px 26px}
+.app{position:absolute;inset:0;display:flex;flex-direction:column;padding:0 18px}
+
+/* 顶栏 */
+.hd{flex:none;height:64px;display:flex;align-items:center;gap:10px}
+.ring{width:26px;height:26px;border-radius:50%;flex:none;border:1.5px solid rgba(62,210,224,.4);position:relative;
+  display:grid;place-items:center;transition:.3s}
+.ring:before{content:"";width:7px;height:7px;border-radius:50%;background:#3ED2E0;opacity:.35;transition:.3s}
+.ring.on{border-color:#3ED2E0;box-shadow:0 0 14px rgba(62,210,224,.5)}
+.ring.on:before{opacity:1;box-shadow:0 0 10px #3ED2E0}
+.hd .tt{flex:1;min-width:0}
+.hd .tt b{display:block;font-size:13px;font-weight:600;letter-spacing:.02em}
+.hd .tt span{display:block;font-size:9px;font-weight:600;letter-spacing:.16em;color:#5A6E85;margin-top:2px}
+.fold{width:30px;height:30px;border-radius:7px;display:grid;place-items:center;cursor:pointer;color:#7E93A9;
+  border:1px solid rgba(120,180,210,.16);background:rgba(120,180,210,.05);transition:.18s}
+.fold:active{background:rgba(120,180,210,.14)}
+
+.hr{height:1px;background:linear-gradient(90deg,rgba(120,200,220,.22),rgba(120,200,220,.04));flex:none}
+
+.main{flex:1;min-height:0;overflow-y:auto;scrollbar-width:none;display:flex;flex-direction:column}
+.main>*{flex:none}
+.main::-webkit-scrollbar{display:none}
+
+/* 主开关区 */
+.master{padding:22px 0 18px;display:flex;align-items:flex-start;gap:14px}
+.master .tx{flex:1;min-width:0}
+.master .lab{font-size:9.5px;font-weight:660;letter-spacing:.16em;color:#5A6E85}
+.master .big{font-size:34px;font-weight:250;letter-spacing:-.03em;line-height:1;margin-top:9px;color:#7F94A9;transition:.24s}
+.master.on .big{color:#EAFBFF;text-shadow:0 0 26px rgba(62,210,224,.45)}
+.master .sub{font-size:10.5px;color:#5E7186;margin-top:9px;letter-spacing:.01em}
+.sw{width:50px;height:28px;border-radius:6px;flex:none;position:relative;cursor:pointer;margin-top:4px;
+  background:rgba(120,200,220,.09);border:1px solid rgba(120,200,220,.2);transition:.24s}
+.sw i{position:absolute;top:2.5px;left:2.5px;width:21px;height:21px;border-radius:4px;background:#7C93A8;
+  transition:transform .26s cubic-bezier(.36,1.4,.52,1),background .24s}
+.sw.on{background:rgba(62,210,224,.16);border-color:rgba(62,210,224,.65);box-shadow:0 0 18px rgba(62,210,224,.25),inset 0 0 12px rgba(62,210,224,.14)}
+.sw.on i{transform:translateX(22px);background:#3ED2E0;box-shadow:0 0 12px rgba(62,210,224,.85)}
+
+/* 刻度尺 */
+.scale{display:flex;gap:4px;align-items:flex-end;height:10px;padding:0 0 0 1px;margin-bottom:20px}
+.scale i{width:3px;height:6px;border-radius:1px;background:rgba(120,200,220,.14);transition:.3s}
+.scale i.on{background:#3ED2E0;height:10px;box-shadow:0 0 7px rgba(62,210,224,.8)}
+
+/* KV 行 */
+.kv{padding:4px 0}
+.kv .r{display:flex;align-items:baseline;justify-content:space-between;gap:12px;height:40px}
+.kv .r span{font-size:11.5px;color:#647A90;letter-spacing:.02em}
+.kv .r b{font-size:12px;font-weight:560;color:#B9CBD9;font-variant-numeric:tabular-nums;letter-spacing:.01em}
+.kv .r b.cy{color:#3ED2E0}
+
+/* 操作行 */
+.sec-lab{font-size:9.5px;font-weight:660;letter-spacing:.16em;color:#5A6E85;padding:18px 0 10px}
+.op{display:flex;align-items:center;gap:11px;height:54px;cursor:pointer;position:relative;
+  padding:0 12px;margin:0 -12px;border-radius:6px;transition:.16s}
+.op:active{background:rgba(62,210,224,.08)}
+.op .pre{font-family:ui-monospace,Menlo,monospace;font-size:13px;color:#3ED2E0;opacity:.65;flex:none;width:12px}
+.op .tx{flex:1;min-width:0}
+.op .tx b{display:block;font-size:13.5px;font-weight:540;letter-spacing:-.01em}
+.op .tx span{display:block;font-size:10px;color:#5E7186;margin-top:2px;letter-spacing:.01em}
+.op .st{font-family:ui-monospace,Menlo,monospace;font-size:9.5px;letter-spacing:.08em;color:#4E6478;flex:none}
+.op.red .tx b{color:#F0798A}
+.op.red .pre{color:#F0798A}
+.op.busy .st{color:#3ED2E0}
+
+/* 日志 */
+.logwrap{padding:6px 0 4px;display:flex;gap:11px;flex:1;min-height:120px;max-height:300px}
+.logwrap:before{content:"";width:1px;flex:none;margin:4px 0 46px 2px;
+  background:linear-gradient(180deg,rgba(62,210,224,.4),rgba(62,210,224,.04))}
+.log{flex:1;min-width:0;min-height:100px;overflow-y:auto;scrollbar-width:none;
+  font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:10px;line-height:1.85;color:#63788D}
+.log::-webkit-scrollbar{display:none}
+.ln{white-space:pre-wrap;word-break:break-all}
+.ln .tm{color:#3C4E60}
+.ln.ok{color:#43D9A8}
+.ln.warn{color:#D9A45E}
+.logtop{display:flex;align-items:center;justify-content:space-between;padding:2px 0 8px}
+.logtop b{font-size:9.5px;font-weight:660;letter-spacing:.16em;color:#5A6E85}
+.logtop button{border:0;background:transparent;color:#57708A;font-size:9.5px;font-weight:600;
+  letter-spacing:.1em;font-family:inherit;cursor:pointer;padding:2px 0}
+.logtop button:active{color:#3ED2E0}
+
+/* 底栏 */
+.foot{flex:none;height:46px;display:flex;align-items:center;gap:14px;
+  font-family:ui-monospace,Menlo,monospace;font-size:9px;letter-spacing:.1em;color:#4A5F73;
+  border-top:1px solid rgba(120,200,220,.1)}
+.foot span{white-space:nowrap}
+.foot .v{color:#7E93A9}
+.foot .v.cy{color:#3ED2E0}
+.foot .sp{flex:1}
+
+/* 弹窗 */
+.mask{position:absolute;inset:0;background:rgba(2,6,12,.72);backdrop-filter:blur(6px);display:grid;place-items:center;
+  opacity:0;pointer-events:none;transition:.24s;z-index:40}
+.mask.show{opacity:1;pointer-events:auto}
+.mbox{width:258px;padding:24px 22px 18px;text-align:center;background:#0A141F;
+  border:1px solid rgba(62,210,224,.28);border-radius:4px;
+  box-shadow:0 0 0 1px rgba(62,210,224,.08),0 30px 70px -24px #000,inset 0 1px 0 rgba(255,255,255,.05);
+  transform:scale(.94);transition:.3s cubic-bezier(.32,1.3,.5,1)}
+.mask.show .mbox{transform:scale(1)}
+.mck{width:42px;height:42px;margin:0 auto 15px;display:grid;place-items:center;color:#3ED2E0;
+  border:1px solid rgba(62,210,224,.45);border-radius:50%;box-shadow:0 0 22px rgba(62,210,224,.28) inset}
+.mbox h3{font-size:15px;font-weight:600;letter-spacing:.02em}
+.mbox p{font-size:10.5px;color:#6C8299;line-height:1.6;margin-top:8px}
+.mbox button{width:100%;height:40px;margin-top:18px;border:1px solid rgba(62,210,224,.4);border-radius:4px;
+  background:rgba(62,210,224,.12);color:#9BF0FA;font-size:12.5px;font-weight:600;letter-spacing:.06em;
+  font-family:inherit;cursor:pointer}
+.mbox button:active{background:rgba(62,210,224,.22)}
+.toast{position:absolute;left:50%;bottom:70px;transform:translate(-50%,14px);padding:9px 16px;border-radius:4px;
+  font-family:ui-monospace,Menlo,monospace;font-size:11px;letter-spacing:.03em;white-space:nowrap;
+  background:rgba(10,20,31,.97);color:#9BF0FA;border:1px solid rgba(62,210,224,.3);
+  box-shadow:0 16px 34px -14px #000;opacity:0;pointer-events:none;
+  transition:.26s cubic-bezier(.32,1.2,.5,1);z-index:50}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+</style>
+</head>
+<body>
+<div class="phone">
+  <div class="wall"></div>
+  <div class="grid"></div>
+  <div class="app">
+    <header class="hd">
+      <div class="ring" id="ring"></div>
+      <div class="tt"><b>王者内核</b><span>S45 / KERNEL</span></div>
+      <div class="fold"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"><path d="M6 15l6-6 6 6"/></svg></div>
+    </header>
+    <div class="hr"></div>
+
+    <div class="main">
+      <div class="master" id="master">
+        <div class="tx">
+          <div class="lab">MASTER SWITCH</div>
+          <div class="big" id="big">关闭</div>
+          <div class="sub" id="sub">内核未加载 · 请先初始化</div>
+        </div>
+        <div class="sw" id="sw"><i></i></div>
+      </div>
+      <div class="scale" id="scale"></div>
+
+      <div class="kv">
+        <div class="r"><span>内核状态</span><b id="vSt">待加载</b></div>
+        <div class="r"><span>偏移项 / S45</span><b>222 项</b></div>
+        <div class="r"><span>世界地址</span><b class="cy">0x13E5C698</b></div>
+        <div class="r"><span>相机地址</span><b class="cy">0x138A2848</b></div>
+        <div class="r"><span>悬浮球</span><b id="vBall">未挂载</b></div>
+      </div>
+
+      <div class="hr"></div>
+      <div class="sec-lab">MAINTENANCE</div>
+      <div class="op" id="opInit">
+        <div class="pre">&gt;</div>
+        <div class="tx"><b id="initTxt">初始化内核</b><span>校验 222 项偏移并写入镜像</span></div>
+        <div class="st" id="initSt">IDLE</div>
+      </div>
+      <div class="op red" id="opClear">
+        <div class="pre">&gt;</div>
+        <div class="tx"><b>清除内核残留</b><span>偏好配置 / 临时镜像 / 图标缓存</span></div>
+        <div class="st">CLEAN</div>
+      </div>
+
+      <div class="hr"></div>
+      <div class="logtop"><b>OUTPUT</b><button id="btnLogClear">CLEAR</button></div>
+      <div class="logwrap"><div class="log" id="log"></div></div>
+    </div>
+
+    <div class="foot">
+      <span>BUILD <span class="v">4.2.1</span></span>
+      <span>VER <span class="v">S45</span></span>
+      <span class="sp"></span>
+      <span>STATUS <span class="v cy" id="fSt">STANDBY</span></span>
+    </div>
+  </div>
+
+  <div class="mask" id="mask">
+    <div class="mbox">
+      <div class="mck"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.6l5.2 5.2L20 6.4"/></svg></div>
+      <h3>初始化完成</h3>
+      <p>内核已就绪<br>现在可以打开主开关</p>
+      <button id="btnModalOk">确认</button>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+</div>
+
+<script>
+(function(){
+  var sw=document.getElementById('sw'), master=document.getElementById('master'), big=document.getElementById('big'),
+      sub=document.getElementById('sub'), ring=document.getElementById('ring'), scale=document.getElementById('scale'),
+      vSt=document.getElementById('vSt'), vBall=document.getElementById('vBall'), fSt=document.getElementById('fSt'),
+      logEl=document.getElementById('log'), mask=document.getElementById('mask'), toastEl=document.getElementById('toast');
+  var on=false, ready=false, busy=false, t1=null;
+
+  for(var k=0;k<22;k++){var s=document.createElement('i');scale.appendChild(s)}
+
+  function now(){var d=new Date(),p=function(n){return ('0'+n).slice(-2)};return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())}
+  function add(m,c){var d=document.createElement('div');d.className='ln '+(c||'');
+    var t=document.createElement('span');t.className='tm';t.textContent='['+now()+'] ';
+    d.appendChild(t);d.appendChild(document.createTextNode(m));logEl.appendChild(d);
+    while(logEl.children.length>90)logEl.removeChild(logEl.firstChild);logEl.scrollTop=logEl.scrollHeight;}
+  function toast(s){toastEl.textContent=s;toastEl.classList.add('show');clearTimeout(t1);t1=setTimeout(function(){toastEl.classList.remove('show')},1900)}
+  function scaleTo(n){var bars=scale.children;for(var i=0;i<bars.length;i++)bars[i].classList.toggle('on',i<n)}
+
+  sw.addEventListener('click',function(){
+    if(!ready){toast('请先初始化内核');add('主开关被拦截 · 内核未初始化','warn');return}
+    on=!on;
+    sw.classList.toggle('on',on);master.classList.toggle('on',on);ring.classList.toggle('on',on);
+    big.textContent=on?'开启':'关闭';
+    sub.textContent=on?'内核运行中 · 悬浮球已挂载':'已停止 · 绘制进程已挂起';
+    vSt.textContent=on?'ONLINE':'OFFLINE';vSt.style.color=on?'#3ED2E0':'';
+    vBall.textContent=on?'已挂载':'未挂载';
+    fSt.textContent=on?'RUNNING':'STANDBY';
+    scaleTo(on?22:0);
+    add(on?'主开关已开启 · 悬浮球已挂载':'主开关已关闭 · 绘制已停止', on?'ok':'warn');
+  });
+
+  function doInit(){
+    if(busy||ready)return;busy=true;
+    var txt=document.getElementById('initTxt'), st=document.getElementById('initSt');
+    txt.textContent='初始化中…';st.textContent='RUNNING';
+    add('开始初始化 · 校验 S45 偏移表');
+    var s=['世界 0x13E5C698 · 相机 0x138A2848','皮肤补丁 3 处 · hook 6 处','222/222 项校验通过','写入内核镜像','内核已就绪'];
+    var i=0,iv=setInterval(function(){
+      scaleTo(Math.round(22*(i+1)/s.length));
+      add(s[i],i>=s.length-1?'ok':'');i++;
+      if(i>=s.length){clearInterval(iv);busy=false;ready=true;
+        txt.textContent='初始化内核';st.textContent='READY';
+        vSt.textContent='READY';vSt.style.color='#3ED2E0';ring.classList.add('on');
+        mask.classList.add('show');}
+    },340);
+  }
+  function doClear(){
+    add('清除内核残留 · 偏好 / 镜像 / 缓存','warn');
+    ready=false;on=false;sw.classList.remove('on');master.classList.remove('on');ring.classList.remove('on');
+    big.textContent='关闭';sub.textContent='内核未加载 · 请先初始化';
+    vSt.textContent='待加载';vSt.style.color='';vBall.textContent='未挂载';
+    document.getElementById('initSt').textContent='IDLE';
+    fSt.textContent='STANDBY';scaleTo(0);
+    setTimeout(function(){add('已清除 3 项残留 · 建议重新初始化','ok');toast('内核残留已清除')},500);
+  }
+  document.getElementById('opInit').addEventListener('click',doInit);
+  document.getElementById('opClear').addEventListener('click',doClear);
+  document.getElementById('btnLogClear').addEventListener('click',function(){logEl.innerHTML='';add('日志已清空')});
+  document.getElementById('btnModalOk').addEventListener('click',function(){mask.classList.remove('show')});
+
+  add('内核引导器 v4.2.1 · S45');
+  add('设备 iPhone X · iOS 14.4.1 · arm64');
+  add('检测到 TrollStore 环境 · 已越权');
+  add('偏移表已载入 · 222 项待校验');
+  add('等待初始化…');
+})();
+</script>
+</body>
+</html>

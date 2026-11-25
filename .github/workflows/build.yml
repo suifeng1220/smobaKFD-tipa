@@ -1,0 +1,43 @@
+name: Build Books tipa
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（用于 tipa 文件名）'
+        required: false
+        default: '1.0.0'
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build tipa
+        run: bash build.sh "${{ github.event.inputs.version || '1.0.0' }}"
+
+      - name: Upload tipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: Books-tipa
+          path: packages/*.tipa
+          if-no-files-found: error

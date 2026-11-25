@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>P1 · 侧栏玻璃</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{background:#04050A;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:40px 0;
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Helvetica Neue",sans-serif;color:#EDEFF6}
+.phone{position:relative;width:390px;height:844px;border-radius:48px;overflow:hidden;
+  box-shadow:0 50px 130px -30px #000,0 0 0 1px rgba(255,255,255,.075)}
+.wall{position:absolute;inset:-8%;background:
+  radial-gradient(70% 48% at 14% 2%,rgba(88,112,255,.62),transparent 62%),
+  radial-gradient(58% 42% at 94% 12%,rgba(150,62,214,.44),transparent 60%),
+  radial-gradient(88% 58% at 44% 108%,rgba(26,92,190,.55),transparent 66%),
+  linear-gradient(168deg,#0B0D22 0%,#070813 46%,#04050B 100%)}
+.wall:after{content:"";position:absolute;inset:0;
+  background:repeating-linear-gradient(118deg,rgba(255,255,255,.028) 0 1px,transparent 1px 17px)}
+.app{position:absolute;inset:0;display:flex;flex-direction:column;transition:transform .38s cubic-bezier(.32,.72,0,1),opacity .3s}
+
+/* ── 顶栏 ── */
+.hd{flex:none;height:64px;display:flex;align-items:center;gap:11px;padding:0 15px 0 16px;
+  background:linear-gradient(180deg,rgba(18,20,32,.62),rgba(12,14,22,.18));border-bottom:1px solid rgba(255,255,255,.07);
+  backdrop-filter:blur(20px) saturate(150%)}
+.logo{width:34px;height:34px;border-radius:10px;flex:none;display:grid;place-items:center;
+  background:linear-gradient(180deg,#2A2E38,#16181E);box-shadow:inset 0 1px 0 rgba(255,255,255,.16),0 2px 6px -3px #000;
+  font-size:14px;font-weight:800;letter-spacing:-.02em}
+.tt{flex:1;min-width:0}
+.tt b{display:block;font-size:14.5px;font-weight:600;letter-spacing:-.015em;line-height:1.15}
+.tt span{display:block;font-size:9.5px;font-weight:600;letter-spacing:.11em;color:#7B82A0;margin-top:2px}
+.fold{width:32px;height:32px;border-radius:50%;flex:none;display:grid;place-items:center;cursor:pointer;
+  border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.075);color:#C7CCDE;transition:.18s}
+.fold:active{transform:scale(.92);background:rgba(255,255,255,.14)}
+.fold svg{transition:transform .38s cubic-bezier(.32,.72,0,1)}
+.app.collapsed .fold svg{transform:rotate(180deg)}
+
+/* ── 布局 ── */
+.body{flex:1;display:flex;min-height:0}
+.rail{width:63px;flex:none;display:flex;flex-direction:column;align-items:center;padding:14px 0 18px;gap:7px;
+  border-right:1px solid rgba(255,255,255,.06);background:rgba(10,12,20,.28);backdrop-filter:blur(14px)}
+.rail a{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;color:#6D7490;cursor:pointer;transition:.18s;position:relative}
+.rail a:active{transform:scale(.93)}
+.rail a.on{background:rgba(255,255,255,.13);color:#fff;box-shadow:inset 0 1px 0 rgba(255,255,255,.16),0 4px 12px -6px #000}
+
+.rail .sp{flex:1}
+.ava{width:32px;height:32px;border-radius:50%;flex:none;display:grid;place-items:center;font-size:11px;font-weight:700;
+  color:#C9D2FF;background:linear-gradient(150deg,#2B3560,#161B33);border:1px solid rgba(255,255,255,.14)}
+
+.main{flex:1;min-width:0;overflow-y:auto;padding:9px 14px 26px;scrollbar-width:none;
+  display:flex;flex-direction:column}
+.main>*{flex:none}
+.main::-webkit-scrollbar{display:none}
+
+/* ── 分组 ── */
+.grp{font-size:10.5px;font-weight:640;letter-spacing:.09em;color:#6B7288;margin:19px 4px 8px}
+.grp:first-child{margin-top:12px}
+
+.glass{background:linear-gradient(180deg,rgba(40,43,52,.66),rgba(20,22,28,.84));
+  border:1px solid rgba(255,255,255,.075);border-radius:17px;overflow:hidden;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.075),0 18px 36px -30px #000;
+  backdrop-filter:blur(22px) saturate(140%);-webkit-backdrop-filter:blur(22px) saturate(140%)}
+
+.row{display:flex;align-items:center;gap:11px;padding:13px 15px;min-height:56px;position:relative}
+.row+.row:before{content:"";position:absolute;top:0;left:15px;right:15px;height:1px;background:rgba(255,255,255,.055)}
+.row .txt{flex:1;min-width:0}
+.row .t{font-size:14px;font-weight:520;letter-spacing:-.012em;color:#EAEDF5;line-height:1.25}
+.row .s{font-size:11px;color:#787F9A;margin-top:3px;line-height:1.3;letter-spacing:0}
+.row.tap{cursor:pointer;transition:background .16s}
+.row.tap:active{background:rgba(255,255,255,.055)}
+.chev{color:#5B6280;flex:none}
+
+/* 开关 */
+.sw{width:46px;height:27px;border-radius:14px;flex:none;position:relative;cursor:pointer;
+  background:rgba(255,255,255,.13);box-shadow:inset 0 1px 2px rgba(0,0,0,.35);transition:background .26s}
+.sw i{position:absolute;top:2px;left:2px;width:23px;height:23px;border-radius:50%;background:#fff;
+  box-shadow:0 2px 5px rgba(0,0,0,.42);transition:transform .28s cubic-bezier(.36,1.42,.52,1),width .18s}
+.sw:active i{width:26px}
+.sw.on{background:#3D74FF;box-shadow:inset 0 1px 2px rgba(0,0,0,.2),0 0 0 1px rgba(90,130,255,.5)}
+.sw.on i{transform:translateX(19px)}
+.sw.on:active i{transform:translateX(16px)}
+
+/* 状态点 */
+.dot{width:7px;height:7px;border-radius:50%;background:#3C445C;flex:none}
+.dot.live{background:#37D98D;box-shadow:0 0 0 3px rgba(55,217,141,.13),0 0 9px rgba(55,217,141,.7)}
+.val{font-size:12.5px;color:#9AA2BC;font-variant-numeric:tabular-nums;letter-spacing:-.01em;flex:none}
+.val.ok{color:#48D79A}
+.danger .t{color:#FF7A82}
+.danger:active{background:rgba(255,90,100,.08)!important}
+
+/* 日志 */
+.logbox{margin-top:2px;flex:1;display:flex;flex-direction:column;min-height:150px;max-height:300px}
+.loghd{display:flex;align-items:center;justify-content:space-between;padding:11px 14px 9px}
+.loghd b{font-size:11px;font-weight:620;letter-spacing:.07em;color:#7C84A2}
+.loghd button{border:0;background:rgba(255,255,255,.08);color:#9BA3BD;font-size:10.5px;font-weight:560;
+  padding:4px 9px;border-radius:7px;cursor:pointer;font-family:inherit}
+.loghd button:active{background:rgba(255,255,255,.16)}
+.log{flex:1;min-height:120px;overflow-y:auto;padding:0 13px 12px;scrollbar-width:none;
+  font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:10px;line-height:1.75;color:#828FB0}
+.log::-webkit-scrollbar{display:none}
+.ln{white-space:pre-wrap;word-break:break-all}
+.ln .tm{color:#4C5675}
+.ln.ok{color:#46D398}
+.ln.warn{color:#E8B45C}
+
+/* 提示条 */
+.tip{display:flex;gap:9px;margin-top:16px;align-items:flex-start;margin-top:12px;padding:0 4px;color:#6F7794;font-size:10.5px;line-height:1.55}
+.tip b{color:#9AA3C2;font-weight:600}
+
+/* ── 弹窗 ── */
+.mask{position:absolute;inset:0;background:rgba(4,6,12,.58);backdrop-filter:blur(6px);
+  display:grid;place-items:center;opacity:0;pointer-events:none;transition:.26s;z-index:40}
+.mask.show{opacity:1;pointer-events:auto}
+.mbox{width:268px;border-radius:21px;padding:24px 22px 18px;text-align:center;
+  background:linear-gradient(180deg,rgba(52,56,80,.96),rgba(28,31,46,.98));
+  border:1px solid rgba(255,255,255,.13);box-shadow:0 30px 70px -24px #000,inset 0 1px 0 rgba(255,255,255,.14);
+  transform:scale(.92);opacity:0;transition:.3s cubic-bezier(.32,1.3,.5,1)}
+.mask.show .mbox{transform:scale(1);opacity:1}
+.mck{width:47px;height:47px;margin:0 auto 14px;border-radius:50%;display:grid;place-items:center;
+  background:rgba(55,217,141,.13);border:1px solid rgba(55,217,141,.4);color:#37D98D}
+.mbox h3{font-size:16.5px;font-weight:620;letter-spacing:-.02em}
+.mbox p{font-size:12px;color:#98A0BC;line-height:1.55;margin-top:7px}
+.mbox button{width:100%;height:42px;margin-top:18px;border:0;border-radius:12px;cursor:pointer;
+  background:linear-gradient(180deg,#4A7CFF,#2D5AE0);color:#fff;font-size:14px;font-weight:600;font-family:inherit;
+  box-shadow:0 6px 16px -6px #2D5AE0,inset 0 1px 0 rgba(255,255,255,.28)}
+.mbox button:active{transform:translateY(1px)}
+
+.toast{position:absolute;left:50%;bottom:44px;transform:translate(-50%,14px);z-index:50;
+  padding:10px 17px;border-radius:12px;font-size:12.5px;font-weight:520;white-space:nowrap;
+  background:rgba(30,33,48,.96);border:1px solid rgba(255,255,255,.13);color:#E6E9F4;
+  box-shadow:0 16px 34px -14px #000;opacity:0;pointer-events:none;transition:.28s cubic-bezier(.32,1.2,.5,1)}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+</style>
+</head>
+<body>
+<div class="phone">
+  <div class="wall"></div>
+  <div class="app" id="app">
+    <header class="hd">
+      <div class="logo">SL</div>
+      <div class="tt"><b>王者内核</b><span>S45 · CONTROL PANEL</span></div>
+      <div class="fold" id="fold">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 15l6-6 6 6"/></svg>
+      </div>
+    </header>
+
+    <div class="body">
+      <nav class="rail">
+        <a class="on" data-go="g-core"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.6L12 3.2l9 7.4V20a1 1 0 0 1-1 1h-4.8v-6H8.8v6H4a1 1 0 0 1-1-1z"/></svg></a>
+        <a data-go="g-do"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5L4.6 13.2h6.1L10.6 21.5l8.8-11.1h-6.4z"/></svg></a>
+        <a data-go="g-log"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M4.5 6.5h15M4.5 12h15M4.5 17.5h9"/></svg></a>
+        <div class="sp"></div>
+        <div class="ava">S</div>
+      </nav>
+
+      <main class="main" id="main">
+        <div class="grp" id="g-core">内核</div>
+        <div class="glass">
+          <div class="row">
+            <div class="txt"><div class="t">主开关</div><div class="s">内核总控 · 内存注入</div></div>
+            <div class="sw" id="sw"><i></i></div>
+          </div>
+          <div class="row">
+            <div class="txt"><div class="t">内核状态</div><div class="s">S45 · 222 项偏移已校验</div></div>
+            <div class="dot" id="stDot"></div>
+            <div class="val" id="stTxt">待加载</div>
+          </div>
+          <div class="row">
+            <div class="txt"><div class="t">运行环境</div><div class="s">iPhone X · arm64</div></div>
+            <div class="val">iOS 14.4.1</div>
+          </div>
+        </div>
+
+        <div class="grp" id="g-do">操作</div>
+        <div class="glass">
+          <div class="row tap" id="btnInit">
+            <div class="txt"><div class="t" id="initLabel">初始化内核</div><div class="s">校验偏移表并写入内核镜像</div></div>
+            <svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg>
+          </div>
+          <div class="row tap danger" id="btnClear">
+            <div class="txt"><div class="t">清除内核残留</div><div class="s">移除偏好配置与临时镜像</div></div>
+            <svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg>
+          </div>
+        </div>
+
+        <div class="grp" id="g-log">运行日志</div>
+        <div class="glass logbox">
+          <div class="loghd">
+            <b>SYSTEM OUTPUT</b>
+            <button id="btnLogClear">清空</button>
+          </div>
+          <div class="log" id="log"></div>
+        </div>
+
+        <div class="tip">
+          <span>·</span><span>主开关打开后，游戏内会出现<b>悬浮球</b>；绘制、视觉与自瞄参数都在球里调整，此页只保留开关与维护。</span>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <div class="mask" id="mask">
+    <div class="mbox">
+      <div class="mck">
+        <svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.6l5.2 5.2L20 6.4"/></svg>
+      </div>
+      <h3>初始化完成</h3>
+      <p>内核已就绪，现在可以打开主开关</p>
+      <button id="btnModalOk">好</button>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+</div>
+
+<script>
+(function(){
+  var app=document.getElementById('app'), sw=document.getElementById('sw'), logEl=document.getElementById('log'),
+      stDot=document.getElementById('stDot'), stTxt=document.getElementById('stTxt'),
+      mask=document.getElementById('mask'), toastEl=document.getElementById('toast');
+  var on=false, ready=false, busy=false, tmr=null;
+
+  function now(){var d=new Date(),p=function(n){return ('0'+n).slice(-2)};return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())}
+  function add(msg,cls){
+    var d=document.createElement('div');d.className='ln '+(cls||'');
+    var t=document.createElement('span');t.className='tm';t.textContent='['+now()+'] ';
+    d.appendChild(t);d.appendChild(document.createTextNode(msg));
+    logEl.appendChild(d);
+    while(logEl.children.length>80)logEl.removeChild(logEl.firstChild);
+    logEl.scrollTop=logEl.scrollHeight;
+  }
+  function toast(s){
+    toastEl.textContent=s;toastEl.classList.add('show');
+    clearTimeout(tmr);tmr=setTimeout(function(){toastEl.classList.remove('show')},1900);
+  }
+
+  document.getElementById('fold').addEventListener('click',function(){
+    app.classList.toggle('collapsed');
+    add(app.classList.contains('collapsed')?'面板已收起':'面板已展开');
+  });
+
+  sw.addEventListener('click',function(e){
+    e.stopPropagation();
+    if(!ready){ toast('请先初始化内核'); add('主开关被拦截 · 内核未初始化','warn'); return; }
+    on=!on;sw.classList.toggle('on',on);
+    if(on){ add('主开关已开启 · 悬浮球已挂载'); stDot.classList.add('live'); stTxt.textContent='运行中'; stTxt.classList.add('ok'); }
+    else { add('主开关已关闭 · 绘制已停止','warn'); stDot.classList.remove('live'); stTxt.textContent='已停止'; stTxt.classList.remove('ok'); }
+  });
+
+  document.getElementById('btnInit').addEventListener('click',function(){
+    if(busy||ready)return;
+    busy=true;
+    var label=document.getElementById('initLabel');
+    label.textContent='初始化中…';
+    add('开始初始化 · 校验 S45 偏移表');
+    var steps=['世界 0x13E5C698 · 相机 0x138A2848','皮肤补丁 3 处 · hook 6 处','字段偏移 18 项 · 内联 4 项','222/222 项校验通过','写入内核镜像 · 0x100000000','内核已就绪'];
+    var i=0;
+    var iv=setInterval(function(){
+      add(steps[i], i>=steps.length-1?'ok':'');
+      i++;
+      if(i>=steps.length){
+        clearInterval(iv);busy=false;ready=true;label.textContent='初始化内核';
+        sw.classList.remove('on');on=false;
+        stDot.classList.add('live');stTxt.textContent='已就绪';stTxt.classList.add('ok');
+        mask.classList.add('show');
+      }
+    },330);
+  });
+
+  document.getElementById('btnClear').addEventListener('click',function(){
+    add('清除内核残留 · 偏好 / 临时镜像 / 缓存','warn');
+    ready=false;on=false;sw.classList.remove('on');
+    stDot.classList.remove('live');stTxt.textContent='待加载';stTxt.classList.remove('ok');
+    setTimeout(function(){add('已清除 3 项残留 · 建议重新初始化','ok');toast('内核残留已清除')},520);
+  });
+
+  document.getElementById('btnLogClear').addEventListener('click',function(){
+    logEl.innerHTML='';add('日志已清空');
+  });
+  document.getElementById('btnModalOk').addEventListener('click',function(){ mask.classList.remove('show'); });
+
+  document.querySelectorAll('.rail a[data-go]').forEach(function(a){
+    a.addEventListener('click',function(){
+      document.querySelectorAll('.rail a').forEach(function(x){x.classList.remove('on')});
+      a.classList.add('on');
+      var el=document.getElementById(a.dataset.go);
+      if(el)document.getElementById('main').scrollTo({top:el.offsetTop-10,behavior:'smooth'});
+    });
+  });
+
+  add('内核引导器 v4.2.1 · S45');
+  add('设备 iPhone X · iOS 14.4.1 · arm64');
+  add('检测到 TrollStore 环境 · 已越权');
+  add('偏移表已载入 · 222 项待校验');
+  add('等待初始化…');
+})();
+</script>
+</body>
+</html>

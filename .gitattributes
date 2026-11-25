@@ -1,0 +1,24 @@
+# 统一换行：避免 build.sh / *.sh 在 macOS runner 上出现 bad interpreter
+* text=auto eol=lf
+
+*.sh            text eol=lf
+*.pbxproj       text eol=lf
+*.plist         text eol=lf
+*.entitlements  text eol=lf
+*.yml           text eol=lf
+*.md            text eol=lf
+
+# 二进制不要做换行转换
+*.a             binary
+*.dylib         binary
+*.dylib.*       binary
+*.png           binary
+*.jpg           binary
+*.icns          binary
+*.ttf           binary
+*.ttc           binary
+*.otf           binary
+*.car           binary
+*.zip           binary
+*.tipa          binary
+*.tc            binary
