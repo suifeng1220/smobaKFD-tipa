@@ -1937,12 +1937,14 @@ static void 取证4采样(uint64_t 数组, int 数量) {
             扫缓冲(实体, k, -1, 0, buf, 0x200);
         }
 
-        // B. 一级指针解引用
+        // B. 一级指针解引用（每个子对象扫满 0x600，旧链曾把位置指到 +0x2B8）
         for (int po = 0; po < 0x600; po += 8) {
             uint64_t 子 = vm_read<uint64_t>(实体 + (uint64_t)po);
             if (!IsValidAddr(子)) continue;
-            if (!readMemory(子, buf, 0x200)) continue;
-            扫缓冲(实体, k, po, 子, buf, 0x200);
+            for (int base = 0; base < 0x600; base += 0x200) {
+                if (!readMemory(子 + (uint64_t)base, buf, 0x200)) break;
+                扫缓冲(实体, k, po, 子, buf, 0x200);
+            }
         }
     }
 }
