@@ -983,7 +983,7 @@ static bool 读矩阵(uint64_t 模块, float* 矩阵) {
 static bool 投影(const float* m, int 世界X, int 世界Z, float* 屏X, float* 屏Y, float 宽, float 高) {
     float x = 世界X / 1000.0f;
     float z = 世界Z / 1000.0f;
-    float w = m[2] * x + m[10] * z + m[14];
+    float w = m[3] * x + m[11] * z + m[15];
     if (!isfinite(w) || w < 0.001f) return false;
     float inv = 1.0f / w;
     float px = (m[0] * x + m[8] * z + m[12]) * inv;
@@ -1902,75 +1902,39 @@ static void 取证4(uint64_t 世界, uint64_t 容器, uint64_t 数组, int 数�
     }
 }
 
-// ==================== 取证 v5：用相机矩阵反证真坐标 ====================
-//
-// 之前几版的教训：
-//   v3 证明实体 +0x278/+0x280 在 782 份快照里纹丝不动 —— 不是坐标。
-//   v4 只按「int 落在 100~250000」筛，捞到的全是血量(+0x1d0→+0xc0)、
-//      毫秒计时(+0xa8→+0x0d4)、朝向(+0x260→+0x160)，一条真坐标都没有。
-//      原因：坐标要么是 /1000 后成大整数（超上限被砍），要么根本是 float。
-//
-// v5 不猜值域，改用几何反证：
-//   真坐标 (x,z) 用「当前这一帧相机矩阵」投影，必须落在屏幕内；
-//   同一字段在 10 个实体槽上投影，屏幕位置必须真的散开（不是全挤中心）。
-//   血量/计时/朝向过不了这一关。
-//
-// 同时支持三种数值类型（v4 只支持第一种，这是它漏掉 float 坐标的直接原因）：
-//   0 = int 原值即米      1 = int/1000 为米      2 = float 即米
-//
-// 输出 Documents/fields_dump5.txt：预筛候选 + 每个候选的 (x,z) 时间序列，
-// 便于人工确认「跟着走位连续变化」还是「乱跳/死值」。
+// ==================== 取证 v7：负坐标 + 正确 VP ====================
+// v6 实测结论（用 P(0xE8) × V(0xA8) 逐元素复算 0x128 的 16 个 float）：
+//   99.294  = 1.72167 × 57.673        (P00 × V03)
+//   135.927 = 3.73205 × 36.4216       (P11 × V13)
+//   95.701  = -1.0006 × (-96.2437) + (-0.60018)
+//   96.244  = -1 × (-96.2437)
+// → 0x128 就是合法的 VP（列主序）。上一轮「矩阵不对」的判断作废，矩阵一直是对的。
+// 顺带算出相机世界位置 = -Rᵀ·t ≈ (-57.67, 37.33, -95.89) 米，地面落点在负半轴，
+// 也就是英雄坐标本身带负号 —— 而 v4 的 100<v<250000、v5 的 1~20000 米全都要求必须为正，
+// 这才是两轮 0 命中的真实原因，和矩阵无关。
 
-#define 取证5指针项   193                                   // 0=实体自身，1..192=(0x600/8)
-#define 取证5偏移项   384                                   // 0..0x600，每 4 字节
-#define 取证5配对项   3                                     // (a,c) (a,b) (b,c)
-#define 取证5类型项   3
-#define 取证5键数     (取证5指针项 * 取证5偏移项 * 取证5配对项 * 取证5类型项)
-#define 取证5样本数   8
-#define 取证5候选上限 4000
-#define 取证5最短米   1.0f
-#define 取证5最长米   20000.0f                              // 20 公里，任何 MOBA 地图都够
+#define 取证7指针项 97       // 0=实体自身，1..96 = 一级指针 @0x00..0x2F8
+#define 取证7偏移项 576      // 0..0x900，每 4 字节
+#define 取证7类型项 4        // 0=int/1000  1=int/100  2=int(米)  3=float(米)
+#define 取证7配对项 2        // 0=(off,off+4)  1=(off+4,off)
+#define 取证7样本数 6
 
-// 预筛表：只统计「有多少槽落屏内」以及屏幕坐标范围，用来判断是否散开
-struct 屏界 {
-    int16_t 槽数;
-    int16_t 最小x, 最大x, 最小y, 最大y;
-};
-static 屏界*  取证5界   = nullptr;
-static FILE*  取证5文件 = nullptr;
-static int    取证5帧计 = 0, 取证5等帧 = 0, 取证5采样序 = 0;
-static int    取证5预筛轮 = 0;
-static bool   取证5完成 = false;
+struct 命中槽 { int16_t 屏内; int16_t 近中; };
+static 命中槽* 取证7表 = nullptr;
+static FILE*   取证7文件 = nullptr;
+static int     取证7帧计 = 0, 取证7等帧 = 0, 取证7序 = 0;
+static bool    取证7完成 = false;
 
-struct 候选项 {
-    uint16_t p;
-    uint16_t off;
-    uint8_t  配对;
-    uint8_t  类型;
-    uint8_t  命中;                                  // 有效样本数（槽命中>=5 才算）
-    uint8_t  槽命中[取证5样本数];
-    float    序x[取证5样本数], 序z[取证5样本数];    // 取该样本第一个有效槽的值
-};
-static 候选项* 取证5候选   = nullptr;
-static int     取证5候选数 = 0;
-static int     取证5分桶头[取证5指针项];
-static int     取证5分桶下[取证5候选上限];
-
-static inline int 取证5索引(int p, int off, int 配对, int 类型) {
-    if (p < 0 || p >= 取证5指针项) return -1;
-    if (off < 0 || off >= 取证5偏移项 * 4) return -1;
-    return ((p * 取证5偏移项 + off / 4) * 取证5配对项 + 配对) * 取证5类型项 + 类型;
+static inline int 取证7索引(int p, int off4, int t, int k) {
+    if (p < 0 || p >= 取证7指针项) return -1;
+    if (off4 < 0 || off4 >= 取证7偏移项) return -1;
+    return ((p * 取证7偏移项 + off4) * 取证7类型项 + t) * 取证7配对项 + k;
 }
 
-static inline bool 取证5屏内(float sx, float sy, float 宽, float 高) {
-    float mx = 宽 * 0.15f, my = 高 * 0.15f;
-    return sx >= -mx && sx <= 宽 + mx && sy >= -my && sy <= 高 + my;
-}
-
-// 世界坐标 → 屏幕（米制输入，矩阵列主序，Y 视为 0）
-static inline bool 投影f(const float* m, float x, float z, float* 屏X, float* 屏Y, float 宽, float 高) {
-    float w = m[2] * x + m[10] * z + m[14];
-    if (!isfinite(w) || w < 0.01f) return false;
+// 列主序 VP，Y 视为 0：clip.x=m[0]x+m[8]z+m[12]  clip.y=m[1]x+m[9]z+m[13]  w=m[3]x+m[11]z+m[15]
+static inline bool 投影列(const float* m, float x, float z, float* 屏X, float* 屏Y, float 宽, float 高) {
+    float w = m[3] * x + m[11] * z + m[15];
+    if (!isfinite(w) || w < 0.05f) return false;
     float inv = 1.0f / w;
     float px = (m[0] * x + m[8] * z + m[12]) * inv;
     float py = (m[1] * x + m[9] * z + m[13]) * inv;
@@ -1980,319 +1944,187 @@ static inline bool 投影f(const float* m, float x, float z, float* 屏X, float*
     return true;
 }
 
-// 按类型取一个「米」值
-static inline bool 取米(const unsigned char* b, int off, int 类型, float* 出) {
-    float v;
-    if (类型 == 2) {
-        v = *(const float*)(b + off);
-        if (!isfinite(v)) return false;
-    } else {
-        int32_t i = *(const int32_t*)(b + off);
-        if (i <= 0) return false;
-        v = (类型 == 1) ? (float)i / 1000.0f : (float)i;
+static inline bool 取证7屏内(float sx, float sy, float 宽, float 高) {
+    float mx = 宽 * 0.12f, my = 高 * 0.12f;
+    return sx >= -mx && sx <= 宽 + mx && sy >= -my && sy <= 高 + my;
+}
+
+// 允许负数；int 可能是毫米/厘米/米，float 直接当米
+static inline bool 取证7取值(const unsigned char* b, int off, int t, float* 出) {
+    if (t == 3) {
+        float v = *(const float*)(b + off);
+        if (!isfinite(v) || v <= -20000.0f || v >= 20000.0f) return false;
+        *出 = v;
+        return true;
     }
-    if (v < 取证5最短米 || v > 取证5最长米) return false;
+    int32_t i = *(const int32_t*)(b + off);
+    if (i == 0 || i <= -400000 || i >= 400000) return false;
+    float v = (t == 0) ? (float)i * 0.001f : ((t == 1) ? (float)i * 0.01f : (float)i);
+    if (v <= -20000.0f || v >= 20000.0f) return false;
     *出 = v;
     return true;
 }
 
-// 预筛：整块扫描，只记「多少槽落屏内 + 屏幕坐标范围」
-static void 取证5扫(int p, const unsigned char* 块, int 长度, const float* m, float 宽, float 高) {
-    for (int off = 0; off + 12 <= 长度; off += 4) {
-        for (int t = 0; t < 取证5类型项; ++t) {
-            float v[3];
-            bool ok[3];
-            for (int i = 0; i < 3; ++i) ok[i] = 取米(块, off + i * 4, t, &v[i]);
+static void 取证7扫(int p, const unsigned char* 块, int 长度, const float* m,
+                    float 宽, float 高, float 中X, float 中Y) {
+    int 末 = 长度 / 4 - 2;
+    for (int o = 0; o < 末; ++o) {
+        for (int t = 0; t < 取证7类型项; ++t) {
+            float v[3]; bool ok[3];
+            for (int i = 0; i < 3; ++i) ok[i] = 取证7取值(块, (o + i) * 4, t, &v[i]);
             if (!ok[0] && !ok[1] && !ok[2]) continue;
-            for (int k = 0; k < 取证5配对项; ++k) {
-                int xi = (k == 0) ? 0 : ((k == 1) ? 0 : 1);
-                int zi = (k == 0) ? 2 : ((k == 1) ? 1 : 2);
-                if (!ok[xi] || !ok[zi]) continue;
-                if (v[xi] == v[zi]) continue;           // x==z：同一份数据被当两轴取
+            for (int k = 0; k < 取证7配对项; ++k) {
+                int xi = (k == 0) ? 0 : 1;
+                int zi = (k == 0) ? 2 : 0;
+                if (!ok[xi] || !ok[zi] || v[xi] == v[zi]) continue;
                 float sx, sy;
-                if (!投影f(m, v[xi], v[zi], &sx, &sy, 宽, 高)) continue;
-                if (!取证5屏内(sx, sy, 宽, 高)) continue;
-                int idx = 取证5索引(p, off, k, t);
+                if (!投影列(m, v[xi], v[zi], &sx, &sy, 宽, 高)) continue;
+                if (!取证7屏内(sx, sy, 宽, 高)) continue;
+                int idx = 取证7索引(p, o, t, k);
                 if (idx < 0) continue;
-                屏界& e = 取证5界[idx];
-                int16_t ix = (int16_t)fmaxf(-30000.0f, fminf(30000.0f, sx));
-                int16_t iy = (int16_t)fmaxf(-30000.0f, fminf(30000.0f, sy));
-                if (e.槽数 == 0) {
-                    e.最小x = e.最大x = ix;
-                    e.最小y = e.最大y = iy;
-                } else {
-                    if (ix < e.最小x) e.最小x = ix;
-                    if (ix > e.最大x) e.最大x = ix;
-                    if (iy < e.最小y) e.最小y = iy;
-                    if (iy > e.最大y) e.最大y = iy;
-                }
-                if (e.槽数 < 30000) e.槽数++;
+                命中槽& e = 取证7表[idx];
+                if (e.屏内 < 9000) e.屏内++;
+                float dx = sx - 中X, dy = sy - 中Y;
+                if (dx * dx + dy * dy < 200.0f * 200.0f && e.近中 < 9000) e.近中++;
             }
         }
     }
 }
 
-// 一轮预筛：读 10 个实体的自身 + 一级子对象
-static void 取证5预筛(uint64_t 数组, int 数量, const float* m, float 宽, float 高) {
-    unsigned char 块[0x600];
-    if (数量 > 16) 数量 = 16;
+static void 取证7采样(uint64_t 数组, int 数量, const float* m, float 宽, float 高) {
+    unsigned char* 块 = (unsigned char*)malloc(0x900);
+    if (!块) return;
+    float 中X = 宽 * 0.5f, 中Y = 高 * 0.5f;
+    if (数量 > 32) 数量 = 32;
     for (int k = 0; k < 数量; ++k) {
         uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)k);
         if (!IsValidAddr(实体)) continue;
-        if (readMemory(实体, 块, 0x600)) 取证5扫(0, 块, 0x600, m, 宽, 高);
-        for (int po = 0; po < 0x600; po += 8) {
+        if (readMemory(实体, 块, 0x900)) 取证7扫(0, 块, 0x900, m, 宽, 高, 中X, 中Y);
+        for (int po = 0; po < 0x300; po += 8) {
             uint64_t 子 = vm_read<uint64_t>(实体 + (uint64_t)po);
             if (!IsValidAddr(子)) continue;
-            if (!readMemory(子, 块, 0x600)) continue;
-            取证5扫(po / 8 + 1, 块, 0x600, m, 宽, 高);
+            if (!readMemory(子, 块, 0x400)) continue;
+            取证7扫(po / 8 + 1, 块, 0x400, m, 宽, 高, 中X, 中Y);
         }
     }
+    free(块);
 }
 
-// 预筛结果 → 候选表（要求 >=5 槽落屏、且屏幕坐标真的散开）
-static int 取证5收集(int 槽数) {
-    int 需要 = 槽数 >= 6 ? 5 : (槽数 >= 3 ? 2 : 1);
-    取证5候选数 = 0;
-    if (!取证5候选) return 0;
-    // 按「落屏槽数」从高到低分轮收，槽数=全部实体的优先，避免被地址靠前的杂项占满配额
-    for (int 门槛 = 槽数; 门槛 >= 需要 && 取证5候选数 < 取证5候选上限; --门槛)
-    for (int i = 0; i < 取证5键数 && 取证5候选数 < 取证5候选上限; ++i) {
-        屏界& e = 取证5界[i];
-        if (e.槽数 != 门槛) continue;
-        if (e.最大x - e.最小x < 60 && e.最大y - e.最小y < 60) continue;   // 挤成一坨 = 假命中
-        int t = i % 取证5类型项;
-        int r = i / 取证5类型项;
-        int k = r % 取证5配对项;
-        r /= 取证5配对项;
-        int off = (r % 取证5偏移项) * 4;
-        int p = r / 取证5偏移项;
-        候选项& c = 取证5候选[取证5候选数];
-        c.p = (uint16_t)p;
-        c.off = (uint16_t)off;
-        c.配对 = (uint8_t)k;
-        c.类型 = (uint8_t)t;
-        c.命中 = 0;
-        memset(c.槽命中, 0, sizeof(c.槽命中));
-        memset(c.序x, 0, sizeof(c.序x));
-        memset(c.序z, 0, sizeof(c.序z));
-        取证5候选数++;
-    }
-    // 分桶：按 p 建链，第 2 阶段每个槽只读需要的那几个指针
-    for (int i = 0; i < 取证5指针项; ++i) 取证5分桶头[i] = -1;
-    for (int i = 取证5候选数 - 1; i >= 0; --i) {
-        int p = 取证5候选[i].p;
-        取证5分桶下[i] = 取证5分桶头[p];
-        取证5分桶头[p] = i;
-    }
-    return 取证5候选数;
-}
-
-// 读一个候选在某实体槽上的 (x,z)
-static inline bool 取证5读值(uint64_t 实体, const 候选项& c, float* x, float* z) {
-    uint64_t 基 = 实体;
-    if (c.p > 0) {
-        uint64_t 子 = vm_read<uint64_t>(实体 + (uint64_t)(c.p - 1) * 8ULL);
-        if (!IsValidAddr(子)) return false;
-        基 = 子;
-    }
-    unsigned char t[12];
-    if (!readMemory(基 + (uint64_t)c.off, t, 12)) return false;
-    float v[3];
-    bool ok[3];
-    for (int i = 0; i < 3; ++i) ok[i] = 取米(t, i * 4, c.类型, &v[i]);
-    int xi = (c.配对 == 2) ? 1 : 0;
-    int zi = (c.配对 == 1) ? 1 : 2;
-    if (!ok[xi] || !ok[zi]) return false;
-    if (v[xi] == v[zi]) return false;
-    *x = v[xi];
-    *z = v[zi];
-    return true;
-}
-
-// 第 2 阶段：逐候选逐槽验证，记录值序列
-static void 取证5跟踪(uint64_t 数组, int 数量, const float* m, float 宽, float 高, int 序) {
-    if (数量 > 16) 数量 = 16;
-    static uint8_t 槽计[取证5候选上限];
-    memset(槽计, 0, sizeof(uint8_t) * (size_t)取证5候选数);
-    for (int k = 0; k < 数量; ++k) {
-        uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)k);
-        if (!IsValidAddr(实体)) continue;
-        for (int c = 0; c < 取证5候选数; ++c) {
-            float x, z, sx, sy;
-            if (!取证5读值(实体, 取证5候选[c], &x, &z)) continue;
-            if (!投影f(m, x, z, &sx, &sy, 宽, 高)) continue;
-            if (!取证5屏内(sx, sy, 宽, 高)) continue;
-            if (槽计[c] < 250) 槽计[c]++;
-            if (取证5候选[c].序x[序] == 0.0f) { 取证5候选[c].序x[序] = x; 取证5候选[c].序z[序] = z; }
+static void 取证7结算(uint64_t 数组, int 数量, const float* m, float 宽, float 高) {
+    fprintf(取证7文件, "\n=== 结果  (%d 次采样 × %d 槽)  判据=投影落屏内 + 靠近屏幕中心 ===\n",
+            取证7样本数, 数量);
+    fprintf(取证7文件, "屏内=该字段投影落屏的槽次累计；近中=投影落在屏幕中心 200px 内的槽次累计\n");
+    for (int 轮 = 0; 轮 < 32; ++轮) {
+        int 最佳 = -1, 最佳分 = 0, 最佳次 = 0;
+        for (int i = 0; i < 取证7指针项 * 取证7偏移项 * 取证7类型项 * 取证7配对项; ++i) {
+            int a = 取证7表[i].屏内, b = 取证7表[i].近中;
+            if (a <= 0) continue;
+            int 分 = b * 1000 + a;
+            if (分 > 最佳分) { 最佳分 = 分; 最佳次 = b; 最佳 = i; }
         }
-    }
-    int 需要 = 数量 >= 6 ? 5 : (数量 >= 3 ? 2 : 1);
-    for (int c = 0; c < 取证5候选数; ++c) {
-        取证5候选[c].槽命中[序] = 槽计[c];
-        if (槽计[c] >= 需要) 取证5候选[c].命中++;
-    }
-}
-
-static void 取证5结算(void) {
-    fprintf(取证5文件, "\n=== 结果：候选 %d 条，按有效样本数排序 ===\n", 取证5候选数);
-    fprintf(取证5文件, "格式: 命中/8样本  位置  配对  类型  槽命中序列  值序列(x,z)\n");
-    for (int 轮 = 0; 轮 < 30; ++轮) {
-        int 最佳 = -1, 最佳分 = 0;
-        for (int i = 0; i < 取证5候选数; ++i) {
-            if (取证5候选[i].命中 > 最佳分) { 最佳分 = 取证5候选[i].命中; 最佳 = i; }
-        }
-        if (最佳 < 0 || 最佳分 < 2) break;
-        候选项& c = 取证5候选[最佳];
-        const char* 配对名 = (c.配对 == 0) ? "x=a,z=c" : ((c.配对 == 1) ? "x=a,z=b" : "x=b,z=c");
-        const char* 类型名 = (c.类型 == 0) ? "int" : ((c.类型 == 1) ? "int/1000" : "float");
-        if (c.p == 0)
-            fprintf(取证5文件, "命中%d/8  实体 +%#05x  %s %s  ", 最佳分, c.off, 配对名, 类型名);
+        if (最佳 < 0 || 最佳分 < 8) break;
+        int k = 最佳 % 取证7配对项;
+        int t = (最佳 / 取证7配对项) % 取证7类型项;
+        int r = 最佳 / (取证7配对项 * 取证7类型项);
+        int off = (r % 取证7偏移项) * 4;
+        int p = r / 取证7偏移项;
+        const char* 类型名[4] = { "int/1000", "int/100", "int=米", "float=米" };
+        const char* 配对名[2] = { "x=off,z=off+4", "x=off+4,z=off" };
+        if (p == 0)
+            fprintf(取证7文件, "\n[近中%2d 屏内%3d] 实体 +%#05x  %s  %s\n", 最佳次, 取证7表[最佳].屏内, off, 类型名[t], 配对名[k]);
         else
-            fprintf(取证5文件, "命中%d/8  子对象@+%#05x->+%#05x  %s %s  ",
-                    最佳分, (c.p - 1) * 8, c.off, 配对名, 类型名);
-        fprintf(取证5文件, "槽:");
-        for (int s = 0; s < 取证5样本数; ++s) fprintf(取证5文件, "%d,", c.槽命中[s]);
-        fprintf(取证5文件, "  值:");
-        for (int s = 0; s < 取证5样本数; ++s)
-            fprintf(取证5文件, "(%.2f,%.2f)", c.序x[s], c.序z[s]);
-        fprintf(取证5文件, "\n");
-        c.命中 = -1;
-    }
-    fflush(取证5文件);
-}
-
-static void 取证5(uint64_t 数组, int 数量, const float* m, float 宽, float 高) {
-    if (取证5完成) return;
-    if (!取证5界) {
-        取证5界 = (屏界*)calloc((size_t)取证5键数, sizeof(屏界));
-        取证5候选 = (候选项*)calloc(取证5候选上限, sizeof(候选项));
-        if (!取证5界 || !取证5候选) return;
-    }
-
-    // 预筛阶段：每 120 帧（约 2 秒）跑一轮，跑 2 轮都空就直接报结论，不空转
-    if (取证5候选数 == 0 && 取证5采样序 == 0) {
-        if (++取证5帧计 < 120) return;
-        取证5帧计 = 0;
-        if (!取证5文件) {
-            const char* 家 = getenv("HOME");
-            if (!家) return;
-            char 路径[512];
-            snprintf(路径, sizeof(路径), "%s/Documents/fields_dump5.txt", 家);
-            取证5文件 = fopen(路径, "w");
-            if (!取证5文件) return;
-            setvbuf(取证5文件, nullptr, _IOLBF, 0);
-            fprintf(取证5文件, "=== 取证 v5（相机矩阵投影反证）===\n");
-            fprintf(取证5文件, "屏幕=%.0fx%.0f  实体数量=%d\n", 宽, 高, 数量);
-            fprintf(取证5文件, "矩阵:");
-            for (int i = 0; i < 16; ++i) fprintf(取证5文件, " %.5f", m[i]);
-            fprintf(取证5文件, "\n判据: 投影落屏内(含15%%边距) + 至少5槽 + 屏幕坐标散开>60px\n");
-            fprintf(取证5文件, "类型: int=原值即米, int/1000, float=米。值域 1~20000 米\n");
-            fflush(取证5文件);
-        }
-        memset(取证5界, 0, sizeof(屏界) * (size_t)取证5键数);
-        取证5预筛(数组, 数量, m, 宽, 高);
-        int n = 取证5收集(数量);
-        取证5预筛轮++;
-        fprintf(取证5文件, "[预筛轮%d] 候选 %d 条\n", 取证5预筛轮, n);
-        fflush(取证5文件);
-        if (n == 0) {
-            if (取证5预筛轮 >= 3) {
-                取证5完成 = true;
-                fprintf(取证5文件, "三轮预筛全空：可疑点不在坐标值域，而在【相机矩阵】本身\n");
-                fprintf(取证5文件, "=== 取证结束 ===\n");
-                fclose(取证5文件);
-                取证5文件 = nullptr;
-            } else {
-                取证5帧计 = 60;      // 缩短下一轮等待
+            fprintf(取证7文件, "\n[近中%2d 屏内%3d] 子对象@+%#05x -> +%#05x  %s  %s\n", 最佳次, 取证7表[最佳].屏内, (p - 1) * 8, off, 类型名[t], 配对名[k]);
+        取证7表[最佳].屏内 = -1;   // 排掉，避免重复
+        if (数量 > 32) 数量 = 32;
+        for (int s = 0; s < 数量; ++s) {
+            uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)s);
+            if (!IsValidAddr(实体)) continue;
+            uint64_t 基 = 实体;
+            if (p > 0) {
+                基 = vm_read<uint64_t>(实体 + (uint64_t)((p - 1) * 8));
+                if (!IsValidAddr(基)) continue;
             }
-            return;
+            float xv, zv;
+            unsigned char 小[16];
+            if (!readMemory(基 + (uint64_t)off, 小, 16)) continue;
+            if (!取证7取值(小, 0, t, &xv)) continue;
+            if (!取证7取值(小, 4, t, &zv)) continue;
+            if (k == 1) { float tmp = xv; xv = zv; zv = tmp; }
+            float sx = 0, sy = 0;
+            bool ok = 投影列(m, xv, zv, &sx, &sy, 宽, 高);
+            fprintf(取证7文件, "    槽%-2d  x=%9.2f z=%9.2f  →  %s %.0f,%.0f\n",
+                    s, xv, zv, ok ? "屏" : "屏外", sx, sy);
         }
     }
-
-    // 跟踪阶段：等 40 帧（约 0.5~1 秒）采一次，共 8 次
-    if (++取证5等帧 < 40) return;
-    取证5等帧 = 0;
-    int 序 = 取证5采样序;
-    if (序 >= 取证5样本数) return;
-    取证5跟踪(数组, 数量, m, 宽, 高, 序);
-    取证5采样序++;
-    fprintf(取证5文件, "[样本%d] 槽数=%d 已完成\n", 序, 数量);
-    fflush(取证5文件);
-    if (取证5采样序 >= 取证5样本数) {
-        取证5完成 = true;
-        取证5结算();
-        fprintf(取证5文件, "=== 取证结束 ===\n");
-        fclose(取证5文件);
-        取证5文件 = nullptr;
-    }
+    fprintf(取证7文件, "=== 取证结束 ===\n");
 }
 
-// ==================== 取证 v6：相机链内存倾倒 ====================
-
-// 把一段内存按 float 打印，每行 16 个，带相对偏移
-static void 倾浮(FILE* f, const char* 名, uint64_t 基, int 起, int 长) {
-    if (!IsValidAddr(基)) { fprintf(f, "%s 地址无效\n", 名); return; }
-    for (int i = 0; i < 长; i += 16) {
-        fprintf(f, "%s%+#06x:", 名, 起 + 4 * i);
-        for (int j = 0; j < 16; ++j) {
-            float x = vm_read<float>(基 + (uint64_t)(起 + 4 * (i + j)));
-            if (!isfinite(x) || fabsf(x) > 1e12f) x = 0.0f;
-            fprintf(f, " %.5f", x);
-        }
-        fprintf(f, "\n");
+static void 取证7(uint64_t 数组, int 数量, const float* m, float 宽, float 高) {
+    if (取证7完成) return;
+    if (!取证7表) {
+        size_t n = (size_t)取证7指针项 * 取证7偏移项 * 取证7类型项 * 取证7配对项;
+        取证7表 = (命中槽*)calloc(n, sizeof(命中槽));
+        if (!取证7表) return;
     }
-}
-
-// 矩阵读错时，把相机链每一层都倒出来，本地找真正的 4x4
-static void 取证6(uint64_t 模块, const float* 矩阵) {
-    static FILE* f = nullptr;
-    static int 帧计 = 0, 样 = 0;
-    static double 上次 = 0;
-    if (样 >= 4) return;
-    if (++帧计 % 30) return;
-    double now = CACurrentMediaTime();
-    if (样 > 0 && now - 上次 < 5.0) return;
-    上次 = now;
-
-    if (!f) {
+    if (++取证7帧计 % 30) return;
+    if (取证7序 > 0) {
+        if (++取证7等帧 < 45) return;
+        取证7等帧 = 0;
+    }
+    if (!取证7文件) {
         const char* 家 = getenv("HOME");
         if (!家) return;
         char 路径[512];
-        snprintf(路径, sizeof(路径), "%s/Documents/fields_dump6.txt", 家);
-        f = fopen(路径, "w");
-        if (!f) return;
-        setvbuf(f, nullptr, _IOLBF, 0);
-        fprintf(f, "=== 取证 v6：相机链内存倾倒 ===\n当前读到的矩阵:");
-        for (int i = 0; i < 16; ++i) fprintf(f, " %.5f", 矩阵[i]);
-        fprintf(f, "\n根相机=%#llx 根相机备=%#llx\n",
-                (unsigned long long)SDK::根相机, (unsigned long long)SDK::根相机备);
-        fflush(f);
+        snprintf(路径, sizeof(路径), "%s/Documents/fields_dump7.txt", 家);
+        取证7文件 = fopen(路径, "w");
+        if (!取证7文件) return;
+        setvbuf(取证7文件, nullptr, _IOLBF, 0);
+        fprintf(取证7文件, "=== 取证 v7（允许负坐标）===\n");
+        fprintf(取证7文件, "屏幕=%.0fx%.0f  数量=%d\n", 宽, 高, 数量);
+        fprintf(取证7文件, "VP:");
+        for (int i = 0; i < 16; ++i) fprintf(取证7文件, " %.5f", m[i]);
+        fprintf(取证7文件, "\n");
+        // 由 V(0xA8) 反算相机世界位置，并求视线落地面点
+        float v[16];
+        int 有效 = 0;
+        for (int i = 0; i < 16; ++i) {
+            v[i] = vm_read<float>(相机节点 + 0xA8 + 4 * i);
+            if (isfinite(v[i])) 有效++;
+        }
+        if (有效 == 16) {
+            float tx = v[3], ty = v[7], tz = v[11];
+            float cx = -(v[0] * tx + v[4] * ty + v[8] * tz);
+            float cy = -(v[1] * tx + v[5] * ty + v[9] * tz);
+            float cz = -(v[2] * tx + v[6] * ty + v[10] * tz);
+            fprintf(取证7文件, "相机世界位置 ≈ (%.2f, %.2f, %.2f) 米\n", cx, cy, cz);
+            float fx = -v[8], fy = -v[9], fz = -v[10];   // 视线方向
+            if (fy < -0.05f) {
+                float t = cy / -fy;
+                fprintf(取证7文件, "视线地面点 ≈ (%.2f, %.2f) 米  → 毫米 (%.0f, %.0f)\n",
+                        cx + fx * t, cz + fz * t, (cx + fx * t) * 1000, (cz + fz * t) * 1000);
+            }
+            fprintf(取证7文件, "V:");
+            for (int i = 0; i < 16; ++i) fprintf(取证7文件, " %.5f", v[i]);
+            fprintf(取证7文件, "\n");
+        } else {
+            fprintf(取证7文件, "V 读取失败（相机节点+0xA8）\n");
+        }
+        fflush(取证7文件);
     }
 
-    fprintf(f, "--- 采样%d ---\n", 样);
-    const uint64_t 偏[2] = { SDK::根相机, SDK::根相机备 };
-    for (int k = 0; k < 2; ++k) {
-        uint64_t A = vm_read<uint64_t>(模块 + 偏[k]);
-        uint64_t B = IsValidAddr(A) ? vm_read<uint64_t>(A + 184) : 0;
-        uint64_t C = IsValidAddr(B) ? vm_read<uint64_t>(B) : 0;
-        uint64_t D = IsValidAddr(C) ? vm_read<uint64_t>(C + 8) : 0;
-        fprintf(f, "[相机%d] A=%#llx B=%#llx C=%#llx D=%#llx\n", k,
-                (unsigned long long)A, (unsigned long long)B,
-                (unsigned long long)C, (unsigned long long)D);
-        倾浮(f, "  A", A, 0, 64);
-        倾浮(f, "  B", B, 0, 128);
-        倾浮(f, "  C", C, 0, 128);
-        倾浮(f, "  D", D, 0, 320);
-    }
-    fprintf(f, "--- 采样%d 结束 ---\n", 样);
-    fflush(f);
+    取证7采样(数组, 数量, m, 宽, 高);
+    int 序 = 取证7序++;
+    fprintf(取证7文件, "--- 采样%d 完成 ---\n", 序);
+    fflush(取证7文件);
 
-    if (++样 >= 4) {
-        fprintf(f, "=== 取证结束 ===\n");
-        fclose(f);
-        f = nullptr;
+    if (序 + 1 >= 取证7样本数) {
+        取证7完成 = true;
+        取证7结算(数组, 数量, m, 宽, 高);
+        fclose(取证7文件);
+        取证7文件 = nullptr;
     }
 }
+
 
 // ==================== 主渲染 ====================
 
@@ -2332,9 +2164,9 @@ void Draw::StartBooks() {
     // 小地图自适配（没手调过才回写）
     if (!地图已手调) {
         float 基准 = 短边 / 缩放;
-        cfg_mapX = 基准 * 0.085333f;
-        cfg_mapY = 基准 * 0.0053333f;
-        cfg_mapSize = 基准 * 0.328f;
+        cfg_mapX = 基准 * 0.085810f;
+        cfg_mapY = 基准 * 0.004490f;
+        cfg_mapSize = 基准 * 0.327210f;
         回写地图配置(cfg_mapX, cfg_mapY, cfg_mapSize);
     }
 
@@ -2408,12 +2240,10 @@ void Draw::StartBooks() {
     // 每 0.5 秒一行/槽（ID/阵营/+0x278 坐标/血量），第 20/80/200 份快照整块导出。
     static bool 已提示取证 = false;
     if (数量 >= 2) {
-        取证4(根世界, 容器, 数组, 数量);
-        取证5(数组, 数量, 矩阵, 屏.x, 屏.y);
-        取证6(模块基址, 矩阵);
-        if (!已提示取证 && 取证5文件) {
+        取证7(数组, 数量, 矩阵, 屏.x, 屏.y);
+        if (!已提示取证 && 取证7文件) {
             已提示取证 = true;
-            日志("取证v4/v5/v6 已开跑 → fields_dump4/5/6.txt");
+            日志("取证v7 已开跑 → Documents/fields_dump7.txt（允许负坐标）");
         }
     }
 
