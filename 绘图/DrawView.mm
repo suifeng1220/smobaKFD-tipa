@@ -891,9 +891,20 @@ static bool 读实测坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
     return 读坐标值(实体 + 坐标偏移X, X, Z);
 }
 
-// 读实体坐标：只有实测直读一条路，读不到返回 -1（没有链兜底了）
+// 读实体坐标：实体 +0x230 → 子对象 +0x128(x) / +0x130(z)，int32 毫米，可为负
+// 依据 fields_dump4.txt + 实测 VP 反证（槽8 → 屏幕正中，且与相机地面点 x 完全吻合）
 static int 读实体坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
-    return 读实测坐标(实体, X, Z) ? 4 : -1;
+    if (!IsValidAddr(实体)) return -1;
+    uint64_t 位 = vm_read<uint64_t>(实体 + SDK::坐标节点);
+    if (!IsValidAddr(位)) return -1;
+    int x = vm_read<int>(位 + SDK::坐标节点X);
+    int z = vm_read<int>(位 + SDK::坐标节点Y);
+    if (x <= -300000 || x >= 300000) return -1;
+    if (z <= -300000 || z >= 300000) return -1;
+    if (x == 0 && z == 0) return -1;
+    *X = (unsigned)x;
+    *Z = (unsigned)z;
+    return 4;
 }
 
 // ==================== 实体字段 ====================
@@ -2126,6 +2137,37 @@ static void 取证7(uint64_t 数组, int 数量, const float* m, float 宽, floa
 }
 
 
+
+// ==================== 位置落盘（小地图标定用） ====================
+// 每 0.5 秒写一次 10 个槽的世界坐标与屏幕坐标，用来和游戏原生小地图做对齐标定。
+static void 位置日志(uint64_t 数组, int 数量, const float* m, float 宽, float 高) {
+    static FILE* f = nullptr;
+    static double 上次 = 0;
+    double now = CACurrentMediaTime();
+    if (now - 上次 < 0.5) return;
+    上次 = now;
+    if (!f) {
+        const char* 家 = getenv("HOME");
+        if (!家) return;
+        char p2[512];
+        snprintf(p2, sizeof(p2), "%s/Documents/pos.log", 家);
+        f = fopen(p2, "w");
+        if (!f) return;
+        setvbuf(f, nullptr, _IOLBF, 0);
+        fprintf(f, "# 槽 x(毫米) z(毫米) 屏x 屏y 有效  (屏幕 %.0fx%.0f)\n", 宽, 高);
+    }
+    fprintf(f, "--- %.2f ---\n", now);
+    for (int i = 0; i < 数量 && i < 16; ++i) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)i);
+        unsigned X = 0, Z = 0;
+        if (读实体坐标(e, &X, &Z) < 0) { fprintf(f, "%d 0 0 0 0 0\n", i); continue; }
+        float sx = 0, sy = 0;
+        bool ok = 投影(m, (int)X, (int)Z, &sx, &sy, 宽, 高);
+        fprintf(f, "%d %d %d %.0f %.0f %d\n", i, (int)X, (int)Z, sx, sy, ok ? 1 : 0);
+    }
+    fflush(f);
+}
+
 // ==================== 主渲染 ====================
 
 static bool 点在小地图(const ImVec4& 地图, float x, float y) {
@@ -2240,10 +2282,10 @@ void Draw::StartBooks() {
     // 每 0.5 秒一行/槽（ID/阵营/+0x278 坐标/血量），第 20/80/200 份快照整块导出。
     static bool 已提示取证 = false;
     if (数量 >= 2) {
-        取证7(数组, 数量, 矩阵, 屏.x, 屏.y);
-        if (!已提示取证 && 取证7文件) {
+        位置日志(数组, 数量, 矩阵, 屏.x, 屏.y);
+        if (!已提示取证) {
             已提示取证 = true;
-            日志("取证v7 已开跑 → Documents/fields_dump7.txt（允许负坐标）");
+            日志("坐标已切换到 实体+0x230→+0x128/+0x130，位置写入 Documents/pos.log");
         }
     }
 
