@@ -102,6 +102,12 @@ static bool 地图已手调 = false;            // 0x100223580（plist 里有 ma
 static bool cfg_fov_probe = false;         // 0x100223590
 static bool cfg_status = false;            // 左下角状态浮层开关（默认关，不自动弹出）
 
+// 小地图世界换算：坐标为毫米，地图全幅跨度（毫米）。实测我方/敌方泉水在 ±55400 mm，
+// 泉水在原生小图上距边约 12%，故全幅 ≈ 150000（= 王者 12000 单位 × 12.5mm）。
+// 不写死，改为可运行时调：读 Documents/tune.txt 的 mapSpan=xxx，改完 2 秒内生效，不用重编。
+static float cfg_mapSpan = 150000.0f;
+static int   cfg_flip = 0;                 // 0=按我方阵营自动；1=强制不翻转；-1=强制翻转
+
 static const char* 设置路径 = "/var/mobile/Library/Preferences/com.map.settings.plist";
 
 // StartBooks 局部静态
@@ -478,6 +484,37 @@ static void 读配置() {
     if (cfg_mapSize > 999.0f) cfg_mapSize = 999.0f;
     if (cfg_fov < 0.1f) cfg_fov = 0.1f;
     if (cfg_fov > 10.0f) cfg_fov = 10.0f;
+}
+
+// 运行时调参：Documents/tune.txt，每行 key=value，每 2 秒重读一次。
+// 支持 mapSpan（小地图世界全幅，毫米）、flip（0自动/1不翻转/-1翻转）。
+// 目的：小地图比例可以在电脑端改文件直接生效，不用重编重装。
+static void 读调参() {
+    static double 上次 = 0;
+    double now = CACurrentMediaTime();
+    if (now - 上次 < 2.0) return;
+    上次 = now;
+    const char* 家 = getenv("HOME");
+    if (!家) return;
+    char p[512];
+    snprintf(p, sizeof(p), "%s/Documents/tune.txt", 家);
+    FILE* f = fopen(p, "r");
+    if (!f) return;
+    char 行[256];
+    while (fgets(行, sizeof(行), f)) {
+        char* eq = strchr(行, '=');
+        if (!eq) continue;
+        *eq = 0;
+        const char* k = 行;
+        while (*k == ' ' || *k == '\t') ++k;
+        float v = strtof(eq + 1, nullptr);
+        if (!strncmp(k, "mapSpan", 7)) {
+            if (v >= 20000.0f && v <= 400000.0f) cfg_mapSpan = v;
+        } else if (!strncmp(k, "flip", 4)) {
+            cfg_flip = (int)v;
+        }
+    }
+    fclose(f);
 }
 
 // 小地图自适配回写：参数变化 ≥1.0 才写 plist
@@ -1413,20 +1450,48 @@ static int 读野怪(uint64_t 模块, 野怪信息* 输出, int 上限) {
     return 数;
 }
 
-// 小图坐标（英雄，/109000，阵营 1 时 y 取反）
-static void 小图坐标(int x, int z, unsigned 阵营, const ImVec4& 地图, float* 出X, float* 出Y) {
-    float 翻转 = 阵营符号(阵营);
-    float half = 地图.w * 0.5f;
-    *出X = ((x * 翻转) / 109000.0f) * 地图.w + 地图.x + half;
-    *出Y = ((z * 翻转) / 109000.0f) * (-地图.w) + 地图.y + half;
+// 小地图翻转：全局唯一值，按【我方阵营英雄的世界 X 均值符号】每帧推一次。
+// ★ 这是"英雄全挤在敌方泉水附近乱跳"的根因修正：
+//   原代码按【每个目标自己的阵营】取反，我方 -1、敌方 +1，两拨人各自镜像后
+//   全部落到同一侧，于是十个人全叠在一起、还随摄像头抖动。
+//   现在只按观察者一侧统一翻转，保证我方基地永远在左下。
+static float 小图翻转值 = 1.0f;
+static unsigned 调试我方阵营 = 0;      // 只用于 pos.log 表头，方便标定
+
+static float 小图翻转() {
+    if (cfg_flip > 0) return 1.0f;
+    if (cfg_flip < 0) return -1.0f;
+    return 小图翻转值;
 }
 
-// 野怪小图坐标（/100000）
-static void 野怪小图坐标(int x, int z, unsigned 阵营, const ImVec4& 地图, float* 出X, float* 出Y) {
-    float 翻转 = 阵营符号(阵营);
+// 每帧调用一次：用我方阵营英雄的平均 X 判断我方基地在哪一侧，推出统一翻转
+static void 推小图翻转(uint64_t 数组, int 数量, unsigned 我方阵营) {
+    if (cfg_flip != 0) return;
+    long long 和 = 0;
+    int 数 = 0;
+    for (int k = 0; k < 数量 && k < cfg_scan_max; ++k) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        if (!IsValidAddr(e)) continue;
+        unsigned X = 0, Z = 0;
+        if (读实体坐标(e, &X, &Z) < 0) continue;
+        if (vm_read<int>(e + SDK::阵营) != (int)我方阵营) continue;
+        和 += (int)X;
+        数++;
+    }
+    if (数 == 0) return;                       // 本帧没有样本，沿用上帧
+    小图翻转值 = (和 / 数 > 0) ? -1.0f : 1.0f;
+}
+
+static void 小图坐标(int x, int z, const ImVec4& 地图, float* 出X, float* 出Y) {
+    float 翻转 = 小图翻转();
     float half = 地图.w * 0.5f;
-    *出X = ((x * 翻转) / 100000.0f) * 地图.w + 地图.x + half;
-    *出Y = ((z * 翻转) / 100000.0f) * (-地图.w) + 地图.y + half;
+    *出X = ((x * 翻转) / cfg_mapSpan) * 地图.w + 地图.x + half;
+    *出Y = ((z * 翻转) / cfg_mapSpan) * (-地图.w) + 地图.y + half;
+}
+
+// 野怪小图坐标：与小地图同一世界换算，不再单独用 /100000
+static void 野怪小图坐标(int x, int z, const ImVec4& 地图, float* 出X, float* 出Y) {
+    小图坐标(x, z, 地图, 出X, 出Y);
 }
 
 static float 阵营符号(unsigned 阵营) {
@@ -2176,7 +2241,8 @@ static void 位置日志(uint64_t 数组, int 数量, const float* m, float 宽,
         setvbuf(f, nullptr, _IOLBF, 0);
         fprintf(f, "# 槽 x(毫米) z(毫米) 屏x 屏y 有效  (屏幕 %.0fx%.0f)\n", 宽, 高);
     }
-    fprintf(f, "--- %.2f 命中=0x%llX ---\n", now, (unsigned long long)坐标命中偏移);
+    fprintf(f, "--- %.2f 命中=0x%llX 阵营=%u 翻转=%.0f 跨度=%.0f ---\n",
+            now, (unsigned long long)坐标命中偏移, 调试我方阵营, 小图翻转(), cfg_mapSpan);
     for (int i = 0; i < 数量 && i < 16; ++i) {
         uint64_t e = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)i);
         unsigned X = 0, Z = 0;
@@ -2406,6 +2472,11 @@ void Draw::StartBooks() {
         我方阵营 = 阵营锁定;
     }
 
+    // 运行时调参（Documents/tune.txt，2 秒重读一次）与小地图翻转
+    读调参();
+    推小图翻转(数组, 数量, 我方阵营);
+    调试我方阵营 = 我方阵营;
+
     if (!cfg_draw) return;
 
     // 小地图边框
@@ -2564,7 +2635,7 @@ void Draw::StartBooks() {
         // 小地图图标
         if (cfg_map) {
             float mx = 0.0f, my = 0.0f;
-            小图坐标((int)样X, (int)样Z, 阵营, 地图, &mx, &my);
+            小图坐标((int)样X, (int)样Z, 地图, &mx, &my);
             mx *= 缩放;
             my *= 缩放;
             // 敌方头像 + 绿环的整体外径对齐游戏原生小地图头像。
@@ -2642,7 +2713,7 @@ void Draw::StartBooks() {
         野怪计 = 读野怪(模块基址, 野怪, 20);
         for (int m = 0; m < 野怪计; ++m) {
             float mx = 0.0f, my = 0.0f;
-            野怪小图坐标(野怪[m].x, 野怪[m].z, 野怪[m].camp, 地图, &mx, &my);
+            野怪小图坐标(野怪[m].x, 野怪[m].z, 地图, &mx, &my);
             // 先在逻辑坐标上判断/翻折，最后再乘一次缩放（否则与 地图 的量纲不一致）
             if (!点在小地图(地图, mx, my)) {
                 // 镜像翻折（对面半图）
