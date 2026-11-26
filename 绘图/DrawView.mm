@@ -891,29 +891,38 @@ static bool 读实测坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
     return 读坐标值(实体 + 坐标偏移X, X, Z);
 }
 
-// 读实体坐标：实体 +0x230 → 子对象 +0x128(x) / +0x130(z)，int32 毫米，可为负
-// 依据 fields_dump4.txt 原始行：槽0 @+0x230->0x2bfc26c08 +0x128 (-51875,0,-52055)
-// 之前 SDK::坐标节点 误写成 592(0x250)，读的是隔壁对象 → 十槽恒 0，已修正为 560(0x230)。
-// 这里再留 0x260 / 0x250 两个备用偏移，命中时打日志，避免又因为一个常量卡住整轮。
+// 读实体坐标：坐标三元组就在实体自身 —— +0x278=x, +0x27C=y, +0x280=z（int32 毫米，可为负）
+// 实测钉死：新 chain.log 的 +0x278 与 pos.log 的 x 在同一局同一帧对拍，10 槽 10/10 完全相等。
+// 旧链路（实体+0x230 → 子对象+0x128/+0x130）在本局全槽恒 0，只留作兜底。
+// 命中偏移写 pos.log 表头，一眼能看出本局走的是哪条链，不用再猜。
+static uint64_t 坐标命中偏移 = 0;   // 0=未命中；否则记录实际生效的首个字段偏移
+
 static int 读实体坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
     if (!IsValidAddr(实体)) return -1;
-    static const uint64_t 候选[] = { SDK::坐标节点, 608 /* 0x260 */, 592 /* 0x250 */ };
-    for (int k = 0; k < 3; ++k) {
-        uint64_t 位 = vm_read<uint64_t>(实体 + 候选[k]);
-        if (!IsValidAddr(位)) continue;
-        int x = vm_read<int>(位 + SDK::坐标节点X);
-        int z = vm_read<int>(位 + SDK::坐标节点Y);
-        if (x <= -300000 || x >= 300000) continue;
-        if (z <= -300000 || z >= 300000) continue;
-        if (x == 0 && z == 0) continue;
-        static uint64_t 上次命中 = 0;
-        if (上次命中 != 候选[k]) {
-            上次命中 = 候选[k];
-            日志("坐标节点命中 实体+0x%llX", (unsigned long long)候选[k]);
+    // 一级：实体自身 +0x278 / +0x280
+    {
+        int x = vm_read<int>(实体 + SDK::坐标直接X);
+        int z = vm_read<int>(实体 + SDK::坐标直接Z);
+        if (x > -300000 && x < 300000 && z > -300000 && z < 300000 && !(x == 0 && z == 0)) {
+            坐标命中偏移 = SDK::坐标直接X;
+            *X = (unsigned)x;
+            *Z = (unsigned)z;
+            return 4;
         }
-        *X = (unsigned)x;
-        *Z = (unsigned)z;
-        return 4;
+    }
+    // 二级兜底：旧链路 实体+0x230 → 子对象 +0x128/+0x130
+    {
+        uint64_t 位 = vm_read<uint64_t>(实体 + SDK::坐标节点);
+        if (IsValidAddr(位)) {
+            int x = vm_read<int>(位 + SDK::坐标节点X);
+            int z = vm_read<int>(位 + SDK::坐标节点Y);
+            if (x > -300000 && x < 300000 && z > -300000 && z < 300000 && !(x == 0 && z == 0)) {
+                坐标命中偏移 = SDK::坐标节点;
+                *X = (unsigned)x;
+                *Z = (unsigned)z;
+                return 4;
+            }
+        }
     }
     return -1;
 }
@@ -2167,7 +2176,7 @@ static void 位置日志(uint64_t 数组, int 数量, const float* m, float 宽,
         setvbuf(f, nullptr, _IOLBF, 0);
         fprintf(f, "# 槽 x(毫米) z(毫米) 屏x 屏y 有效  (屏幕 %.0fx%.0f)\n", 宽, 高);
     }
-    fprintf(f, "--- %.2f ---\n", now);
+    fprintf(f, "--- %.2f 命中=0x%llX ---\n", now, (unsigned long long)坐标命中偏移);
     for (int i = 0; i < 数量 && i < 16; ++i) {
         uint64_t e = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)i);
         unsigned X = 0, Z = 0;
