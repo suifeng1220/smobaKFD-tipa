@@ -2227,6 +2227,73 @@ static void 取证5(uint64_t 数组, int 数量, const float* m, float 宽, floa
     }
 }
 
+// ==================== 取证 v6：相机链内存倾倒 ====================
+
+// 把一段内存按 float 打印，每行 16 个，带相对偏移
+static void 倾浮(FILE* f, const char* 名, uint64_t 基, int 起, int 长) {
+    if (!IsValidAddr(基)) { fprintf(f, "%s 地址无效\n", 名); return; }
+    for (int i = 0; i < 长; i += 16) {
+        fprintf(f, "%s%+#06x:", 名, 起 + 4 * i);
+        for (int j = 0; j < 16; ++j) {
+            float x = vm_read<float>(基 + (uint64_t)(起 + 4 * (i + j)));
+            if (!isfinite(x) || fabsf(x) > 1e12f) x = 0.0f;
+            fprintf(f, " %.5f", x);
+        }
+        fprintf(f, "\n");
+    }
+}
+
+// 矩阵读错时，把相机链每一层都倒出来，本地找真正的 4x4
+static void 取证6(uint64_t 模块, const float* 矩阵) {
+    static FILE* f = nullptr;
+    static int 帧计 = 0, 样 = 0;
+    static double 上次 = 0;
+    if (样 >= 4) return;
+    if (++帧计 % 30) return;
+    double now = CACurrentMediaTime();
+    if (样 > 0 && now - 上次 < 5.0) return;
+    上次 = now;
+
+    if (!f) {
+        const char* 家 = getenv("HOME");
+        if (!家) return;
+        char 路径[512];
+        snprintf(路径, sizeof(路径), "%s/Documents/fields_dump6.txt", 家);
+        f = fopen(路径, "w");
+        if (!f) return;
+        setvbuf(f, nullptr, _IOLBF, 0);
+        fprintf(f, "=== 取证 v6：相机链内存倾倒 ===\n当前读到的矩阵:");
+        for (int i = 0; i < 16; ++i) fprintf(f, " %.5f", 矩阵[i]);
+        fprintf(f, "\n根相机=%#llx 根相机备=%#llx\n",
+                (unsigned long long)SDK::根相机, (unsigned long long)SDK::根相机备);
+        fflush(f);
+    }
+
+    fprintf(f, "--- 采样%d ---\n", 样);
+    const uint64_t 偏[2] = { SDK::根相机, SDK::根相机备 };
+    for (int k = 0; k < 2; ++k) {
+        uint64_t A = vm_read<uint64_t>(模块 + 偏[k]);
+        uint64_t B = IsValidAddr(A) ? vm_read<uint64_t>(A + 184) : 0;
+        uint64_t C = IsValidAddr(B) ? vm_read<uint64_t>(B) : 0;
+        uint64_t D = IsValidAddr(C) ? vm_read<uint64_t>(C + 8) : 0;
+        fprintf(f, "[相机%d] A=%#llx B=%#llx C=%#llx D=%#llx\n", k,
+                (unsigned long long)A, (unsigned long long)B,
+                (unsigned long long)C, (unsigned long long)D);
+        倾浮(f, "  A", A, 0, 64);
+        倾浮(f, "  B", B, 0, 128);
+        倾浮(f, "  C", C, 0, 128);
+        倾浮(f, "  D", D, 0, 320);
+    }
+    fprintf(f, "--- 采样%d 结束 ---\n", 样);
+    fflush(f);
+
+    if (++样 >= 4) {
+        fprintf(f, "=== 取证结束 ===\n");
+        fclose(f);
+        f = nullptr;
+    }
+}
+
 // ==================== 主渲染 ====================
 
 static bool 点在小地图(const ImVec4& 地图, float x, float y) {
@@ -2341,10 +2408,12 @@ void Draw::StartBooks() {
     // 每 0.5 秒一行/槽（ID/阵营/+0x278 坐标/血量），第 20/80/200 份快照整块导出。
     static bool 已提示取证 = false;
     if (数量 >= 2) {
+        取证4(根世界, 容器, 数组, 数量);
         取证5(数组, 数量, 矩阵, 屏.x, 屏.y);
+        取证6(模块基址, 矩阵);
         if (!已提示取证 && 取证5文件) {
             已提示取证 = true;
-            日志("取证v5 已开跑 → Documents/fields_dump5.txt（矩阵投影反证坐标）");
+            日志("取证v4/v5/v6 已开跑 → fields_dump4/5/6.txt");
         }
     }
 
