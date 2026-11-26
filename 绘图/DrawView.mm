@@ -1902,6 +1902,200 @@ static void 取证4(uint64_t 世界, uint64_t 容器, uint64_t 数组, int 数�
     }
 }
 
+// ==================== 取证 v5：用相机矩阵反证真坐标 ====================
+//
+// v4 只按「地图量级 int（100~250000）」筛，天然漏掉两类真坐标：
+//   * 坐标 /1000 后是米，原始 int 很容易超过 25 万（大图/大场景）
+//   * 坐标是 float 时位模式在 1e9 量级，直接被过滤
+// 所以 v4 的候选表里全是血量(+0x1d0→+0xc0/+0xc8)、计时器、朝向，一条真坐标都没有。
+//
+// v5 换个判据，不靠值域猜，靠几何反证：
+//   真坐标 (x,z) 经「当前这一帧的相机矩阵」投影，必须落进屏幕。
+//   同一字段在 10 个槽里，落屏内的槽数越多，越可能是位置。
+//   血量/计时器/朝向这类字段要么槽间同值，要么投影到天上，命中数上不去。
+//
+// 输出 Documents/fields_dump5.txt：按累加命中排序，命中数 = 6 次采样 × 10 槽里的屏内次数。
+
+struct 投影槽 {
+    int32_t 累加命中;      // 采到「满足屏内 + 分散」的槽，累加
+    int32_t 槽数;          // 本次采样已计入的槽数
+    float   和x, 和y, 积x, 积y;
+    int32_t 样a, 样b, 样c;
+};
+
+#define 取证5指针项 194     // 0=实体自身，1..192 = 指针偏移/8+1
+#define 取证5偏移项 384     // 0..0x600，每 4 字节
+#define 取证5配对项 3
+#define 取证5缩放项 2       // 0: 原始 int 就是米(/1)   1: int/1000 才是米
+#define 取证5键数   (取证5指针项 * 取证5偏移项 * 取证5配对项 * 取证5缩放项)
+static 投影槽* 取证5槽 = nullptr;
+static FILE*   取证5文件 = nullptr;
+static int     取证5帧计 = 0, 取证5等帧 = 0, 取证5采样序 = 0;
+static bool    取证5完成 = false;
+
+static inline int 取证5索引(int32_t 指针偏移, int32_t 内偏移, int 配对, int 缩放) {
+    if (内偏移 < 0 || 内偏移 >= 取证5偏移项 * 4) return -1;
+    int p = (指针偏移 < 0) ? 0 : (int32_t)(指针偏移 / 8 + 1);
+    if (p < 0 || p >= 取证5指针项) return -1;
+    return ((p * 取证5偏移项 + 内偏移 / 4) * 取证5配对项 + 配对) * 取证5缩放项 + 缩放;
+}
+
+static inline bool 取证5屏内(float sx, float sy, float 宽, float 高) {
+    float mx = 宽 * 0.15f, my = 高 * 0.15f;
+    return sx >= -mx && sx <= 宽 + mx && sy >= -my && sy <= 高 + my;
+}
+
+// 带缩放的浮点投影（投影() 内部固定 /1000，这里要试多档）
+static inline bool 投影f(const float* m, float x, float z, float* 屏X, float* 屏Y, float 宽, float 高) {
+    float w = m[2] * x + m[10] * z + m[14];
+    if (!isfinite(w) || w < 0.01f) return false;
+    float inv = 1.0f / w;
+    float px = (m[0] * x + m[8] * z + m[12]) * inv;
+    float py = (m[1] * x + m[9] * z + m[13]) * inv;
+    if (!isfinite(px) || !isfinite(py)) return false;
+    *屏X = (px + 1.0f) * 宽 * 0.5f;
+    *屏Y = (1.0f - py) * 高 * 0.5f;
+    return true;
+}
+
+// 坐标必须是正数（游戏世界在第一象限），上限放到 200 万，覆盖「/1000」那种大整数
+static inline bool 取证5值可(int32_t v) { return v > 1 && v < 2000000; }
+
+static void 取证5扫(int32_t 指针偏移, const unsigned char* buf, int 长度,
+                    const float* m, float 宽, float 高) {
+    for (int off = 0; off + 12 <= 长度; off += 4) {
+        int32_t a = *(const int32_t*)(buf + off);
+        if (!取证5值可(a)) continue;
+        int32_t b = *(const int32_t*)(buf + off + 4);
+        int32_t c = *(const int32_t*)(buf + off + 8);
+        const int32_t xv[3] = { a, a, b };
+        const int32_t zv[3] = { c, b, c };
+        for (int k = 0; k < 3; ++k) {
+            if (!取证5值可(zv[k])) continue;
+            if (xv[k] == zv[k]) continue;          // x==z 多半是同一份数据被读两次
+            for (int sc = 0; sc < 取证5缩放项; ++sc) {
+                int idx = 取证5索引(指针偏移, off, k, sc);
+                if (idx < 0) continue;
+                float div = (sc == 0) ? 1.0f : 1000.0f;
+                float sx = 0, sy = 0;
+                if (!投影f(m, (float)xv[k] / div, (float)zv[k] / div, &sx, &sy, 宽, 高)) continue;
+                if (!取证5屏内(sx, sy, 宽, 高)) continue;
+                投影槽& s = 取证5槽[idx];
+                if (s.累加命中 == 0 && s.槽数 == 0) { s.样a = a; s.样b = b; s.样c = c; }
+                s.槽数++;
+                s.和x += sx; s.和y += sy;
+                s.积x += sx * sx; s.积y += sy * sy;
+            }
+        }
+    }
+}
+
+static void 取证5采样(uint64_t 数组, int 数量, const float* m, float 宽, float 高) {
+    unsigned char buf[0x600];
+    if (数量 > 32) 数量 = 32;
+    for (int k = 0; k < 数量; ++k) {
+        uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)k);
+        if (!IsValidAddr(实体)) continue;
+
+        // A. 实体自身 0x0..0x600
+        if (readMemory(实体, buf, 0x600)) 取证5扫(-1, buf, 0x600, m, 宽, 高);
+
+        // B. 一级指针子对象，一次读满 0x600（readMemory 内部 256 字节分块，限流按调用次数算）
+        for (int po = 0; po < 0x600; po += 8) {
+            uint64_t 子 = vm_read<uint64_t>(实体 + (uint64_t)po);
+            if (!IsValidAddr(子)) continue;
+            if (!readMemory(子, buf, 0x600)) continue;
+            取证5扫(po, buf, 0x600, m, 宽, 高);
+        }
+    }
+}
+
+// 本采样收尾：槽数够、且屏幕坐标真的散开（排除「全挤屏幕中心」的假命中）才计入
+static void 取证5结算(int 槽数) {
+    int 需要 = 槽数 >= 6 ? 5 : (槽数 >= 3 ? 2 : 1);
+    for (int i = 0; i < 取证5键数; ++i) {
+        投影槽& s = 取证5槽[i];
+        if (s.槽数 == 0) continue;
+        int n = s.槽数;
+        bool 好 = (n >= 需要);
+        if (好) {
+            float mx = s.和x / n, my = s.和y / n;
+            float vx = s.积x / n - mx * mx, vy = s.积y / n - my * my;
+            if (vx < 2500.0f && vy < 2500.0f) 好 = false;   // 两轴标准差都 < 50px = 挤成一坨
+        }
+        if (好) s.累加命中 += n;
+        s.槽数 = 0; s.和x = s.和y = s.积x = s.积y = 0;
+    }
+}
+
+static void 取证5(uint64_t 数组, int 数量, const float* m, float 宽, float 高) {
+    if (取证5完成) return;
+    if (!取证5槽) {
+        取证5槽 = (投影槽*)calloc((size_t)取证5键数, sizeof(投影槽));
+        if (!取证5槽) return;
+    }
+    if (++取证5帧计 % 30) return;
+    if (取证5采样序 > 0) {
+        if (++取证5等帧 < 30) return;
+        取证5等帧 = 0;
+    }
+
+    if (!取证5文件) {
+        const char* 家 = getenv("HOME");
+        if (!家) return;
+        char 路径[512];
+        snprintf(路径, sizeof(路径), "%s/Documents/fields_dump5.txt", 家);
+        取证5文件 = fopen(路径, "w");
+        if (!取证5文件) return;
+        setvbuf(取证5文件, nullptr, _IOLBF, 0);
+        fprintf(取证5文件, "=== 取证 v5（相机矩阵投影反证）===\n");
+        fprintf(取证5文件, "屏幕=%.0fx%.0f  实体数量=%d\n", 宽, 高, 数量);
+        fprintf(取证5文件, "矩阵:");
+        for (int i = 0; i < 16; ++i) fprintf(取证5文件, " %.5f", m[i]);
+        fprintf(取证5文件, "\n判据: 投影落屏内 + 10 槽屏幕坐标离散(σ>50px)\n");
+        fflush(取证5文件);
+    }
+
+    取证5采样(数组, 数量, m, 宽, 高);
+    取证5结算(数量);
+    int 序 = 取证5采样序++;
+    fprintf(取证5文件, "--- 采样%d 完成 ---\n", 序);
+    fflush(取证5文件);
+
+    if (序 >= 5) {
+        取证5完成 = true;
+        int 采样数 = 序 + 1;
+        fprintf(取证5文件, "\n=== 结果（%d 次采样 × %d 槽）===\n", 采样数, 数量);
+        for (int 轮 = 0; 轮 < 40; ++轮) {
+            int 最佳 = -1, 最佳分 = 0;
+            for (int i = 0; i < 取证5键数; ++i) {
+                int 分 = 取证5槽[i].累加命中;
+                if (分 > 最佳分) { 最佳分 = 分; 最佳 = i; }
+            }
+            if (最佳 < 0 || 最佳分 < 6) break;
+            int sc = 最佳 % 取证5缩放项;
+            int t = 最佳 / 取证5缩放项;
+            int k = t % 取证5配对项;
+            t /= 取证5配对项;
+            int o = t % 取证5偏移项;
+            int p = t / 取证5偏移项;
+            投影槽& s = 取证5槽[最佳];
+            const char* 配对名 = (k == 0) ? "x=a,z=c" : (k == 1 ? "x=a,z=b" : "x=b,z=c");
+            const char* 缩放名 = (sc == 0) ? "原值" : "/1000";
+            if (p == 0)
+                fprintf(取证5文件, "命中%3d  实体 +%#05x  %s %s  a=%d b=%d c=%d\n",
+                        最佳分, o * 4, 配对名, 缩放名, s.样a, s.样b, s.样c);
+            else
+                fprintf(取证5文件, "命中%3d  子对象@+%#05x -> +%#05x  %s %s  a=%d b=%d c=%d\n",
+                        最佳分, (p - 1) * 8, o * 4, 配对名, 缩放名, s.样a, s.样b, s.样c);
+            取证5槽[最佳].累加命中 = -1;     // 排掉，避免重复
+        }
+        fprintf(取证5文件, "=== 取证结束 ===\n");
+        fclose(取证5文件);
+        取证5文件 = nullptr;
+    }
+}
+
 // ==================== 主渲染 ====================
 
 static bool 点在小地图(const ImVec4& 地图, float x, float y) {
@@ -2016,10 +2210,10 @@ void Draw::StartBooks() {
     // 每 0.5 秒一行/槽（ID/阵营/+0x278 坐标/血量），第 20/80/200 份快照整块导出。
     static bool 已提示取证 = false;
     if (数量 >= 2) {
-        取证4(根世界, 容器, 数组, 数量);
-        if (!已提示取证 && 取证4文件) {
+        取证5(数组, 数量, 矩阵, 屏.x, 屏.y);
+        if (!已提示取证 && 取证5文件) {
             已提示取证 = true;
-            日志("取证v4 已开跑 → Documents/fields_dump4.txt（实时坐标动态搜索）");
+            日志("取证v5 已开跑 → Documents/fields_dump5.txt（矩阵投影反证坐标）");
         }
     }
 
