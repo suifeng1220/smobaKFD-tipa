@@ -2168,6 +2168,77 @@ static void 位置日志(uint64_t 数组, int 数量, const float* m, float 宽,
     fflush(f);
 }
 
+// 链路诊断：把 根世界→容器→数组→实体→候选坐标节点 的原始指针全部落盘，
+// 并每 3 秒对槽0 做一次指针扫描，找出真正形如 {x,z} 的坐标对。
+// 写 Documents/chain.log，用于在没有任何调试器可用时定位字段。
+static void 链路诊断(uint64_t 根世界, uint64_t 容器, uint64_t 数组, int 数量) {
+    static FILE* f = nullptr;
+    static double 上次 = 0, 上次扫 = 0;
+    double now = CACurrentMediaTime();
+    if (now - 上次 < 1.0) return;
+    上次 = now;
+    if (!f) {
+        const char* 家 = getenv("HOME");
+        if (!家) return;
+        char p3[512];
+        snprintf(p3, sizeof(p3), "%s/Documents/chain.log", 家);
+        f = fopen(p3, "w");
+        if (!f) return;
+        setvbuf(f, nullptr, _IOLBF, 0);
+        fprintf(f, "# 链路诊断：根世界/容器/数组/实体指针 + 候选坐标扫描\n");
+    }
+    fprintf(f, "=== %.2f 根世界=0x%llx 容器=0x%llx 数组=0x%llx 数量=%d\n", now,
+            (unsigned long long)根世界, (unsigned long long)容器,
+            (unsigned long long)数组, 数量);
+    for (int i = 0; i < 数量 && i < 12; ++i) {
+        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)i);
+        fprintf(f, "槽%-2d 实体=0x%llx", i, (unsigned long long)e);
+        if (!IsValidAddr(e)) { fprintf(f, " [实体无效]\n"); continue; }
+        uint64_t p230 = vm_read<uint64_t>(e + SDK::坐标节点);
+        uint64_t p1d0 = vm_read<uint64_t>(e + SDK::血量对象);
+        unsigned v278 = vm_read<unsigned>(e + 0x278);
+        int v2b8 = vm_read<int>(e + SDK::坐标X);
+        int v2c0 = vm_read<int>(e + SDK::坐标Y);
+        fprintf(f, " +230=0x%llx +1D0=0x%llx +278=%u +2B8=%d +2C0=%d",
+                (unsigned long long)p230, (unsigned long long)p1d0,
+                v278, v2b8, v2c0);
+        if (IsValidAddr(p230)) {
+            fprintf(f, "\n      p230:");
+            for (uint64_t o = 0x100; o <= 0x170; o += 8)
+                fprintf(f, " %llx=%d", (unsigned long long)o, vm_read<int>(p230 + o));
+        }
+        fprintf(f, "\n");
+    }
+    // 指针扫描：只扫槽0，3 秒一次，避免拖慢帧率
+    if (数量 > 0 && now - 上次扫 > 3.0) {
+        上次扫 = now;
+        uint64_t e = vm_read<uint64_t>(数组);
+        if (IsValidAddr(e)) {
+            fprintf(f, "-- 扫描槽0 实体=0x%llx --\n", (unsigned long long)e);
+            for (uint64_t off = 0x180; off <= 0x340; off += 8) {
+                uint64_t p = vm_read<uint64_t>(e + off);
+                if (!IsValidAddr(p)) continue;
+                int bx = 0, bz = 0;
+                uint64_t bo = 0;
+                bool 找到 = false;
+                for (uint64_t o = 0x100; o <= 0x180; o += 4) {
+                    int x = vm_read<int>(p + o);
+                    int z = vm_read<int>(p + o + 4);
+                    int ax = x < 0 ? -x : x, az = z < 0 ? -z : z;
+                    if (ax > 1000 && ax < 200000 && az > 1000 && az < 200000) {
+                        bx = x; bz = z; bo = o; 找到 = true; break;
+                    }
+                }
+                if (找到)
+                    fprintf(f, "   +0x%llx -> 0x%llx @0x%llx (%d, %d)\n",
+                            (unsigned long long)off, (unsigned long long)p,
+                            (unsigned long long)bo, bx, bz);
+            }
+        }
+    }
+    fflush(f);
+}
+
 // ==================== 主渲染 ====================
 
 static bool 点在小地图(const ImVec4& 地图, float x, float y) {
@@ -2283,6 +2354,7 @@ void Draw::StartBooks() {
     static bool 已提示取证 = false;
     if (数量 >= 2) {
         位置日志(数组, 数量, 矩阵, 屏.x, 屏.y);
+        链路诊断(根世界, 容器, 数组, 数量);
         if (!已提示取证) {
             已提示取证 = true;
             日志("坐标已切换到 实体+0x230→+0x128/+0x130，位置写入 Documents/pos.log");
