@@ -106,9 +106,24 @@ static bool cfg_status = false;            // 左下角状态浮层开关（默�
 // 泉水在原生小图上距边约 12%，故全幅 ≈ 150000（= 王者 12000 单位 × 12.5mm）。
 // 不写死，改为可运行时调：读 Documents/tune.txt 的 mapSpan=xxx，改完 2 秒内生效，不用重编。
 static float cfg_mapSpan = 150000.0f;
+static bool  调参定地图 = false;   // tune.txt 里给了 mapX/mapY/mapSize → 关掉自适配，别覆盖手工值
 static int   cfg_flip = 0;                 // 0=按我方阵营自动；1=强制不翻转；-1=强制翻转
 
-static const char* 设置路径 = "/var/mobile/Library/Preferences/com.map.settings.plist";
+// ★ 配置落盘路径修正：原来写 /var/mobile/Library/Preferences/com.map.settings.plist，
+//   但本程序是注入到游戏进程里的 dylib，受游戏沙盒限制，那个目录根本写不进去
+//   （实测该文件从未生成）→ 所有设置关游戏就丢，小地图尺寸也永远改不动。
+//   改为游戏容器自己的 Documents，读写都通。
+static const char* 设置路径取() {
+    static char 缓存[512] = {0};
+    if (!缓存[0]) {
+        const char* 家 = getenv("HOME");
+        if (家) snprintf(缓存, sizeof(缓存), "%s/Documents/settings.plist", 家);
+        else   snprintf(缓存, sizeof(缓存), "/var/mobile/Library/Preferences/com.map.settings.plist");
+    }
+    return 缓存;
+}
+// 旧路径仅用于一次性迁移读取
+static const char* 旧设置路径 = "/var/mobile/Library/Preferences/com.map.settings.plist";
 
 // StartBooks 局部静态
 static float 缩放系数 = 1.0f;              // 缩放 = 短边/物理短边
@@ -434,7 +449,8 @@ static float 读浮点(NSDictionary* cfg, NSString* key, float 缺省) {
 
 
 static void 读配置() {
-    NSDictionary* cfg = [NSDictionary dictionaryWithContentsOfFile:@(设置路径)];
+    NSDictionary* cfg = [NSDictionary dictionaryWithContentsOfFile:@(设置路径取())];
+    if (!cfg) cfg = [NSDictionary dictionaryWithContentsOfFile:@(旧设置路径)];
     if (!cfg) return;
     {
         id raw = [cfg objectForKey:@"draw"];
@@ -512,6 +528,12 @@ static void 读调参() {
             if (v >= 20000.0f && v <= 400000.0f) cfg_mapSpan = v;
         } else if (!strncmp(k, "flip", 4)) {
             cfg_flip = (int)v;
+        } else if (!strncmp(k, "mapX", 4)) {
+            if (v >= 0.0f && v <= 2000.0f) { cfg_mapX = v; 调参定地图 = true; }
+        } else if (!strncmp(k, "mapY", 4)) {
+            if (v >= 0.0f && v <= 2000.0f) { cfg_mapY = v; 调参定地图 = true; }
+        } else if (!strncmp(k, "mapSize", 7)) {
+            if (v >= 20.0f && v <= 999.0f) { cfg_mapSize = v; 调参定地图 = true; }
         }
     }
     fclose(f);
@@ -523,7 +545,7 @@ static void 回写地图配置(float mapX, float mapY, float mapSize) {
     double now = CACurrentMediaTime();
     if (now - 上次 < 3.0) return;
     上次 = now;
-    NSString* path = @(设置路径);
+    NSString* path = @(设置路径取());
     NSMutableDictionary* dict = [[NSDictionary dictionaryWithContentsOfFile:path] mutableCopy];
     if (!dict) dict = [NSMutableDictionary dictionary];
     float 旧X = [dict objectForKey:@"mapX"] ? [[dict objectForKey:@"mapX"] floatValue] : -1e30f;
@@ -1111,7 +1133,7 @@ static bool 写视距(float fov) {
 
 // 回写视距址到 plist（自校准命中后）
 static void 回写视距址(uint64_t 地址, bool 是度) {
-    NSString* path = @(设置路径);
+    NSString* path = @(设置路径取());
     NSMutableDictionary* dict = [[NSDictionary dictionaryWithContentsOfFile:path] mutableCopy];
     if (!dict) dict = [NSMutableDictionary dictionary];
     dict[@"fov_addr"] = [NSString stringWithFormat:@"0x%llx", 地址];
@@ -1329,7 +1351,7 @@ static bool getbbz() {
     const char* 命中方式 = "sysctl精确";
     if (pid <= 1) { pid = sysctl模糊找pid(); 命中方式 = "sysctl模糊"; }
     if (pid <= 1) {
-        NSDictionary* cfg = [NSDictionary dictionaryWithContentsOfFile:@(设置路径)];
+        NSDictionary* cfg = [NSDictionary dictionaryWithContentsOfFile:@(设置路径取())];
         bool fullscan = cfg && [[cfg objectForKey:@"fullscan"] boolValue];
         if (fullscan) {
             日志("找进程③: 名字没命中 → 走内核 allproc 遍历（fullscan=1 已开，可能卡死）");
@@ -1378,7 +1400,7 @@ static bool getbbz() {
         日志("找进程: 按名字没找到（精确=%d 模糊=%d）→ 列一遍系统进程名", pid, -1);
         列进程表();
     }
-    NSDictionary* cfg = [NSDictionary dictionaryWithContentsOfFile:@(设置路径)];
+    NSDictionary* cfg = [NSDictionary dictionaryWithContentsOfFile:@(设置路径取())];
     bool fullscan = cfg && [[cfg objectForKey:@"fullscan"] boolValue];
     if (fullscan) {
         状态文字 = "全盘搜进程（手动开启）";
@@ -2360,7 +2382,8 @@ void Draw::StartBooks() {
         读配置();
     }
 
-    // 小地图自适配（没手调过才回写）
+    // 小地图自适配（没手调过、也没被 tune.txt 指定过才回写）
+    if (调参定地图) 地图已手调 = true;
     if (!地图已手调) {
         float 基准 = 短边 / 缩放;
         cfg_mapX = 基准 * 0.085810f;
