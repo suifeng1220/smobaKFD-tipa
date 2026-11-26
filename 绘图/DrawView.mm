@@ -892,19 +892,30 @@ static bool 读实测坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
 }
 
 // 读实体坐标：实体 +0x230 → 子对象 +0x128(x) / +0x130(z)，int32 毫米，可为负
-// 依据 fields_dump4.txt + 实测 VP 反证（槽8 → 屏幕正中，且与相机地面点 x 完全吻合）
+// 依据 fields_dump4.txt 原始行：槽0 @+0x230->0x2bfc26c08 +0x128 (-51875,0,-52055)
+// 之前 SDK::坐标节点 误写成 592(0x250)，读的是隔壁对象 → 十槽恒 0，已修正为 560(0x230)。
+// 这里再留 0x260 / 0x250 两个备用偏移，命中时打日志，避免又因为一个常量卡住整轮。
 static int 读实体坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
     if (!IsValidAddr(实体)) return -1;
-    uint64_t 位 = vm_read<uint64_t>(实体 + SDK::坐标节点);
-    if (!IsValidAddr(位)) return -1;
-    int x = vm_read<int>(位 + SDK::坐标节点X);
-    int z = vm_read<int>(位 + SDK::坐标节点Y);
-    if (x <= -300000 || x >= 300000) return -1;
-    if (z <= -300000 || z >= 300000) return -1;
-    if (x == 0 && z == 0) return -1;
-    *X = (unsigned)x;
-    *Z = (unsigned)z;
-    return 4;
+    static const uint64_t 候选[] = { SDK::坐标节点, 608 /* 0x260 */, 592 /* 0x250 */ };
+    for (int k = 0; k < 3; ++k) {
+        uint64_t 位 = vm_read<uint64_t>(实体 + 候选[k]);
+        if (!IsValidAddr(位)) continue;
+        int x = vm_read<int>(位 + SDK::坐标节点X);
+        int z = vm_read<int>(位 + SDK::坐标节点Y);
+        if (x <= -300000 || x >= 300000) continue;
+        if (z <= -300000 || z >= 300000) continue;
+        if (x == 0 && z == 0) continue;
+        static uint64_t 上次命中 = 0;
+        if (上次命中 != 候选[k]) {
+            上次命中 = 候选[k];
+            日志("坐标节点命中 实体+0x%llX", (unsigned long long)候选[k]);
+        }
+        *X = (unsigned)x;
+        *Z = (unsigned)z;
+        return 4;
+    }
+    return -1;
 }
 
 // ==================== 实体字段 ====================
