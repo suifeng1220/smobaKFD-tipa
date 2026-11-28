@@ -16,6 +16,9 @@
 #include <mach/mach.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
 #include "BBZGui.h"
 #include "游戏/SDK.h"
 
@@ -42,6 +45,8 @@ bool exploit_mach_kwritebuf(pid_t pid, uint64_t base, const void* input, size_t 
 int exploit_kreadbuf(uint64_t kaddr, void* output, size_t size);
 void exploit_v2p_cache_clear(void);
 uint64_t kfd_get_current_proc(void);   // kfd 抓到的本进程 proc（内核态），作 allproc 兜底起点
+// 越狱 jbserver 交棒：内核已被 Dopamine 利用，本进程只要一次 physrw，不再跑 exploit
+int jbclient_initialize_primitives(void);
 #ifdef __cplusplus
 }
 #endif
@@ -55,7 +60,7 @@ static uint64_t 模块基址 = 0;              // _ZL6___0
 static mach_port_t 任务端口 = 0;           // _ZL12_____2
 static pid_t 任务端口_pid = -1;            // 任务端口对应的 pid（pid 变了必须重新取）
 static bool 用备相机 = false;              // _ZL15______3
-static const char* 状态文字 = "等待内核";  // _ZL12____
+static const char* 状态文字 = "启动中";  // _ZL12____
 static std::atomic<int> 找进程调用{0};     // _ZL15______4
 static std::atomic<int> 找进程完成{0};     // _ZL15______5
 static int 读限流计数 = 0;                 // _ZL12_____1
@@ -244,10 +249,40 @@ bool writeMemory(uint64_t address, const void* data, size_t size) {
     return true;
 }
 
+// ==================== 内核原语：越狱优先，绝不重复初始化 ====================
+// 设备已被 Dopamine 接管（kfd + physrw 在内核里已生效），本进程只做“消费者”：
+//   · gPrimitives 已被填好 → 直接用，一行初始化都不跑
+//   · 否则向 jbserver 要一次 physrw 交棒（jbclient_initialize_primitives）
+//   · 都拿不到 → 纯任务端口模式，绘制照常（#177 已实测端口路径完全够用）
+// 来源：0=未接 1=越狱内核（交棒/已注入） 2=App 内 kfd exploit（仅保留兼容）
+static std::atomic<int> 内核来源{0};
+
+static inline bool 内核可读() {
+    return 内核来源.load(std::memory_order_acquire) != 0 && gPrimitives.kreadbuf != nullptr;
+}
+
+// 内核读统一入口：只在 gPrimitives 真有时才走，空指针一律返回 0（kfd 的 kread 空指针会崩）
+static inline uint32_t 核读32(uint64_t 地址) {
+    if (!内核可读()) return 0;
+    uint32_t v = 0;
+    return gPrimitives.kreadbuf(地址, &v, sizeof(v)) == 0 ? v : 0;
+}
+
+static inline uint64_t 核读64(uint64_t 地址) {
+    if (!内核可读()) return 0;
+    uint64_t v = 0;
+    return gPrimitives.kreadbuf(地址, &v, sizeof(v)) == 0 ? v : 0;
+}
+
+static inline bool 核读缓冲(uint64_t 地址, void* 输出, size_t 大小) {
+    if (!内核可读()) return false;
+    return gPrimitives.kreadbuf(地址, 输出, 大小) == 0;
+}
+
 // 内核指针（PAC 解签）
 #define BIT(b) (1ULL << (b))
 uint64_t kread_ptr(uint64_t va) {
-    uint64_t v = kread64(va);
+    uint64_t v = 核读64(va);
     if (v & BIT(55)) return v | kconstant(pointer_mask);
     return v & ~kconstant(pointer_mask);
 }
@@ -301,6 +336,107 @@ void 日志(const char* fmt, ...) {
     }
 }
 
+// ==================== 接越狱内核（只做一次，不跑 exploit） ====================
+// 关键：roothide 的 libjailbreak 在 /basebin，多两个符号 jbclient_jailbreakd_checkin/lookup，
+//   它不走 launchd 的 jbserver，而是直接向 jailbreakd 换 mach 端口。
+//   我们包里嵌的是官方 Dopamine 2.4.5 版（走 launchd），在 roothide 上必然连不上，
+//   所以优先「接管 /basebin 那份已就绪的原语表」，嵌入版只作最后兜底。
+static bool 原语就绪(const struct kernel_primitives& p) {
+    return p.kreadbuf != nullptr || (p.physreadbuf && p.phystokv);
+}
+
+// 拿 roothide / 其它越狱已注入的那份 libjailbreak 的原语表
+static bool 接注入原语(const char** 命中路径) {
+    // 遍历已加载镜像找 libjailbreak（比猜路径可靠：roothide 注入时的路径字符串可能带前缀）
+    const char* 已加载[4] = {nullptr};
+    int 已加载数 = 0;
+    uint32_t 镜像数 = _dyld_image_count();
+    for (uint32_t i = 0; i < 镜像数 && 已加载数 < 4; ++i) {
+        const char* 名 = _dyld_get_image_name(i);
+        if (!名 || !strstr(名, "libjailbreak")) continue;
+        if (strstr(名, "Books.app")) continue;          // 跳过本 App 自带的那份，先看越狱的
+        已加载[已加载数++] = 名;
+    }
+    static const char* 固定路径[] = {
+        "/basebin/libjailbreak.dylib",          // roothide 3.x
+        "/var/jb/basebin/libjailbreak.dylib",   // rootless 兼容
+        "/usr/lib/libjailbreak.dylib",
+    };
+    for (int 轮 = 0; 轮 < 已加载数 + 3; ++轮) {
+        const char* p = (轮 < 已加载数) ? 已加载[轮] : 固定路径[轮 - 已加载数];
+        void* h = dlopen(p, RTLD_NOW | RTLD_NOLOAD);   // 只要已经加载的，绝不重复加载
+        if (!h) continue;
+        struct kernel_primitives* rh = (struct kernel_primitives*)dlsym(h, "gPrimitives");
+        if (!rh) {
+            日志("注入原语: %s 在内存里，但没有 gPrimitives 符号", p);
+            continue;
+        }
+        日志("注入原语: %s handle=%p 表=%p kreadbuf=%p phys=%p vtophys=%p",
+             p, h, (void*)rh, (void*)rh->kreadbuf, (void*)rh->physreadbuf, (void*)rh->vtophys);
+        if (原语就绪(*rh)) {
+            gPrimitives = *rh;                 // 整表接管，后面所有读取直接用
+            if (命中路径) *命中路径 = p;
+            日志("注入原语: %s 已初始化，整表接管（无需任何初始化动作）", p);
+            return true;
+        }
+        // 已加载但还没初始化 → 调它自己的 initialize（roothide 版内部会 checkin jailbreakd）
+        typedef int (*初始化FN)(void);
+        初始化FN fn = (初始化FN)dlsym(h, "jbclient_initialize_primitives");
+        if (!fn) {
+            日志("注入原语: %s 未初始化，且没有 initialize 入口", p);
+            continue;
+        }
+        int r = fn();
+        日志("注入原语: 调 %s 的 initialize → r=%d 现 kreadbuf=%p phys=%p",
+             p, r, (void*)rh->kreadbuf, (void*)rh->physreadbuf);
+        if (原语就绪(*rh)) {
+            gPrimitives = *rh;
+            if (命中路径) *命中路径 = p;
+            return true;
+        }
+    }
+    return false;
+}
+
+// 返回 true 表示内核读已可用。全程不调用 exploit_init / kopen / PPL bypass。
+static bool 接越狱内核() {
+    if (内核来源.load(std::memory_order_acquire) != 0) return 内核可读();
+
+    // ① 本进程自己的 gPrimitives 已有值（越狱注入时就填好了）
+    if (原语就绪(gPrimitives)) {
+        内核来源.store(1, std::memory_order_release);
+        日志("内核原语：本进程表已就绪（kreadbuf=%p phys=%p），零初始化",
+             (void*)gPrimitives.kreadbuf, (void*)gPrimitives.physreadbuf);
+        return true;
+    }
+    // ② 接管 /basebin 那份（roothide 的正确路径）
+    const char* 来源 = nullptr;
+    if (接注入原语(&来源)) {
+        内核来源.store(1, std::memory_order_release);
+        日志("内核原语：已接管 %s（uid=%d）", 来源 ? 来源 : "?", getuid());
+        return true;
+    }
+    // ③ 嵌入的官方版：向 jbserver 要交棒（官方 Dopamine 才有效）
+    int r = jbclient_initialize_primitives();
+    if (r == 0 && 原语就绪(gPrimitives)) {
+        内核来源.store(1, std::memory_order_release);
+        日志("内核原语：嵌入版 jbserver 交棒成功（uid=%d）", getuid());
+        return true;
+    }
+    日志("内核原语：三条路都不通 r=%d uid=%d → 全走任务端口", r, getuid());
+    return false;
+}
+
+static void 打印内核来源() {
+    static int 已打 = -1;
+    int 现 = 内核来源.load(std::memory_order_acquire);
+    if (现 == 已打) return;
+    已打 = 现;
+    日志("内核来源=%s（kreadbuf=%p physreadbuf=%p）",
+         现 == 1 ? "越狱内核" : (现 == 2 ? "App内kfd" : "无·纯端口"),
+         (void*)gPrimitives.kreadbuf, (void*)gPrimitives.physreadbuf);
+}
+
 // ==================== 绘制原语 ====================
 
 static ImDrawList* 画布() { return BBZGUI::GetBackgroundDrawList(); }
@@ -312,12 +448,16 @@ static void 画框(ImU32 color, float x, float y, float w, float h, float thick)
 
 // 内核自检：kernel base 的 Mach-O magic 必须是 0xFEEDFACF，否则 kread 根本没通
 static void 内核自检() {
+    if (!内核可读()) {
+        日志("内核自检: 跳过（内核原语未接入，走任务端口）");
+        return;
+    }
     uint64_t 基 = gSystemInfo.kernelConstant.base;
     uint64_t 静态基 = gSystemInfo.kernelConstant.staticBase;
     uint64_t 偏移 = gSystemInfo.kernelConstant.slide;
     if (!IsKernelAddr(基)) 基 = 静态基 + 偏移;
     uint64_t allproc = gSystemInfo.kernelSymbol.allproc;
-    uint32_t magic = IsKernelAddr(基) ? kread32(基) : 0;
+    uint32_t magic = IsKernelAddr(基) ? 核读32(基) : 0;
     日志("内核自检: base=0x%llx staticBase=0x%llx slide=0x%llx allproc=0x%llx magic=0x%08x %s",
          基, 静态基, 偏移, allproc, magic,
          (magic == 0xFEEDFACF) ? "✅ kread 正常" : "❌ kread 异常/符号缺失");
@@ -329,7 +469,7 @@ static void 内核自检() {
          gSystemInfo.kernelStruct.proc.textvp,
          gSystemInfo.kernelStruct.proc.struct_size);
     uint64_t allproc符号 = gSystemInfo.kernelSymbol.allproc;
-    uint64_t allproc头 = IsKernelAddr(allproc符号) ? kread64(allproc符号) : 0;
+    uint64_t allproc头 = IsKernelAddr(allproc符号) ? 核读64(allproc符号) : 0;
     uint64_t 自身proc = kfd_get_current_proc();
     日志("内核链表: allproc=0x%llx lh_first=0x%llx current_proc=0x%llx",
          allproc符号, allproc头, 自身proc);
@@ -811,6 +951,7 @@ static pid_t sysctl模糊找pid() {
 // 注意：一律用 struct system_info 的具名字段，禁止再用 ((u64*)&gSystemInfo)[N] 下标——
 // 那套下标是按旧版 struct 布局算的，与当前 info.h 完全错位。
 static pid_t 内核找pid() {
+    if (!内核可读()) { 日志("内核遍历: 内核原语未接入，跳过"); return -1; }
     const uint32_t 下个 = gSystemInfo.kernelStruct.proc.list_next;
     const uint32_t 上个 = gSystemInfo.kernelStruct.proc.list_prev;
     const uint32_t pid偏移 = gSystemInfo.kernelStruct.proc.pid;
@@ -818,14 +959,14 @@ static pid_t 内核找pid() {
     char 名字[64];
 
     auto 试一个 = [&](uint64_t p) -> pid_t {
-        int pid = kread32(p + pid偏移);
+        int pid = 核读32(p + pid偏移);
         if (pid <= 1) return -1;
         uint64_t textvp = kread_ptr(p + textvp偏移);
         if (!IsKernelAddr(textvp)) return -1;
         uint64_t 名字指针 = kread_ptr(textvp + 184);
         if (!IsKernelAddr(名字指针)) return -1;
         memset(名字, 0, sizeof(名字));
-        if (!exploit_kreadbuf(名字指针, 名字, 63)) return -1;
+        if (!核读缓冲(名字指针, 名字, 63)) return -1;
         if (!名字像游戏(名字)) return -1;
         日志("内核(%s): 名字命中 pid=%d 名字=%s", "遍历", pid, 名字);
         return pid;
@@ -967,7 +1108,7 @@ static uint64_t 链表找pid(uint64_t 起点, int pid, const char* 来源) {
         日志("链表(%s): 起点无效 0x%llx", 来源, 起点);
         return 0;
     }
-    if ((int)kread32(起点 + pid偏移) == pid) {
+    if ((int)核读32(起点 + pid偏移) == pid) {
         日志("链表(%s): 起点即目标 pid=%d", 来源, pid);
         return 起点;
     }
@@ -975,7 +1116,7 @@ static uint64_t 链表找pid(uint64_t 起点, int pid, const char* 来源) {
     int 后 = 0;
     for (int i = 0; i < 2048 && IsKernelAddr(p); ++i) {
         后++;
-        if ((int)kread32(p + pid偏移) == pid) {
+        if ((int)核读32(p + pid偏移) == pid) {
             日志("链表(%s): 向后命中 pid=%d（走了 %d 个）", 来源, pid, 后);
             return p;
         }
@@ -985,7 +1126,7 @@ static uint64_t 链表找pid(uint64_t 起点, int pid, const char* 来源) {
     int 前 = 0;
     for (int i = 0; i < 2048 && IsKernelAddr(p); ++i) {
         前++;
-        if ((int)kread32(p + pid偏移) == pid) {
+        if ((int)核读32(p + pid偏移) == pid) {
             日志("链表(%s): 向前命中 pid=%d（走了 %d 个）", 来源, pid, 前);
             return p;
         }
@@ -1014,7 +1155,7 @@ static uint64_t 找proc(int pid) {
             if (命中) return 命中;
         } else {
             日志("内核: allproc 头为空 allproc=0x%llx [0]=0x%llx [8]=0x%llx",
-                 allproc, kread64(allproc), kread64(allproc + 8));
+                 allproc, 核读64(allproc), 核读64(allproc + 8));
         }
     } else {
         日志("内核: allproc 符号未解析 (0x%llx)", allproc);
@@ -1042,7 +1183,7 @@ static uint64_t 走内核(int pid, char* 主程序名, char* 主程序路径) {
     }
     if (!IsKernelAddr(task)) { 日志("内核: proc->task 无效 (proc=0x%llx)", proc); return 0; }
     for (uint64_t i = 0; i < 0x1000; i += 8) {
-        uint64_t 候选 = kread64(task + i);
+        uint64_t 候选 = 核读64(task + i);
         if (!IsValidAddr(候选)) continue;
         uint64_t 基址 = 枚举镜像(pid, 0, 候选, 主程序名, 主程序路径);
         if (基址) return 基址;
@@ -1710,16 +1851,18 @@ static uint64_t 全盘扫(uint64_t* 基址出, mach_port_t* 端口出, char* 名
 }
 
 static bool getbbz() {
-    DOJailbreaker* jb = DOJailbreaker.sharedInstance;
-    if (!jb.isSuccess) {
-        if (模块基址 || 游戏pid > 1) {
-            日志("内核已清除 → 作废 pid=%d 模块=0x%llx", 游戏pid, 模块基址);
-            模块基址 = 0;
-            游戏pid = -1;
-            释放任务端口();
+    // 内核只接一次：越狱已经拿下内核就直接用（不跑 exploit、不等待跳转），
+    // 接不上也不拦着 —— 直接转纯任务端口模式，照样找 pid、照样画。
+    {
+        static std::atomic<bool> 已接{false};
+        if (!已接.exchange(true)) {
+            bool 通 = 接越狱内核();
+            if (!通 && DOJailbreaker.sharedInstance.isSuccess) {
+                内核来源.store(2, std::memory_order_release);   // 兼容：App 内 exploit 曾跑成功
+            }
+            打印内核来源();
+            if (!通) 日志("没拿到内核原语 → 纯任务端口模式（不影响绘制）");
         }
-        状态文字 = "等待内核";
-        return false;
     }
     // 内核通路自检（最多 5 秒一次）：确认 kread 真能读到内核内存、allproc 符号已解析
     {
@@ -1937,10 +2080,10 @@ static void 状态浮层(unsigned 代码, const char* 文案) {
     if (代码 != 上次代码 || now - 上次 >= 5.0) {
         上次 = now;
         上次代码 = 代码;
-        bool 内核 = [[DOJailbreaker sharedInstance] isSuccess];
+        bool 内核 = 内核来源.load(std::memory_order_acquire) != 0;
         pid_t sysctl见 = sysctl精确找pid("smoba");
         snprintf(状态行, sizeof(状态行),
-                 "%d %s | 内核%d 模块%llx pid%d 见%d 任务%d 找%d/%d",
+                 "%d %s | 核%d 模块%llx pid%d 见%d 任务%d 找%d/%d",
                  代码, 文案, 内核 ? 1 : 0, 模块基址, 游戏pid,
                  sysctl见, 任务端口 != 0, 找进程调用.load(), 找进程完成.load());
         日志("状态[%d/%s] 内核=%d 模块=0x%llx pid=%d sysctl见smoba=%d 任务=%d 找进程=%d/%d 等=%s",
@@ -2825,11 +2968,7 @@ void Draw::StartBooks() {
         上次找进程推进 = now;
     }
 
-    if (![[DOJailbreaker sharedInstance] isSuccess]) {
-        状态浮层(1, "内核未就绪");
-        底部文字(屏, "等待内核");
-        return;
-    }
+    // 内核不再当门槛：越狱已就绪就直接用；拿不到就纯任务端口，照样画。
     if (!模块基址) {
         状态浮层(2, "没拿到模块基址");
         底部文字(屏, "等待进入对局");
