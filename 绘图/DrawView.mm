@@ -7,6 +7,7 @@
 
 #include "DrawView.hpp"
 #include <mutex>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -967,6 +968,135 @@ static bool 读实测坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
     return 读坐标值(实体 + 坐标偏移X, X, Z);
 }
 
+// ==================== 坐标解密器（照 TrollSpeed 样本第八章的形态实现）====================
+//
+// 样本里的东西拆开是这样（报告 8.1~8.5）：
+//   __ZGVZN14TersafeDecrypt5StateEvE1s = TersafeDecrypt::State() 内局部 static 变量 s 的
+//   守卫字节（__ZGV 前缀 + 函数内局部实体 Z + 名字 E + 变量名 1s），配合 __cxa_guard_acquire/
+//   release，就是标准的 C++ 函数内局部静态对象 —— Meyers 单例。
+//   作者为什么做成单例（8.4）：task_for_pid 端口很贵，必须常驻复用不能每帧重 attach；
+//   频繁 attach 容易被系统拒绝、也容易被反作弊看出调用模式；解密表/缓存/状态机要跨调用共享。
+//   硬证据（8.5）：pid 和 task port 是 std::atomic<int>（_TersafeMachPID 用 ldar 读
+//   @0x10041d9c0，_TersafeMachTask 用 ldar 读 @0x100418aa0；写入端 ldaxr/stlxr CAS，只在未绑定时写）。
+//   还有 TersafeRO()（8.7）：只读扫描和可写修改拆成两套缓存，先只读定位再决定改哪里。
+//
+// 本类就按这个骨架来：单例 + 原子 pid/端口 + 三态状态机 + 只读扫描/解密读取两段式。
+// 坐标链直接用报告附录 B 的表： 实体+0x90(坐标组件) → 组件+0x60(主) / 组件+0x78(镜像)，
+// 元素是 {x@0, y@4, z@8} 的 int32 三元组 —— 和我们实测的 +0x128/+0x130 是同一种布局。
+class 坐标解密器 {
+public:
+    // 对应样本 UI 上的 "初始化解密 / 正在解密中 / 已解密"（外加失败态）
+    enum 阶段值 : int { 未初始化 = 0, 初始化解密中 = 1, 已解密 = 2, 解密失败 = 3 };
+
+    // Meyers 单例：函数内局部静态对象，第一次调用 State() 才构造（编译器插守卫字节）
+    static 坐标解密器& State() {
+        static 坐标解密器 实例;
+        return 实例;
+    }
+
+    int 取阶段() const { return 状态.load(std::memory_order_acquire); }
+
+    const char* 阶段名() const {
+        switch (状态.load(std::memory_order_acquire)) {
+            case 初始化解密中: return "正在解密中";
+            case 已解密:       return "已解密";
+            case 解密失败:     return "解密失败";
+            default:           return "未初始化";
+        }
+    }
+
+    // 绑定目标进程：对应样本 0x100035e5c 那段 CAS —— 只在未绑定时写入，绑上就常驻
+    bool 绑定进程(pid_t pid) {
+        if (pid <= 1) return false;
+        int 已绑 = 目标pid.load(std::memory_order_acquire);
+        if (已绑 == pid && 目标端口.load(std::memory_order_acquire) > 0) return true;
+        if (已绑 != 0 && 已绑 != pid) {   // 换了进程，先解绑
+            目标端口.store(0, std::memory_order_release);
+            目标pid.store(0, std::memory_order_release);
+            状态.store(未初始化, std::memory_order_release);
+        }
+        int 期望 = 0;
+        if (!目标pid.compare_exchange_strong(期望, pid, std::memory_order_acq_rel)) {
+            // 别的线程先绑上了，用它绑的那个
+            return 目标pid.load(std::memory_order_acquire) == pid;
+        }
+        mach_port_t 端 = 取任务端口(pid);   // 同一份端口复用，不重复 task_for_pid
+        if (!端) { 目标pid.store(0, std::memory_order_release); return false; }
+        目标端口.store((int)端, std::memory_order_release);
+        return true;
+    }
+
+    // 只读扫描（样本的 TersafeRO）：确认坐标组件这一层在本版本还能用
+    // 有了结果就把偏移表缓存下来，后面每帧只做读取，不再重新找
+    void 只读扫描(uint64_t 数组, int 数量) {
+        if (状态.load(std::memory_order_acquire) == 已解密) return;
+        状态.store(初始化解密中, std::memory_order_release);
+        int 通过 = 0, 试过 = 0;
+        for (int i = 0; i < 数量 && i < 12; ++i) {
+            uint64_t e = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)i);
+            if (!IsValidAddr(e)) continue;
+            试过++;
+            uint64_t 组件 = vm_read<uint64_t>(e + 组件偏移.load(std::memory_order_acquire));
+            if (!IsValidAddr(组件)) continue;
+            int x = vm_read<int>(组件 + 主偏移.load(std::memory_order_acquire));
+            int z = vm_read<int>(组件 + 主偏移.load(std::memory_order_acquire) + 8);
+            if (坐标合理(x) && 坐标合理(z) && !(x == 0 && z == 0)) 通过++;
+        }
+        状态.store(通过 > 0 ? 已解密 : 解密失败, std::memory_order_release);
+        日志("坐标解密器：只读扫描 试过=%d 通过=%d → %s（组件=%u 主=%u 镜像=%u）",
+             试过, 通过, 阶段名(),
+             (unsigned)组件偏移.load(), (unsigned)主偏移.load(), (unsigned)镜像偏移.load());
+    }
+
+    // 解密读取（样本的每帧那段）：主/镜像两份都读，交叉校验，这是它"两套缓存"的用法
+    bool 读(uint64_t 实体, unsigned* 出X, unsigned* 出Z, uint64_t* 来源) {
+        if (状态.load(std::memory_order_acquire) != 已解密) return false;
+        uint64_t 组件 = vm_read<uint64_t>(实体 + 组件偏移.load(std::memory_order_acquire));
+        if (!IsValidAddr(组件)) { 未命中++; return false; }
+        const uint64_t 主 = 主偏移.load(std::memory_order_acquire);
+        const uint64_t 镜 = 镜像偏移.load(std::memory_order_acquire);
+        int px = vm_read<int>(组件 + 主);
+        int pz = vm_read<int>(组件 + 主 + 8);
+        int mx = vm_read<int>(组件 + 镜);
+        int mz = vm_read<int>(组件 + 镜 + 8);
+        bool 主可 = 坐标合理(px) && 坐标合理(pz) && !(px == 0 && pz == 0);
+        bool 镜可 = 坐标合理(mx) && 坐标合理(mz) && !(mx == 0 && mz == 0);
+        // 两份都有值时必须一致（5 米内），不一致说明这层解出来的不是坐标 —— 直接判失败，不硬画
+        if (主可 && 镜可) {
+            if (llabs((long long)px - mx) > 5000 || llabs((long long)pz - mz) > 5000) {
+                交叉失败++;
+                return false;
+            }
+            *出X = (unsigned)px; *出Z = (unsigned)pz;
+            *来源 = 组件偏移.load() ; 主命中++;
+            return true;
+        }
+        if (主可) { *出X = (unsigned)px; *出Z = (unsigned)pz; *来源 = 组件偏移.load(); 主命中++; return true; }
+        if (镜可) { *出X = (unsigned)mx; *出Z = (unsigned)mz; *来源 = 组件偏移.load() + 镜; 镜像命中++; return true; }
+        未命中++;
+        return false;
+    }
+
+    // 统计（跨调用共享的状态，写进 pos.log 表头用）
+    long 统计主() const { return 主命中.load(std::memory_order_relaxed); }
+    long 统计镜() const { return 镜像命中.load(std::memory_order_relaxed); }
+    long 统计交叉失败() const { return 交叉失败.load(std::memory_order_relaxed); }
+    long 统计未命中() const { return 未命中.load(std::memory_order_relaxed); }
+
+private:
+    坐标解密器() = default;
+    // 样本 8.5 的 _TersafeMachPID / _TersafeMachTask 对应物
+    std::atomic<int> 目标pid{0};
+    std::atomic<int> 目标端口{0};
+    std::atomic<int> 状态{未初始化};
+    // 解密表：扫描确认后常驻，跨调用共享
+    std::atomic<unsigned> 组件偏移{SDK::坐标组件};
+    std::atomic<unsigned> 主偏移{SDK::坐标主};
+    std::atomic<unsigned> 镜像偏移{SDK::坐标镜像};
+    // 缓存/统计
+    std::atomic<long> 主命中{0}, 镜像命中{0}, 交叉失败{0}, 未命中{0};
+};
+
 // 读实体坐标：实时位置在 实体+0x230 → 子对象 +0x128(x) / +0x130(z)，int32 毫米，可为负。
 // 两局对照定的：#177 本链路走位 15 秒坐标连续变化、测速 3.3~3.9 m/s；#180 直读 +0x278 对局 238 秒零变化。
 // +0x278 是静态锚点副本，静止时恰好等于当前位置，所以之前 10/10 对拍是被静止状态骗了。
@@ -975,11 +1105,18 @@ static uint64_t 坐标命中偏移 = 0;   // 0=未命中；否则记录实际生
 
 static int 读实体坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
     if (!IsValidAddr(实体)) return -1;
-    // 一级：实时链。0x230 是主偏移，另带 0x260 / 0x250 两个候选 ——
+    // 一级（主路）：坐标解密器 —— 也就是样本第八章那套"常驻单例 + 解密表 + 主/镜像交叉校验"。
+    //   实体+0x90 → 组件+0x60(主) / +0x78(镜像)。两份都读，不一致就判失败，不硬画。
+    {
+        uint64_t 来源 = 0;
+        if (坐标解密器::State().读(实体, X, Z, &来源)) {
+            坐标命中偏移 = 来源;
+            return 4;
+        }
+    }
+    // 二级：实测链。0x230 是主偏移，另带 0x260 / 0x250 两个候选 ——
     //   #177 版实测有效的正是这套"取第一个能读出合法坐标的候选"，当时 pos.log 坐标连续变化、测速 3.5m/s。
     //   候选顺序固定，命中哪个由 pos.log 表头 命中=0x… 记录，下一局一读就知道，不用再猜。
-    // 指针有效但坐标不合理时直接判无位置，不下沉到 +0x278 静态锚点，
-    //   否则会出现"一部分人正确、一部分人钉在泉水"，比全错更难查。
     static const uint64_t 候选[] = { SDK::坐标节点 /*0x230*/, 608 /*0x260*/, 592 /*0x250*/ };
     for (int i = 0; i < 3; ++i) {
         uint64_t 位 = vm_read<uint64_t>(实体 + 候选[i]);
@@ -993,36 +1130,7 @@ static int 读实体坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
             return 4;
         }
     }
-    // 三级：外部样本（TrollSpeed 分析报告 附录B）给出的坐标链
-    //   实体+0x90(坐标组件) → +0x60 主坐标 / +0x78 镜像坐标，两者都是 {x@0, y@4, z@8} 的 int32 三元组。
-    // 判据：主/镜像两份都非零时必须在 5 米内一致，否则判为错解引用（这是样本作者"读两份交叉校验"的做法）。
-    // 只在 0x230/0x260/0x250 全部失败时才走这里，不影响已经跑通的链路。
-    {
-        uint64_t 组件 = vm_read<uint64_t>(实体 + SDK::坐标组件);
-        if (IsValidAddr(组件)) {
-            int px = vm_read<int>(组件 + SDK::坐标主);
-            int pz = vm_read<int>(组件 + SDK::坐标主 + 8);
-            int mx = vm_read<int>(组件 + SDK::坐标镜像);
-            int mz = vm_read<int>(组件 + SDK::坐标镜像 + 8);
-            bool 主可用 = px > -300000 && px < 300000 && pz > -300000 && pz < 300000 && !(px == 0 && pz == 0);
-            bool 镜可用 = mx > -300000 && mx < 300000 && mz > -300000 && mz < 300000 && !(mx == 0 && mz == 0);
-            bool 一致 = (!主可用 || !镜可用) ? true
-                      : (llabs((long long)px - mx) < 5000 && llabs((long long)pz - mz) < 5000);
-            if (主可用 && 一致) {
-                坐标命中偏移 = SDK::坐标组件;
-                *X = (unsigned)px;
-                *Z = (unsigned)pz;
-                return 4;
-            }
-            if (镜可用 && 一致) {
-                坐标命中偏移 = SDK::坐标组件 + SDK::坐标镜像;
-                *X = (unsigned)mx;
-                *Z = (unsigned)mz;
-                return 4;
-            }
-        }
-    }
-    // 二级兜底：仅当上面三个候选指针全部无效时才用实体自身 +0x278 / +0x280（静态锚点）
+    // 三级兜底：实体自身 +0x278 / +0x280（静态锚点）。只在前两级全废时用，避免"一部分人钉泉水"。
     {
         int x = vm_read<int>(实体 + SDK::坐标直接X);
         int z = vm_read<int>(实体 + SDK::坐标直接Z);
@@ -2317,8 +2425,11 @@ static void 位置日志(uint64_t 数组, int 数量, const float* m, float 宽,
                 cfg_mapX * 缩放系数, cfg_mapY * 缩放系数, cfg_mapSize * 缩放系数,
                 cfg_mapX, cfg_mapY, cfg_mapSize);
     }
-    fprintf(f, "--- %.2f 命中=0x%llX 阵营=%u 翻转=%.0f 跨度=%.0f ---\n",
-            now, (unsigned long long)坐标命中偏移, 调试我方阵营, 小图翻转(), cfg_mapSpan);
+    fprintf(f, "--- %.2f 命中=0x%llX 阵营=%u 翻转=%.0f 跨度=%.0f 解密器=%s 主/镜/交叉失败/未命中=%ld/%ld/%ld/%ld ---\n",
+            now, (unsigned long long)坐标命中偏移, 调试我方阵营, 小图翻转(), cfg_mapSpan,
+            坐标解密器::State().阶段名(),
+            坐标解密器::State().统计主(), 坐标解密器::State().统计镜(),
+            坐标解密器::State().统计交叉失败(), 坐标解密器::State().统计未命中());
     for (int i = 0; i < 数量 && i < 16; ++i) {
         uint64_t e = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)i);
         unsigned X = 0, Z = 0;
@@ -2521,6 +2632,14 @@ void Draw::StartBooks() {
         return;
     }
 
+    // 坐标解密器：绑进程（原子 CAS，绑一次常驻）→ 拿到数组后做一次只读扫描，
+    // 之后每帧只走"解密读取"那一段。对应样本里 State() 单例 + TersafeRO() 的两段式。
+    {
+        坐标解密器& 解 = 坐标解密器::State();
+        解.绑定进程(游戏pid);
+        if (解.取阶段() == 坐标解密器::未初始化) 解.只读扫描(数组, 数量);
+    }
+
     // 取证 v3：坐标时序 + 活局整块对拍 → Documents/fields_dump3.txt
     // 每 0.5 秒一行/槽（ID/阵营/+0x278 坐标/血量），第 20/80/200 份快照整块导出。
     static bool 已提示取证 = false;
@@ -2529,7 +2648,8 @@ void Draw::StartBooks() {
         链路诊断(根世界, 容器, 数组, 数量);
         if (!已提示取证) {
             已提示取证 = true;
-            日志("坐标已切换到 实体+0x230→+0x128/+0x130，位置写入 Documents/pos.log");
+            日志("坐标链：解密器(%s) → 0x230 → 0x278 兜底，位置写入 Documents/pos.log",
+                 坐标解密器::State().阶段名());
         }
     }
 
