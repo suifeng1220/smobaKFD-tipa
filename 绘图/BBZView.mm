@@ -25,6 +25,8 @@ extern "C" {
 #endif
 void KernelLoggerSetHandler(void (^handler)(NSString *line));
 void KernelLogLine(const char *line);
+bool 游戏已连接(void);          // 模块基址 + pid + 任务端口 三件齐
+void 重连游戏进程(void);        // 清空端口与模块缓存，后台线程重扫（无内核动作）
 #ifdef __cplusplus
 }
 #endif
@@ -807,7 +809,7 @@ static float JVR_读取浮点(NSString* key, float 缺省) {
     
     self.label = [[UILabel alloc] init];
     self.label.translatesAutoresizingMaskIntoConstraints = NO;
-    self.label.text = @"初始化内核";
+    self.label.text = @"连接游戏进程";
     self.label.font = [UIFont systemFontOfSize:14.0f weight:UIFontWeightBold];
     self.label.textColor = JVR_主色;
     [self addSubview:self.label];
@@ -1513,7 +1515,7 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
         _dot.layer.cornerRadius = 3.0f;
         [self addSubview:_dot];
 
-        _statusLabel = SLK_标签(@"内核未加载", 11.0f, UIFontWeightMedium, SLK_次字);
+        _statusLabel = SLK_标签(@"等待连接", 11.0f, UIFontWeightMedium, SLK_次字);
         [self addSubview:_statusLabel];
 
         _subLabel = SLK_标签(SLK_偏移摘要(NO), 11.0f, UIFontWeightRegular, SLK_弱字);
@@ -1930,7 +1932,7 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
     title.textAlignment = NSTextAlignmentCenter;
     [box addSubview:title];
 
-    UILabel *desc = SLK_标签(@"内核已就绪，现在可以打开主开关", 11.5f, UIFontWeightRegular, SLK_次字);
+    UILabel *desc = SLK_标签(@"已连接游戏，现在可以打开主开关", 11.5f, UIFontWeightRegular, SLK_次字);
     desc.textAlignment = NSTextAlignmentCenter;
     desc.numberOfLines = 2;
     [box addSubview:desc];
@@ -2250,10 +2252,10 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
     [c1 setCustomSpacing:9.0f afterView:labWork];
 
     SLKListRow *rInit = [[SLKListRow alloc] initWithSymbol:@"bolt.fill" tint:SLK_绿
-                                                      title:@"初始化内核" sub:@"校验偏移表并写入内核镜像"
+                                                      title:@"重连游戏进程" sub:@"清空端口与模块缓存后重新握手"
                                                    trailing:@"" chevron:YES];
     SLKListRow *rClear = [[SLKListRow alloc] initWithSymbol:@"trash" tint:SLK_红
-                                                       title:@"清除内核残留" sub:@"移除偏好配置与临时镜像"
+                                                       title:@"重置连接缓存" sub:@"丢掉端口与模块缓存并重扫"
                                                     trailing:@"" chevron:YES];
     SLKListGroup *gWork = [[SLKListGroup alloc] initWithRows:@[rInit, rClear]];
     [c1 addArrangedSubview:gWork];
@@ -2411,7 +2413,7 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
     _initBtn = [[SLKBlockButton alloc] initWithFrame:CGRectZero];
     _initBtn.backgroundColor = SLK_绿;
     _initBtn.layer.cornerRadius = 14.0f;
-    [_initBtn setTitle:@"初始化内核" forState:UIControlStateNormal];
+    [_initBtn setTitle:@"重连游戏进程" forState:UIControlStateNormal];
     [_initBtn setTitleColor:[UIColor colorWithRed:4.0/255.0 green:21.0/255.0 blue:15.0/255.0 alpha:1.0]
                    forState:UIControlStateNormal];
     _initBtn.titleLabel.font = [UIFont systemFontOfSize:14.5f weight:UIFontWeightSemibold];
@@ -2424,7 +2426,7 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
     clearBtn.layer.cornerRadius = 14.0f;
     clearBtn.layer.borderWidth = 1.0f;
     clearBtn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.09f].CGColor;
-    [clearBtn setTitle:@"清除内核残留" forState:UIControlStateNormal];
+    [clearBtn setTitle:@"重置连接缓存" forState:UIControlStateNormal];
     [clearBtn setTitleColor:[UIColor colorWithRed:195.0/255.0 green:202.0/255.0 blue:216.0/255.0 alpha:1.0]
                    forState:UIControlStateNormal];
     clearBtn.titleLabel.font = [UIFont systemFontOfSize:14.5f weight:UIFontWeightMedium];
@@ -2436,9 +2438,8 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
     [c2 addArrangedSubview:labNote];
     [c2 setCustomSpacing:9.0f afterView:labNote];
 
-    NSString *noteText = [NSString stringWithFormat:
-        @"初始化会校验 %d 项偏移并写入内核镜像；清除残留会移除偏好配置、临时镜像与图标缓存，游戏内悬浮球会一并卸载。\n绘制、调节与自瞄参数请在悬浮球里调整。",
-        SDK::偏移项数];
+    NSString *noteText =
+        @"设备已由越狱持有内核，本 App 只做一件事：用 task_for_pid 拿游戏的任务端口读内存，不跑任何内核初始化。\n「重连游戏进程」会清空端口与模块缓存后重新握手；「重置连接缓存」等于同样的重置并卸载悬浮球。\n绘制、调节与自瞄参数请在悬浮球里调整。";
     UILabel *note = SLK_标签(noteText,
                              11.5f, UIFontWeightRegular, SLK_弱字);
     note.numberOfLines = 0;
@@ -2466,21 +2467,21 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
         } completion:^(BOOL finished) {
             refresh.imageView.transform = CGAffineTransformIdentity;
         }];
-        BOOL ok = ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess;
-        [s->_heroCard setStatusText:(ok ? @"内核已就绪" : @"内核未加载")
+        BOOL ok = 游戏已连接();
+        [s->_heroCard setStatusText:(ok ? @"已连接游戏" : @"未连接")
                                 sub:SLK_偏移摘要(ok)
                                live:ok];
-        [s->_terminal appendLog:(ok ? @"状态刷新: 内核已就绪" : @"状态刷新: 内核未就绪")];
+        [s->_terminal appendLog:(ok ? @"状态刷新: 任务端口已连接" : @"状态刷新: 等待连接游戏进程")];
     };
 
     // ---- 主开关 ----
-    BOOL kernelOkAtBoot = ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess;
-    _isRemoteHUDActive = kernelOkAtBoot ? [self isHUDEnabled] : NO;
-    _heroCard.ready = kernelOkAtBoot;
+    BOOL 已连接 = 游戏已连接();
+    _isRemoteHUDActive = 已连接 ? [self isHUDEnabled] : NO;
+    _heroCard.ready = 已连接;
     [_heroCard setOn:_isRemoteHUDActive animated:NO];
-    [_heroCard setStatusText:(kernelOkAtBoot ? (_isRemoteHUDActive ? @"内核运行中" : @"内核已就绪") : @"内核未加载")
+    [_heroCard setStatusText:(已连接 ? (_isRemoteHUDActive ? @"绘制运行中" : @"已连接游戏") : @"等待连接")
                          sub:SLK_偏移摘要(_isRemoteHUDActive)
-                        live:(kernelOkAtBoot && _isRemoteHUDActive)];
+                        live:(已连接 && _isRemoteHUDActive)];
     [_ballCell setValueText:(_isRemoteHUDActive ? @"已挂载" : @"未挂载")];
 
     _heroCard.onDenied = ^{
@@ -2488,14 +2489,14 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
         if (!s) return;
         [s->_heroCard setOn:NO animated:YES];
         [s 提示内核未就绪];
-        [s->_terminal appendLog:@"主开关被拦截 · 内核未初始化"];
+        [s->_terminal appendLog:@"主开关被拦截 · 还没连上游戏进程"];
     };
 
     _heroCard.onToggle = ^(BOOL wantOn) {
         __strong typeof(weakSelf) s = weakSelf;
         if (!s) return;
 
-        if (wantOn && !((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess) {
+        if (wantOn && !游戏已连接()) {
             [s 提示内核未就绪];
             [s->_heroCard setOn:NO animated:YES];
             s->_isRemoteHUDActive = NO;
@@ -2505,73 +2506,55 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
         s->_isRemoteHUDActive = wantOn;
         [s setHUDEnabled:wantOn];
         [s->_heroCard setOn:wantOn animated:YES];
-        [s->_heroCard setStatusText:(wantOn ? @"内核运行中" : @"内核已停止")
+        [s->_heroCard setStatusText:(wantOn ? @"绘制运行中" : @"绘制已停止")
                                 sub:(wantOn ? SLK_偏移摘要(YES) : @"· 绘制进程已挂起")
                                live:wantOn];
         [s->_ballCell setValueText:(wantOn ? @"已挂载" : @"未挂载")];
         [s->_terminal appendLog:(wantOn ? @"主开关已开启 · 悬浮球已挂载" : @"主开关已关闭 · 绘制已停止")];
     };
 
-    // ---- 初始化内核 ----
+    // ---- 重连游戏进程（内核由越狱持有，这里不做任何内核动作） ----
     _initBtn.onTap = ^{
         __strong typeof(weakSelf) s = weakSelf;
         if (!s) return;
-
-        if (((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess) {
-            [s->_terminal appendLog:@"内核已就绪，无需重复初始化"];
-            [s slk_showToast:@"内核已就绪"];
-            return;
-        }
         if (s->_initBtn.enabled == NO) return;
 
         s->_initBtn.enabled = NO;
         s->_initBtn.alpha = 0.65f;
-        [s->_initBtn setTitle:@"初始化中…" forState:UIControlStateNormal];
-        [s->_terminal appendLog:[NSString stringWithFormat:@"开始初始化 · 校验 %d 项偏移", SDK::偏移项数]];
+        [s->_initBtn setTitle:@"重连中…" forState:UIControlStateNormal];
+        [s->_terminal appendLog:@"重连 · 清空任务端口与模块缓存（不跑 exploit、不接内核原语）"];
 
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            // 越狱已经把内核拿下了：先接管它的原语，拿不到才跑本地 exploit
-            if (kfd_jailbreak_primitives_ready()) {
-                ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess = YES;
-            } else {
-                [DOJailbreaker.sharedInstance run];
-            }
-            BOOL ok = ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                __strong typeof(weakSelf) strong = weakSelf;
-                if (!strong) return;
-                strong->_initBtn.enabled = YES;
-                strong->_initBtn.alpha = 1.0f;
-                [strong->_initBtn setTitle:@"初始化内核" forState:UIControlStateNormal];
-                strong->_heroCard.ready = ok;
-                [strong->_heroCard setStatusText:(ok ? @"内核已就绪" : @"内核未加载")
-                                             sub:SLK_偏移摘要(ok)
-                                            live:ok];
-                [strong->_terminal appendLog:(ok ? @"内核初始化成功 · 已就绪" : @"内核初始化失败")];
-                if (ok) {
-                    [SLKDoneAlert showIn:strong.view];
-                    UINotificationFeedbackGenerator *g = [[UINotificationFeedbackGenerator alloc] init];
-                    [g notificationOccurred:UINotificationFeedbackTypeSuccess];
-                } else {
-                    [strong slk_showToast:@"初始化失败，请重试"];
-                }
-            });
+        重连游戏进程();
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strong = weakSelf;
+            if (!strong) return;
+            BOOL ok = 游戏已连接();
+            strong->_initBtn.enabled = YES;
+            strong->_initBtn.alpha = 1.0f;
+            [strong->_initBtn setTitle:@"重连游戏进程" forState:UIControlStateNormal];
+            strong->_heroCard.ready = ok;
+            [strong->_heroCard setStatusText:(ok ? @"已连接游戏" : @"等待连接")
+                                         sub:SLK_偏移摘要(ok)
+                                        live:ok];
+            [strong->_terminal appendLog:(ok ? @"已连接 · task_for_pid 成功，任务端口就绪"
+                                             : @"还没连上 · 确认游戏已在运行，再点一次重连")];
+            [strong slk_showToast:(ok ? @"已连接游戏" : @"尚未连接")];
         });
     };
 
-    // ---- 清除内核残留 ----
+    // ---- 重置连接缓存 ----
     clearBtn.onTap = ^{
         __strong typeof(weakSelf) s = weakSelf;
         if (!s) return;
-        BOOL wasOk = ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess;
-        [DOJailbreaker.sharedInstance clearKernel];
+        重连游戏进程();
         s->_isRemoteHUDActive = NO;
         s->_heroCard.ready = NO;
         [s->_heroCard setOn:NO animated:YES];
-        [s->_heroCard setStatusText:@"内核未加载" sub:SLK_偏移摘要(NO) live:NO];
+        [s->_heroCard setStatusText:@"等待连接" sub:SLK_偏移摘要(NO) live:NO];
         [s->_ballCell setValueText:@"未挂载"];
-        [s->_terminal appendLog:(wasOk ? @"内核已清除 · 可重新初始化" : @"内核本未就绪 · 缓存已重置")];
-        [s slk_showToast:@"内核残留已清除"];
+        [s->_terminal appendLog:@"连接缓存已重置 · 3 秒内后台重扫"];
+        [s slk_showToast:@"连接缓存已重置"];
     };
 
     rInit.onTap = ^{
@@ -2592,7 +2575,7 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
         [self->_terminal appendLog:[NSString stringWithFormat:@"设备 %@ · iOS %@ · %@", SLK_机型名称(), SLK_系统版本(), SLK_CPU架构()]];
         [self->_terminal appendLog:[NSString stringWithFormat:@"运行环境 %@", SLK_运行环境()]];
         [self->_terminal appendLog:[NSString stringWithFormat:@"偏移表已载入 · %d 项待校验", SDK::偏移项数]];
-        [self->_terminal appendLog:(kernelOkAtBoot ? @"内核状态: 已就绪" : @"等待初始化…")];
+        [self->_terminal appendLog:(游戏已连接() ? @"连接状态: 任务端口已就绪" : @"连接状态: 等待连接游戏进程…")];
     });
 }
 
@@ -2750,10 +2733,10 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
     _isRemoteHUDActive = [self isHUDEnabled];
 }
 
-// 内核未就绪时点主开关的提示（还原自 S45 二进制 -[BBZView 提示内核未就绪] @ 0x100078628）
+// 还没连上游戏时点主开关的提示
 - (void)提示内核未就绪 {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"请先初始化内核"
-        message:@"主开关要靠内核读写才有画面：内核没就绪时把它打开，屏幕上什么都不会画。\n请先点上面的「初始化内核」，看到「内核初始化成功」再开主开关。"
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"还没连上游戏进程"
+        message:@"绘制要靠 task_for_pid 拿到的任务端口读游戏内存。现在端口还没建立，打开主开关屏幕上什么都不会画。\n请先确认游戏已在运行，再点上面的「重连游戏进程」。"
         preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
 
