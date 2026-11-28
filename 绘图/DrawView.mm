@@ -103,8 +103,16 @@ static float cfg_mapSize = 123.0f;         // 0x100223570
 static float cfg_skillX = 11.0f;           // 0x100223574
 static float cfg_skillY = 27.0f;           // 0x100223578
 static int cfg_team = 0;                   // 0x10022357C
-static int cfg_scan_max = 96;              // 每帧最多扫的实体槽（联机实体多，原来写死 24 会把英雄漏掉）
+static int cfg_scan_max = 128;             // 每帧最多扫的实体槽（下限强制 128，不依赖容器里的数量字段）
 static int cfg_id_pick = 1;                // 只画“像英雄”的实体（英雄ID 1..999 且 ID 不重复）
+// 从 TrollSpeed 抄来的三个硬阈值（它的 GetPlayers 里就是这三条）：
+//   coord_max   坐标绝对值上限 80000 mm = 80 米，超了直接丢（它连 1000000 都当哨兵值）。
+//   camp_strict 阵营只认 1 / 2，其它一律当垃圾实体 —— 我们以前允许 -1..7，
+//               等于把"阵营读成 0 或 3"的野怪/召唤物/影子体也画成敌人。
+//   dedup_mm    同英雄ID + 相距小于这个毫米数才算重复（原来 8000 = 8 米，把两个真英雄也合掉了）。
+static int cfg_coord_max  = 80000;
+static int cfg_camp_strict = 1;
+static int cfg_dedup_mm    = 1500;
 static bool 地图已手调 = false;            // 0x100223580（plist 里有 mapX/mapY/mapSize 就不自动回写）
 static bool cfg_fov_probe = false;         // 0x100223590
 static bool cfg_status = false;            // 左下角状态浮层开关（默认关，不自动弹出）
@@ -115,6 +123,12 @@ static bool cfg_status = false;            // 左下角状态浮层开关（默�
 static float cfg_mapSpan = 120000.0f;   // 世界直径(毫米)；峡谷约 120m，泉水 ±55m 落在角落
 static bool  调参定地图 = false;   // tune.txt 里给了 mapX/mapY/mapSize → 关掉自适配，别覆盖手工值
 static int   cfg_flip = 0;                 // 0=按我方阵营自动；1=强制不翻转；-1=强制翻转
+// 翻转只在「第一次拿到我方阵营样本」时标定一次，之后锁死。
+// 以前的写法每帧按我方 X 均值重算 —— 队伍推过中线，符号一变，整张小地图瞬间镜像，
+// 表现就是"打着打着所有人跳到对面半图"。样本（TrollSpeed）的翻转取自 ViewMatrix 符号，
+// 一局之内恒定，本质等价于"按我方阵营定一次"，所以这里改成一次标定 + 锁。
+static bool 小图翻转已锁 = false;
+static unsigned 小图翻转锁定阵营 = 0;
 
 // ★ 配置落盘路径修正：原来写 /var/mobile/Library/Preferences/com.map.settings.plist，
 //   但本程序是注入到游戏进程里的 dylib，受游戏沙盒限制，那个目录根本写不进去
@@ -640,10 +654,17 @@ static void 读配置() {
     cfg_skillX    = 读浮点(cfg, @"skillX", 11.0f);
     cfg_skillY    = 读浮点(cfg, @"skillY", 27.0f);
     cfg_team      = (int)读浮点(cfg, @"team", 0.0f);
-    cfg_scan_max  = (int)读浮点(cfg, @"scan_max", 96.0f);
+    cfg_scan_max  = (int)读浮点(cfg, @"scan_max", 128.0f);
     cfg_id_pick   = (int)读浮点(cfg, @"id_pick", 1.0f);
-    if (cfg_scan_max < 12) cfg_scan_max = 12;
+    cfg_coord_max = (int)读浮点(cfg, @"coord_max", 80000.0f);
+    cfg_camp_strict = (int)读浮点(cfg, @"camp_strict", 1.0f);
+    cfg_dedup_mm  = (int)读浮点(cfg, @"dedup_mm", 1500.0f);
+    if (cfg_scan_max < 128) cfg_scan_max = 128;     // 下限抬到 128：不依赖数量字段，跟样本一致
     if (cfg_scan_max > 512) cfg_scan_max = 512;
+    if (cfg_coord_max < 20000) cfg_coord_max = 20000;
+    if (cfg_coord_max > 300000) cfg_coord_max = 300000;
+    if (cfg_dedup_mm < 200) cfg_dedup_mm = 200;
+    if (cfg_dedup_mm > 20000) cfg_dedup_mm = 20000;
 
     // 用户手动调过地图位置 → 停止小地图自适配回写
     地图已手调 = [cfg objectForKey:@"mapX"] != nil
@@ -701,6 +722,15 @@ static void 读调参() {
             if (v >= 0.0f && v <= 2000.0f) { cfg_mapY = v; 调参定地图 = true; }
         } else if (!strncmp(k, "mapSize", 7)) {
             if (v >= 20.0f && v <= 999.0f) { cfg_mapSize = v; 调参定地图 = true; }
+        } else if (!strncmp(k, "coord_max", 9)) {
+            if (v >= 20000.0f && v <= 300000.0f) cfg_coord_max = (int)v;
+        } else if (!strncmp(k, "camp_strict", 11)) {
+            cfg_camp_strict = (v > 0.5f) ? 1 : 0;
+        } else if (!strncmp(k, "dedup", 5)) {
+            if (v >= 200.0f && v <= 20000.0f) cfg_dedup_mm = (int)v;
+        } else if (!strncmp(k, "reaminimap", 10)) {
+            // 手动要求重标定小地图翻转（改了 camp 判断或换了模式后用）
+            小图翻转已锁 = false;
         }
     }
     fclose(f);
@@ -1228,10 +1258,12 @@ static bool 基址是MachO(int pid, uint64_t 基址) {
 
 // ==================== 坐标读取（单一来源：实测直读） ====================
 
-// 世界坐标合理区间：地图半幅约 109000（小图换算 /109000），留 40% 余量。
-// 原来放到 ±200000/400000 太松，联机时错位解引用的垃圾值也能通过 → 坐标在真/假之间闪。
+// 世界坐标合理区间：照样本取 ±80000 mm（80 米）。
+// TrollSpeed 的 GetPlayers 就是 `abs(x) > 80000 丢弃` —— 它那条链同样读 int32 毫米。
+// 我们原来放到 ±150000，联机时错位解引用出来的垃圾值也能通过 → 坐标在真/假之间闪，
+// 表现就是"目标位置乱跳"。要放宽就改 Documents/tune.txt 的 coord_max=（毫米）。
 static inline bool 坐标合理(int v) {
-    return v != 1000000 && v > -150000 && v < 150000;
+    return v != 1000000 && v > -cfg_coord_max && v < cfg_coord_max;
 }
 
 
@@ -1482,7 +1514,7 @@ static int 读实体坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
             if (!IsValidAddr(位)) continue;
             int x = vm_read<int>(位 + 偏移表.节点X);
             int z = vm_read<int>(位 + 偏移表.节点Y);
-            if (x > -300000 && x < 300000 && z > -300000 && z < 300000 && !(x == 0 && z == 0)) {
+            if (坐标合理(x) && 坐标合理(z) && !(x == 0 && z == 0)) {
                 ux = (unsigned)x; uz = (unsigned)z; 主源 = 候选[i]; 有主 = true;
                 break;
             }
@@ -1519,7 +1551,7 @@ static int 读实体坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
     {
         int x = vm_read<int>(实体 + 偏移表.直接X);
         int z = vm_read<int>(实体 + 偏移表.直接Z);
-        if (x > -300000 && x < 300000 && z > -300000 && z < 300000 && !(x == 0 && z == 0)) {
+        if (坐标合理(x) && 坐标合理(z) && !(x == 0 && z == 0)) {
             坐标命中偏移 = 偏移表.直接X;
             *X = (unsigned)x;
             *Z = (unsigned)z;
@@ -2018,11 +2050,12 @@ static int 读野怪(uint64_t 模块, 野怪信息* 输出, int 上限) {
     return 数;
 }
 
-// 小地图翻转：全局唯一值，按【我方阵营英雄的世界 X 均值符号】每帧推一次。
-// ★ 这是"英雄全挤在敌方泉水附近乱跳"的根因修正：
-//   原代码按【每个目标自己的阵营】取反，我方 -1、敌方 +1，两拨人各自镜像后
-//   全部落到同一侧，于是十个人全叠在一起、还随摄像头抖动。
-//   现在只按观察者一侧统一翻转，保证我方基地永远在左下。
+// 小地图翻转：全局唯一值。
+// ★ 第一次拿到我方阵营样本时标定一次，然后锁死整局。
+//   旧写法每帧按我方 X 均值重算：队伍推过中线 → 均值符号翻 → 整张小地图瞬间镜像，
+//   表现就是"打着打着所有人跳到对面半图、小地图和目标对不上"。
+//   样本（TrollSpeed 的 ToMiniMap）翻转取自 ViewMatrix 符号，一局内恒定，
+//   本质就是"按我方阵营定一次 A 或 -A"，这里用第一次采样标定，效果一致且不抖。
 static float 小图翻转值 = 1.0f;
 static unsigned 调试我方阵营 = 0;      // 只用于 pos.log 表头，方便标定
 
@@ -2032,22 +2065,37 @@ static float 小图翻转() {
     return 小图翻转值;
 }
 
-// 每帧调用一次：用我方阵营英雄的平均 X 判断我方基地在哪一侧，推出统一翻转
-static void 推小图翻转(uint64_t 数组, int 数量, unsigned 我方阵营) {
+// 每帧调用一次，但只在未锁定（或换边/手动重标定）时真正计算。
+// 判据仍然是我方阵营英雄的平均 X：我方泉水在 X 正侧就整体翻 -1，让自家基地落到左下。
+static void 推小图翻转(uint64_t 数组, int 扫描上限, unsigned 我方阵营) {
     if (cfg_flip != 0) return;
+    if (小图翻转已锁) {
+        if (小图翻转锁定阵营 == 我方阵营) return;   // 锁定的阵营没变 → 一直用这个值
+        日志("小地图翻转重标定：我方阵营 %u → %u", 小图翻转锁定阵营, 我方阵营);
+        小图翻转已锁 = false;
+    }
+    if (!IsValidAddr(数组)) return;
     long long 和 = 0;
     int 数 = 0;
-    for (int k = 0; k < 数量 && k < cfg_scan_max; ++k) {
+    for (int k = 0; k < 扫描上限; ++k) {
         uint64_t e = vm_read<uint64_t>(数组 + 偏移表.槽距 * k);
         if (!IsValidAddr(e)) continue;
-        unsigned X = 0, Z = 0;
-        if (读实体坐标(e, &X, &Z) < 0) continue;
-        if (vm_read<int>(e + 偏移表.阵营) != (int)我方阵营) continue;
-        和 += (int)X;
+        int c = vm_read<int>(e + 52);
+        if (c != 1 && c != 2) c = 读阵营(e);        // 与主循环同序：+0x34 先，不行再看 +0xC0
+        if (c != (int)我方阵营) continue;
+        uint64_t 位 = vm_read<uint64_t>(e + 偏移表.节点);
+        if (!IsValidAddr(位)) continue;
+        int x = vm_read<int>(位 + 偏移表.节点X);
+        if (x <= -cfg_coord_max || x >= cfg_coord_max || x == 1000000) continue;
+        和 += x;
         数++;
     }
-    if (数 == 0) return;                       // 本帧没有样本，沿用上帧
+    if (数 == 0) return;                       // 本帧没有我方样本，下帧再试
     小图翻转值 = (和 / 数 > 0) ? -1.0f : 1.0f;
+    小图翻转锁定阵营 = 我方阵营;
+    小图翻转已锁 = true;
+    日志("小地图翻转标定：我方阵营=%u 我方X均值=%lld（%d 个样本）→ 翻转=%.0f（整局锁定）",
+         我方阵营, 和 / 数, 数, 小图翻转值);
 }
 
 static void 小图坐标(int x, int z, const ImVec4& 地图, float* 出X, float* 出Y) {
@@ -2075,7 +2123,15 @@ static void 对局状态(bool 进了对局, bool 掉出, double now) {
         状态行[0] = 0;
     } else if (掉出) {
         if (掉出对局时刻 <= 0.0) 掉出对局时刻 = now;
-        if (now - 掉出对局时刻 > 20.0) 在对局 = false;
+        if (now - 掉出对局时刻 > 20.0 && 在对局) {
+            在对局 = false;
+            // 一局结束：小地图翻转要重新标定（下一局我方可能在另一侧），阵营也重新猜。
+            // 不重置的话，下一局如果换了边，地图会一直按上一局的翻转镜像。
+            小图翻转已锁 = false;
+            小图翻转锁定阵营 = 0;
+            阵营锁定 = 0;
+            日志("对局结束→小地图翻转与阵营锁定复位，下一局重新标定");
+        }
     } else {
         掉出对局时刻 = 0;
     }
@@ -2813,8 +2869,9 @@ static void 位置日志(uint64_t 数组, int 数量, const float* m, float 宽,
                 cfg_mapX * 缩放系数, cfg_mapY * 缩放系数, cfg_mapSize * 缩放系数,
                 cfg_mapX, cfg_mapY, cfg_mapSize);
     }
-    fprintf(f, "--- %.2f 命中=0x%llX 阵营=%u 翻转=%.0f 跨度=%.0f 解密器=%s 主/镜/交叉失败/未命中=%ld/%ld/%ld/%ld ---\n",
-            now, (unsigned long long)坐标命中偏移, 调试我方阵营, 小图翻转(), cfg_mapSpan,
+    fprintf(f, "--- %.2f 命中=0x%llX 阵营=%u 翻转=%.0f(%s) 跨度=%.0f 边界=±%d 解密器=%s 主/镜/交叉失败/未命中=%ld/%ld/%ld/%ld ---\n",
+            now, (unsigned long long)坐标命中偏移, 调试我方阵营, 小图翻转(),
+            小图翻转已锁 ? "整局锁定" : "未标定", cfg_mapSpan, cfg_coord_max,
             坐标解密器::State().阶段名(),
             坐标解密器::State().统计主(), 坐标解密器::State().统计镜(),
             坐标解密器::State().统计交叉失败(), 坐标解密器::State().统计未命中());
@@ -3012,8 +3069,9 @@ void Draw::StartBooks() {
         视距探测扫(矩阵);
     }
 
-    bool 数组有效 = IsValidAddr(根世界) && IsValidAddr(容器) && IsValidAddr(数组)
-                 && 数量 > 0 && 数量 <= 512;
+    // 数组有效性只看指针。数量字段不再作为门槛 —— 样本（TrollSpeed GetPlayers）
+    // 是固定遍历 128 个槽、完全不读数量字段，数量读成 0 或垃圾也照画。
+    bool 数组有效 = IsValidAddr(根世界) && IsValidAddr(容器) && IsValidAddr(数组);
 
     if (!数组有效) {
         对局状态(false, true, now);
@@ -3021,6 +3079,12 @@ void Draw::StartBooks() {
         if (!在对局) 底部文字(屏, "等待进入对局");
         return;
     }
+
+    // 扫描槽数：下限写死 128（不依赖数量字段）；数量更多（联机小兵/召唤物/野怪）就按数量走，
+    // 上限由 cfg_scan_max 兜住（默认 128，可在 settings.plist / tune.txt 抬到 512）。
+    int 扫描数 = 128;
+    if (数量 > cfg_scan_max) 扫描数 = cfg_scan_max;
+    else if (数量 > 128)     扫描数 = 数量;
 
     // 坐标解密器：绑进程（原子 CAS，绑一次常驻）→ 拿到数组后做一次只读扫描，
     // 之后每帧只走"解密读取"那一段。对应样本里 State() 单例 + TersafeRO() 的两段式。
@@ -3033,9 +3097,10 @@ void Draw::StartBooks() {
     // 取证 v3：坐标时序 + 活局整块对拍 → Documents/fields_dump3.txt
     // 每 0.5 秒一行/槽（ID/阵营/+0x278 坐标/血量），第 20/80/200 份快照整块导出。
     static bool 已提示取证 = false;
-    if (数量 >= 2) {
-        位置日志(数组, 数量, 矩阵, 屏.x, 屏.y);
-        链路诊断(根世界, 容器, 数组, 数量);
+    // 不再用 数量>=2 当门槛：数量字段读成 0 时 pos.log 会整个不生成，等于自断诊断。
+    if (数组有效) {
+        位置日志(数组, 扫描数, 矩阵, 屏.x, 屏.y);
+        链路诊断(根世界, 容器, 数组, 扫描数);
         if (!已提示取证) {
             已提示取证 = true;
             日志("坐标链：解密器(%s) → 0x230 → 0x278 兜底，位置写入 Documents/pos.log",
@@ -3071,7 +3136,7 @@ void Draw::StartBooks() {
     // 运行时调参（Documents/tune.txt，2 秒重读一次）与小地图翻转
     读调参();
     读偏移表();          // Documents/offsets.json，2 秒看一次 mtime，改完存盘即生效
-    推小图翻转(数组, 数量, 我方阵营);
+    推小图翻转(数组, 扫描数, 我方阵营);
     调试我方阵营 = 我方阵营;
 
     if (!cfg_draw) return;
@@ -3089,7 +3154,10 @@ void Draw::StartBooks() {
     bool 有首个 = false;
     int 首个阵营 = 0, 首个血当前 = 0, 首个血上限 = 0, 首个链 = -1;
     long long 首个英雄ID = 0;
-    int 图标序号 = 0;
+    // 技能列收集表：循环里只收集，循环外按稳定键排序后落位（否则联机槽位一变整列乱跳）
+    struct 技能列项 { long long 英雄ID; uint64_t 技能对象; uint64_t 实体; };
+    技能列项 技能列[20];
+    int 技能列数 = 0;
     // 小地图标定样本：前 3 个有坐标的敌人，原始坐标 + 换算后的小图坐标
     int 小图样数 = 0;
     int 小图样阵营[3] = {0, 0, 0};
@@ -3114,15 +3182,34 @@ void Draw::StartBooks() {
     int 诊断X[12] = {0}, 诊断Z[12] = {0};
     int 诊断屏[12] = {0};
 
-    for (int k = 0; k < 数量 && k < cfg_scan_max; ++k) {
+    // 阵营严格模式（照样本）：只认 1 / 2。
+    // 联机数组里混着野怪/召唤物/影子体，阵营常见 0 / 3 / -1；以前允许 -1..7，
+    // 等于把这些垃圾实体一起画成敌人 —— 目标忽有忽无、位置乱跳的主因之一。
+    // 自愈：严格模式连续 90 帧一个都过不了（个别玩法可能不用 1/2），自动放宽并记一次日志，
+    // 免得换模式直接白板。放宽只作用于本次进程，不改 plist。
+    static int 严格空帧 = 0;
+    static bool 阵营已放宽 = false;
+    static bool 已报放宽 = false;
+    if (!cfg_camp_strict) { 严格空帧 = 0; 阵营已放宽 = false; 已报放宽 = false; }
+    bool 严格阵营 = cfg_camp_strict && !阵营已放宽;
+    int 严格通过 = 0;
+
+    for (int k = 0; k < 扫描数; ++k) {
         uint64_t 实体 = vm_read<uint64_t>(数组 + 偏移表.槽距 * k);
         if (!IsValidAddr(实体)) continue;
         有效实体++;
 
         int 阵营 = vm_read<int>(实体 + 52);
-        if (阵营 < -1 || 阵营 > 7) 阵营 = vm_read<int>(实体 + (int)偏移表.阵营);  // 联机部分实体阵营在 +0xC0
-        if (阵营 < -1 || 阵营 > 7) continue;   // 阵营读不出来的是垃圾实体，以前会被当成敌人画出来（乱跳的来源之一）
-        阵营直方[阵营 + 1]++;
+        bool 阵营合法 = (阵营 == 1 || 阵营 == 2);
+        if (!阵营合法) {
+            int 备 = vm_read<int>(实体 + (int)偏移表.阵营);   // 联机部分实体阵营在 +0xC0
+            if (备 == 1 || 备 == 2) { 阵营 = 备; 阵营合法 = true; }
+            else if (备 >= -1 && 备 <= 7) 阵营 = 备;         // 只用于直方图，不参与绘制
+        }
+        if (阵营 >= -1 && 阵营 <= 7) 阵营直方[阵营 + 1]++;
+        if (阵营合法) 严格通过++;
+        if (严格阵营 && !阵营合法) continue;   // 严格模式：1/2 之外一律当垃圾实体
+        if (!阵营合法 && (阵营 < -1 || 阵营 > 7)) continue;   // 连读都读不出来
 
         if (阵营 == (int)我方阵营) continue;
 
@@ -3144,13 +3231,16 @@ void Draw::StartBooks() {
         // 同一英雄只画一次：必须「ID 相同 + 位置几乎重合」才算重复。
         // 依据 fields_dump2.txt：奇数槽（阵营 2）的 +0x28 会在 {110,111,175,506,581}
         // 之间来回变，光按 ID 去重会把真实敌人整批吞掉；带上位置条件才不会误杀。
+        // 阈值从 8000（8 米）收到 1500（1.5 米）：团战时两个真英雄常常肩并肩站在 8 米内，
+        // 旧阈值会把其中一个当影子体丢掉 → "队友/敌人少一个"。可 tune.txt 里 dedup=xxx 调。
         if (cfg_id_pick && 英雄ID > 0 && 英雄ID < 1000) {
             bool 重复 = false;
+            long long 门限 = (long long)cfg_dedup_mm * (long long)cfg_dedup_mm;
             for (int d = 0; d < 已画数; ++d) {
                 if (已画ID[d] != 英雄ID) continue;
                 long long dx = (long long)(int)样X - 已画X[d];
                 long long dz = (long long)(int)样Z - 已画Z[d];
-                if (dx * dx + dz * dz < 8000LL * 8000LL) { 重复 = true; break; }
+                if (dx * dx + dz * dz < 门限) { 重复 = true; break; }
             }
             if (重复) continue;
             if (已画数 < 20) {
@@ -3190,44 +3280,13 @@ void Draw::StartBooks() {
 
         uint64_t 技能对象 = vm_read<uint64_t>(实体 + 488);
 
-        // 技能图标列（屏幕上方）—— 对齐游戏记分板尺寸
-        if (cfg_skill && IsValidAddr(技能对象)) {
-            float px = (技能列系数[图标序号 % 6] * 技能列步长 + 技能列基准 + cfg_skillX) * 缩放;
-            float py = cfg_skillY * 缩放;
-            float 图标大小 = 17.0f * 缩放;          // 原 24，缩小到接近游戏自带头像
-            float 英雄中心 = py + 15.0f * 缩放;      // 行中心不变，CD 数字对齐
-            float 召唤中心 = py + 42.0f * 缩放;
-            float 圆心x = px + 图标大小 * 0.5f;
-            char 编号[8] = {0};
-            if (英雄ID > 0) snprintf(编号, sizeof(编号), "%d", (int)(英雄ID % 1000));
-
-            id 英雄纹理 = [图标缓存 英雄:(int)英雄ID];
-            画图标(英雄纹理, 0x60000000, 英雄ID > 0 ? 编号 : nullptr,
-                   px, 英雄中心 - 图标大小 * 0.5f, 图标大小);
-
-            unsigned 召唤ID = 读召唤技能ID(技能对象);
-            char 召唤串[8] = {0};
-            if ((int)召唤ID > 0) snprintf(召唤串, sizeof(召唤串), "%d", 召唤ID);
-            id 召唤纹理 = [图标缓存 召唤师:召唤ID];
-            画图标(召唤纹理, 0x60000000, (int)召唤ID > 0 ? 召唤串 : nullptr,
-                   px, 召唤中心 - 图标大小 * 0.5f, 图标大小);
-
-            unsigned CD1 = 读CD秒(技能对象, 264);
-            unsigned CD2 = 读CD秒(技能对象, 336);
-            char 秒串[16];
-            float 圈半径 = 图标大小 * 0.5f;
-            if ((int)CD2 > 0) {
-                snprintf(秒串, sizeof(秒串), "%d", CD2);
-                画CD底(圆心x, py + 42.0f * 缩放, 圈半径);
-                画文字(圆心x, py + 42.0f * 缩放, 秒串, 0xFFFFFFFF, true);
-            }
-            if ((int)CD1 > 0) {
-                snprintf(秒串, sizeof(秒串), "%d", CD1);
-                画CD底(圆心x, py + 15.0f * 缩放, 圈半径);
-                画文字(圆心x, py + 15.0f * 缩放, 秒串, 0xFFFFFF00, true);  // 黄
-            }
+        // 技能图标列不在循环里排位，先收起来，循环结束后按英雄ID排序再画
+        if (cfg_skill && IsValidAddr(技能对象) && 技能列数 < 20) {
+            技能列[技能列数].英雄ID = 英雄ID;
+            技能列[技能列数].技能对象 = 技能对象;
+            技能列[技能列数].实体 = 实体;
+            技能列数++;
         }
-        图标序号++;
 
         // 小地图图标
         if (cfg_map) {
@@ -3302,39 +3361,107 @@ void Draw::StartBooks() {
         }
     }
 
+    // ==================== 技能图标列（屏幕上方）====================
+    // ★ 从实体循环里挪出来，先按稳定键排序再落位：
+    //   原来按「实体数组扫描顺序」边扫边排，联机时容器槽位每帧都在变，
+    //   一列图标就跟着左右乱跳（同一个敌人上帧第 2 列、下帧第 5 列）。
+    //   排序键用英雄ID（相同再比实体地址），一局内稳定；
+    //   超过 6 个目标就换行（原来 %6 会在同一格上叠画）。
+    if (cfg_skill && 技能列数 > 0) {
+        for (int i = 1; i < 技能列数; ++i) {
+            技能列项 v = 技能列[i];
+            int j = i - 1;
+            while (j >= 0 && (技能列[j].英雄ID > v.英雄ID
+                   || (技能列[j].英雄ID == v.英雄ID && 技能列[j].实体 > v.实体))) {
+                技能列[j + 1] = 技能列[j];
+                --j;
+            }
+            技能列[j + 1] = v;
+        }
+        for (int i = 0; i < 技能列数; ++i) {
+            int 列 = i % 6, 行 = i / 6;
+            uint64_t 技能对象 = 技能列[i].技能对象;
+            long long 英雄ID = 技能列[i].英雄ID;
+            float px = (技能列系数[列] * 技能列步长 + 技能列基准 + cfg_skillX) * 缩放;
+            float py = (cfg_skillY + 行 * 58.0f) * 缩放;
+            float 图标大小 = 17.0f * 缩放;          // 原 24，缩小到接近游戏自带头像
+            float 英雄中心 = py + 15.0f * 缩放;      // 行中心不变，CD 数字对齐
+            float 召唤中心 = py + 42.0f * 缩放;
+            float 圆心x = px + 图标大小 * 0.5f;
+            char 编号[8] = {0};
+            if (英雄ID > 0) snprintf(编号, sizeof(编号), "%d", (int)(英雄ID % 1000));
+
+            id 英雄纹理 = [图标缓存 英雄:(int)英雄ID];
+            画图标(英雄纹理, 0x60000000, 英雄ID > 0 ? 编号 : nullptr,
+                   px, 英雄中心 - 图标大小 * 0.5f, 图标大小);
+
+            unsigned 召唤ID = 读召唤技能ID(技能对象);
+            char 召唤串[8] = {0};
+            if ((int)召唤ID > 0) snprintf(召唤串, sizeof(召唤串), "%d", 召唤ID);
+            id 召唤纹理 = [图标缓存 召唤师:召唤ID];
+            画图标(召唤纹理, 0x60000000, (int)召唤ID > 0 ? 召唤串 : nullptr,
+                   px, 召唤中心 - 图标大小 * 0.5f, 图标大小);
+
+            unsigned CD1 = 读CD秒(技能对象, 264);
+            unsigned CD2 = 读CD秒(技能对象, 336);
+            char 秒串[16];
+            float 圈半径 = 图标大小 * 0.5f;
+            if ((int)CD2 > 0) {
+                snprintf(秒串, sizeof(秒串), "%d", CD2);
+                画CD底(圆心x, py + 42.0f * 缩放, 圈半径);
+                画文字(圆心x, py + 42.0f * 缩放, 秒串, 0xFFFFFFFF, true);
+            }
+            if ((int)CD1 > 0) {
+                snprintf(秒串, sizeof(秒串), "%d", CD1);
+                画CD底(圆心x, py + 15.0f * 缩放, 圈半径);
+                画文字(圆心x, py + 15.0f * 缩放, 秒串, 0xFFFFFF00, true);  // 黄
+            }
+        }
+    }
+
     // ==================== 野怪 ====================
-    int 野怪计 = 0;
-    if (cfg_monster && cfg_map && 数量 >= 8) {
+    int 野怪计 = 0, 野怪越界 = 0;
+    if (cfg_monster && cfg_map && 扫描数 >= 8) {
         野怪信息 野怪[20];
         for (int i = 0; i < 20; ++i) 野怪[i] = {0, 0, 0, 0, 0};
         野怪计 = 读野怪(模块基址, 野怪, 20);
         for (int m = 0; m < 野怪计; ++m) {
             float mx = 0.0f, my = 0.0f;
             野怪小图坐标(野怪[m].x, 野怪[m].z, 地图, &mx, &my);
-            // 先在逻辑坐标上判断/翻折，最后再乘一次缩放（否则与 地图 的量纲不一致）
-            if (!点在小地图(地图, mx, my)) {
-                // 镜像翻折（对面半图）
-                mx = 2.0f * (地图.x + 地图.w * 0.5f) - mx;
-                my = 2.0f * (地图.y + 地图.w * 0.5f) - my;
-            }
-            if (点在小地图(地图, mx, my)) {
-                mx *= 缩放;
-                my *= 缩放;
-                if (野怪[m].cd < 野怪[m].刷新) {
-                    char 秒串[16];
-                    snprintf(秒串, sizeof(秒串), "%d", 野怪[m].cd > 0 ? 野怪[m].cd : 0);
-                    画文字(mx, my - 10.0f * 缩放, 秒串, 0xFFFFFFFF, true);
-                } else {
-                    画实心圆(0xFF00FF00, mx, my, 2.0f * 缩放);
-                }
+            // ★ 删掉「算出框外就镜像到对面半图」那一手。
+            //   小图坐标() 里已经按全局翻转换算过一次，这里再镜像等于翻两次，
+            //   野怪会凭空出现在对面半图、同一个野怪两个位置，看着就是"野怪乱跑"。
+            //   样本 ToMiniMap 也没有镜像逻辑，出框就是没在图上，直接不画。
+            if (!点在小地图(地图, mx, my)) { 野怪越界++; continue; }
+            mx *= 缩放;
+            my *= 缩放;
+            if (野怪[m].cd < 野怪[m].刷新) {
+                char 秒串[16];
+                snprintf(秒串, sizeof(秒串), "%d", 野怪[m].cd > 0 ? 野怪[m].cd : 0);
+                画文字(mx, my - 10.0f * 缩放, 秒串, 0xFFFFFFFF, true);
+            } else {
+                画实心圆(0xFF00FF00, mx, my, 2.0f * 缩放);
             }
         }
+    }
+
+    // 阵营严格模式的空转自愈（每帧结算一次）
+    if (严格阵营 && 有效实体 >= 3 && 严格通过 == 0) {
+        if (++严格空帧 >= 90 && !已报放宽) {
+            阵营已放宽 = true;
+            已报放宽 = true;
+            日志("阵营严格模式空转 %d 帧（有效实体 %d 个，阵营 1/2 一个都没有）→ 放宽阵营过滤", 严格空帧, 有效实体);
+            严格空帧 = 0;
+        }
+    } else {
+        严格空帧 = 0;
     }
 
     // ==================== 对局判定 & 统计 ====================
     // 原来卡 数量<=12（假设容器里只有 10 个英雄）。联机时容器里还有小兵/野怪/召唤物，
     // 数量会超过 12 → 判成"没进对局"，野怪与统计同时关掉。只保留下限。
-    bool 判在对局 = 数量 >= 8
+    // 下限改用扫描数（≥128），不再依赖数量字段。
+    bool 判在对局 = 扫描数 >= 8
                  && 有坐标实体 >= 1
                  && 首个英雄ID > 0
                  && 首个血上限 > 0
@@ -3346,12 +3473,14 @@ void Draw::StartBooks() {
     if (统计时刻 - 上次对局统计 > 5.0) {
         上次对局统计 = 统计时刻;
         float fps = BBZGUI::GetIO().DeltaTime > 0.0f ? 1.0f / BBZGUI::GetIO().DeltaTime : 0.0f;
-        日志("n=%d 敌=%d 屏=%d 野=%d 阵[-1:%d 0:%d 1:%d 2:%d 3:%d] 血样%d/%d 源=%s 英雄=%d 我=%d 读=%d 限=%d 任务=%d fps=%.0f",
-             数量, 有坐标实体, 屏内实体, 野怪计,
+        日志("n=%d 扫=%d 敌=%d 屏=%d 野=%d(越界%d) 阵[-1:%d 0:%d 1:%d 2:%d 3:%d] 血样%d/%d 源=%s 英雄=%d 我=%d 严=%d 翻=%.0f 读=%d 限=%d 任务=%d fps=%.0f",
+             数量, 扫描数, 有坐标实体, 屏内实体, 野怪计, 野怪越界,
              阵营直方[0], 阵营直方[1], 阵营直方[2], 阵营直方[3], 阵营直方[4],
              首个血当前, 首个血上限, 链名(首个链), (int)首个英雄ID, 我方阵营,
+             严格阵营 ? 1 : 0, 小图翻转(),
              (int)读总数, 读限流计数, 任务端口 != 0, fps);
-        日志("扫描 %d/%d 槽 去重后=%d 屏内=%d", 有效实体, 数量, 已画数, 屏内实体);
+        日志("扫描 %d/%d 槽 去重后=%d 屏内=%d 边界=±%d 去重阈值=%d",
+             有效实体, 扫描数, 已画数, 屏内实体, cfg_coord_max, cfg_dedup_mm);
         for (int s = 0; s < 诊断数; ++s) {
             日志("  槽%-3d 阵=%d ID=%-4d 世界=(%d,%d) 屏=%d",
                 诊断槽[s], 诊断阵[s], (int)诊断ID[s],
