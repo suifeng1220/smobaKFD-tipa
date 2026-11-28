@@ -1857,8 +1857,9 @@ static bool getbbz() {
         static std::atomic<bool> 已接{false};
         if (!已接.exchange(true)) {
             bool 通 = 接越狱内核();
-            if (!通 && DOJailbreaker.sharedInstance.isSuccess) {
-                内核来源.store(2, std::memory_order_release);   // 兼容：App 内 exploit 曾跑成功
+            DOJailbreaker* jb = DOJailbreaker.sharedInstance;   // 兼容：App 内 exploit 曾跑成功
+            if (!通 && jb.isSuccess) {
+                内核来源.store(2, std::memory_order_release);
             }
             打印内核来源();
             if (!通) 日志("没拿到内核原语 → 纯任务端口模式（不影响绘制）");
