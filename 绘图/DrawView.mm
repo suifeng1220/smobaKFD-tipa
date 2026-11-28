@@ -15,6 +15,7 @@
 #include <cmath>
 #include <mach/mach.h>
 #include <sys/sysctl.h>
+#include <sys/stat.h>
 #include "BBZGui.h"
 #include "游戏/SDK.h"
 
@@ -557,6 +558,173 @@ static void 读调参() {
     fclose(f);
 }
 
+// ==================== 运行时可替换偏移表 ====================
+//
+// 做法来自 TrollSpeed 成品（BackendAdapter.dylib 里那张明文 JSON）：
+// 它整个工具没有一条偏移是编进代码的，全从 {"actorArray":120,...} 里读，
+// 那张表还能从后端下发，本地另有 _LocalOffsets 兜底 —— 换赛季只改数据，不重编译。
+//
+// 我们照这个来：Documents/offsets.json 存在就用它覆盖内置默认值，
+// 每 2 秒看一次文件修改时间，电脑端改完存盘即生效，不用重装 App。
+// 键名同时接受样本原始 key（actorArray / posPrimary / coordBase …）和中文名，
+// 把 TrollSpeed 的表直接倒进来也能吃（冲突项故意不映射，见下）。
+// 文件不存在时自动写一份带全部键的样例出去，直接照着改即可。
+static SDK::偏移表结构 偏移表 = SDK::默认偏移表();
+static char 偏移来源[80] = "内置默认";
+static int 偏移覆盖数 = 0;
+static int 偏移未知键 = 0;
+
+struct 偏移键项 { const char* 样本名; const char* 中文名; uint64_t* 位; };
+
+// 键表：{TrollSpeed 样本 key, 我们的中文 key, 字段}
+// 样本里 team=52 / monsterHp=576 / skill4=336 三项与我们的实测冲突（我们阵营 192、技能CD 576），
+// 语义没核准之前不映射，避免把它的表倒进来时改错字段。
+#define 偏移键_定义(t)                                                        \
+    const 偏移键项 表[] = {                                                    \
+        {"gameStruct",    "根野怪备",  &(t)->根野怪备},                         \
+        {"matrix",        "根相机",    &(t)->根相机},                           \
+        {nullptr,         "根世界",    &(t)->根世界},                           \
+        {nullptr,         "根相机备",  &(t)->根相机备},                         \
+        {nullptr,         "根野怪",    &(t)->根野怪},                           \
+        {nullptr,         "根视距",    &(t)->根视距},                           \
+        {nullptr,         "容器中转",  &(t)->容器中转},                         \
+        {"actorArray",    "实体数组",  &(t)->实体数组},                         \
+        {nullptr,         "数组数量",  &(t)->数组数量},                         \
+        {"entityStride",  "槽距",      &(t)->槽距},                             \
+        {nullptr,         "坐标节点",  &(t)->节点},                             \
+        {nullptr,         "节点X",     &(t)->节点X},                            \
+        {nullptr,         "节点Y",     &(t)->节点Y},                            \
+        {"coordBase",     "坐标基",    &(t)->坐标基},                           \
+        {"coordHop2",     "坐标跳2",   &(t)->坐标跳2},                          \
+        {"coordHop3",     "坐标跳3",   &(t)->坐标跳3},                          \
+        {"coordHop4",     "坐标跳4",   &(t)->坐标跳4},                          \
+        {"posComponent",  "坐标组件",  &(t)->坐标组件},                         \
+        {"posPrimary",    "坐标主",    &(t)->坐标主},                           \
+        {"posMirror",     "坐标镜像",  &(t)->坐标镜像},                         \
+        {"posX",          "坐标内X",   &(t)->坐标内X},                          \
+        {"posY",          "坐标内Y",   &(t)->坐标内Y},                          \
+        {nullptr,         "直接X",     &(t)->直接X},                            \
+        {nullptr,         "直接Y",     &(t)->直接Y},                            \
+        {nullptr,         "直接Z",     &(t)->直接Z},                            \
+        {"heroId",        "英雄ID",    &(t)->英雄ID},                           \
+        {nullptr,         "阵营",      &(t)->阵营},                             \
+        {nullptr,         "回城标记",  &(t)->回城标记},                         \
+        {"hpBase",        "血量对象",  &(t)->血量对象},                         \
+        {"hp",            "血量当前",  &(t)->血量当前},                         \
+        {"maxHp",         "血量上限",  &(t)->血量上限},                         \
+        {nullptr,         "技能对象",  &(t)->技能对象},                         \
+        {nullptr,         "技能中转",  &(t)->技能中转},                         \
+        {nullptr,         "技能ID",    &(t)->技能ID},                           \
+        {nullptr,         "技能CD",    &(t)->技能CD},                           \
+        {"recallRoot",    "回城对象",  &(t)->回城对象},                         \
+        {nullptr,         "回城状态",  &(t)->回城状态},                         \
+        {"matrixHop1",    "矩阵跳1",   &(t)->矩阵跳1},                          \
+        {"matrixHop2",    "矩阵跳2",   &(t)->矩阵跳2},                          \
+        {"matrixHop3",    "矩阵跳3",   &(t)->矩阵跳3},                          \
+        {nullptr,         "矩阵字段",  &(t)->矩阵字段},                         \
+        {"monsterArray",  "野怪数组",  &(t)->野怪数组},                         \
+        {"monsterList1",  "野怪列表1", &(t)->野怪列表1},                        \
+        {"monsterPosX",   "野怪坐标X", &(t)->野怪坐标X},                        \
+        {"monsterPosY",   "野怪坐标Y", &(t)->野怪坐标Y},                        \
+        {"monsterRoot",   "野怪根",    &(t)->野怪根},                           \
+        {"monsterMaxHp",  "野怪刷新",  &(t)->野怪刷新},                         \
+    };                                                                        \
+    const int 表数 = (int)(sizeof(表) / sizeof(表[0]));
+
+static bool 取偏移值(NSDictionary* d, NSString* k, uint64_t* 出) {
+    id v = [d objectForKey:k];
+    if (!v) return false;
+    if ([v isKindOfClass:[NSString class]]) {
+        const char* s = [v UTF8String];
+        if (!s || !*s) return false;
+        int 进制 = (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) ? 16 : 10;
+        char* 尾 = nullptr;
+        unsigned long long x = strtoull(s, &尾, 进制);
+        if (尾 == s) return false;
+        *出 = (uint64_t)x;
+        return true;
+    }
+    if ([v isKindOfClass:[NSNumber class]]) { *出 = (uint64_t)[v unsignedLongLongValue]; return true; }
+    return false;
+}
+
+// 首次没有文件时落一份样例，键全列出来，用户照着改就行
+static void 写偏移样例(const char* 路径) {
+    SDK::偏移表结构 t = SDK::默认偏移表();
+    偏移键_定义(&t)
+    NSMutableDictionary* d = [NSMutableDictionary dictionary];
+    for (int i = 0; i < 表数; ++i) d[@(表[i].中文名)] = @(*(表[i].位));
+    d[@"_说明"] = @"本文件覆盖内置偏移；每2秒自动重读，改完存盘即生效。值可写十进制或 0x 十六进制。删掉本文件即回到内置默认。";
+    NSData* data = [NSJSONSerialization dataWithJSONObject:d
+                                                   options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys
+                                                     error:nil];
+    if (data && [data writeToFile:@(路径) atomically:YES])
+        日志("偏移表：没有 offsets.json → 已写出样例（%d 个键），改它即可覆盖内置默认", 表数);
+    else
+        日志("偏移表：样例写出失败 %s", 路径);
+}
+
+static void 读偏移表() {
+    static double 上次 = 0;
+    static time_t 上次改 = 0;
+    static bool 试过写样例 = false;
+    double now = CACurrentMediaTime();
+    if (now - 上次 < 2.0) return;
+    上次 = now;
+    const char* 家 = getenv("HOME");
+    if (!家) return;
+    char p[512];
+    snprintf(p, sizeof(p), "%s/Documents/offsets.json", 家);
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    if (stat(p, &st) != 0) {
+        if (!试过写样例) { 试过写样例 = true; 写偏移样例(p); }
+        return;
+    }
+    if (st.st_mtime == 上次改) return;
+    上次改 = st.st_mtime;
+
+    NSData* data = [NSData dataWithContentsOfFile:@(p)];
+    if (!data) return;
+    NSError* err = nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+    if (![obj isKindOfClass:[NSDictionary class]]) {
+        日志("偏移表：offsets.json 解析失败（%s），继续用上一份",
+             err ? [[err localizedDescription] UTF8String] : "顶层不是字典");
+        return;
+    }
+    NSDictionary* d = (NSDictionary*)obj;
+    SDK::偏移表结构 t = SDK::默认偏移表();
+    偏移键_定义(&t)
+    int 命中 = 0;
+    for (int i = 0; i < 表数; ++i) {
+        uint64_t v = 0;
+        bool 取到 = false;
+        if (表[i].样本名 && 取偏移值(d, @(表[i].样本名), &v)) 取到 = true;
+        else if (取偏移值(d, @(表[i].中文名), &v)) 取到 = true;
+        if (!取到) continue;
+        *(表[i].位) = v;
+        命中++;
+    }
+    // 统计文件里我们不认识的键（多半是样本 ts* 那批 VM 补丁参数，留着不影响）
+    int 未知 = 0;
+    for (NSString* k in d) {
+        if ([k hasPrefix:@"_"]) continue;
+        bool 认识 = false;
+        for (int i = 0; i < 表数 && !认识; ++i)
+            if ((表[i].样本名 && [k isEqualToString:@(表[i].样本名)]) ||
+                [k isEqualToString:@(表[i].中文名)]) 认识 = true;
+        if (!认识) 未知++;
+    }
+    偏移表 = t;
+    偏移覆盖数 = 命中;
+    偏移未知键 = 未知;
+    snprintf(偏移来源, sizeof(偏移来源), "offsets.json(%d键)", 命中);
+    日志("偏移表：offsets.json 生效 覆盖=%d 未知=%d 世界=0x%llX 相机=0x%llX 节点=%llu 组件=%llu",
+         命中, 未知, (unsigned long long)t.根世界, (unsigned long long)t.根相机,
+         (unsigned long long)t.节点, (unsigned long long)t.坐标组件);
+}
+
 // 小地图自适配回写：参数变化 ≥1.0 才写 plist
 static void 回写地图配置(float mapX, float mapY, float mapSize) {
     static double 上次 = 0;
@@ -760,7 +928,7 @@ static uint64_t 枚举镜像(int pid, mach_port_t 任务, uint64_t all_image_inf
     }
     for (uint32_t i = 0; i < 数量; ++i) {
         struct { uint64_t 加载址; uint64_t 路径址; uint64_t 日期; } 项 = {0, 0, 0};
-        if (!任务或内核读(pid, 任务, 数组址 + 24ULL * i, &项, 24)) continue;
+        if (!任务或内核读(pid, 任务, 数组址 + 偏移表.槽距 * i, &项, 24)) continue;
         if (!项.加载址 || !项.路径址) continue;
         char 路径[256] = {0};
         if (任务或内核读(pid, 任务, 项.路径址, 路径, 255) && strstr(路径, "UnityFramework"))
@@ -896,7 +1064,7 @@ static uint64_t 找模块基址(int pid, mach_port_t* 端口出, char* 主程序
 // 指纹成立：根世界 → +312 可读
 static bool 指纹成立(int pid, uint64_t 基址) {
     uint64_t 世界 = 0;
-    if (!目标读(pid, 基址 + SDK::根世界, &世界, 8) || !IsValidAddr(世界)) return false;
+    if (!目标读(pid, 基址 + 偏移表.根世界, &世界, 8) || !IsValidAddr(世界)) return false;
     uint64_t 容器 = 0;
     return 目标读(pid, 世界 + 312, &容器, 8) && IsValidAddr(容器);
 }
@@ -1033,32 +1201,34 @@ public:
         状态.store(初始化解密中, std::memory_order_release);
         int 通过 = 0, 试过 = 0;
         for (int i = 0; i < 数量 && i < 12; ++i) {
-            uint64_t e = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)i);
+            uint64_t e = vm_read<uint64_t>(数组 + 偏移表.槽距 * (uint64_t)i);
             if (!IsValidAddr(e)) continue;
             试过++;
-            uint64_t 组件 = vm_read<uint64_t>(e + 组件偏移.load(std::memory_order_acquire));
+            uint64_t 组件 = vm_read<uint64_t>(e + 偏移表.坐标组件);
             if (!IsValidAddr(组件)) continue;
-            int x = vm_read<int>(组件 + 主偏移.load(std::memory_order_acquire));
-            int z = vm_read<int>(组件 + 主偏移.load(std::memory_order_acquire) + 8);
+            int x = vm_read<int>(组件 + 偏移表.坐标主 + 偏移表.坐标内X);
+            int z = vm_read<int>(组件 + 偏移表.坐标主 + 偏移表.坐标内Y);
             if (坐标合理(x) && 坐标合理(z) && !(x == 0 && z == 0)) 通过++;
         }
         状态.store(通过 > 0 ? 已解密 : 解密失败, std::memory_order_release);
-        日志("坐标解密器：只读扫描 试过=%d 通过=%d → %s（组件=%u 主=%u 镜像=%u）",
+        日志("坐标解密器：只读扫描 试过=%d 通过=%d → %s（组件=%llu 主=%llu 镜像=%llu）",
              试过, 通过, 阶段名(),
-             (unsigned)组件偏移.load(), (unsigned)主偏移.load(), (unsigned)镜像偏移.load());
+             (unsigned long long)偏移表.坐标组件,
+             (unsigned long long)偏移表.坐标主,
+             (unsigned long long)偏移表.坐标镜像);
     }
 
     // 解密读取（样本的每帧那段）：主/镜像两份都读，交叉校验，这是它"两套缓存"的用法
     bool 读(uint64_t 实体, unsigned* 出X, unsigned* 出Z, uint64_t* 来源) {
         if (状态.load(std::memory_order_acquire) != 已解密) return false;
-        uint64_t 组件 = vm_read<uint64_t>(实体 + 组件偏移.load(std::memory_order_acquire));
+        uint64_t 组件 = vm_read<uint64_t>(实体 + 偏移表.坐标组件);
         if (!IsValidAddr(组件)) { 未命中++; return false; }
-        const uint64_t 主 = 主偏移.load(std::memory_order_acquire);
-        const uint64_t 镜 = 镜像偏移.load(std::memory_order_acquire);
-        int px = vm_read<int>(组件 + 主);
-        int pz = vm_read<int>(组件 + 主 + 8);
-        int mx = vm_read<int>(组件 + 镜);
-        int mz = vm_read<int>(组件 + 镜 + 8);
+        const uint64_t 主 = 偏移表.坐标主;
+        const uint64_t 镜 = 偏移表.坐标镜像;
+        int px = vm_read<int>(组件 + 主 + 偏移表.坐标内X);
+        int pz = vm_read<int>(组件 + 主 + 偏移表.坐标内Y);
+        int mx = vm_read<int>(组件 + 镜 + 偏移表.坐标内X);
+        int mz = vm_read<int>(组件 + 镜 + 偏移表.坐标内Y);
         bool 主可 = 坐标合理(px) && 坐标合理(pz) && !(px == 0 && pz == 0);
         bool 镜可 = 坐标合理(mx) && 坐标合理(mz) && !(mx == 0 && mz == 0);
         // 两份都有值时必须一致（5 米内），不一致说明这层解出来的不是坐标 —— 直接判失败，不硬画
@@ -1068,11 +1238,11 @@ public:
                 return false;
             }
             *出X = (unsigned)px; *出Z = (unsigned)pz;
-            *来源 = 组件偏移.load() ; 主命中++;
+            *来源 = 偏移表.坐标组件 ; 主命中++;
             return true;
         }
-        if (主可) { *出X = (unsigned)px; *出Z = (unsigned)pz; *来源 = 组件偏移.load(); 主命中++; return true; }
-        if (镜可) { *出X = (unsigned)mx; *出Z = (unsigned)mz; *来源 = 组件偏移.load() + 镜; 镜像命中++; return true; }
+        if (主可) { *出X = (unsigned)px; *出Z = (unsigned)pz; *来源 = 偏移表.坐标组件; 主命中++; return true; }
+        if (镜可) { *出X = (unsigned)mx; *出Z = (unsigned)mz; *来源 = 偏移表.坐标组件 + 镜; 镜像命中++; return true; }
         未命中++;
         return false;
     }
@@ -1089,10 +1259,8 @@ private:
     std::atomic<int> 目标pid{0};
     std::atomic<int> 目标端口{0};
     std::atomic<int> 状态{未初始化};
-    // 解密表：扫描确认后常驻，跨调用共享
-    std::atomic<unsigned> 组件偏移{SDK::坐标组件};
-    std::atomic<unsigned> 主偏移{SDK::坐标主};
-    std::atomic<unsigned> 镜像偏移{SDK::坐标镜像};
+    // 解密表不再缓存：偏移表现在是运行时可改的数据（offsets.json），
+    // 缓存一份就等于把外置配置又变回硬编码，改了 JSON 也不生效。
     // 缓存/统计
     std::atomic<long> 主命中{0}, 镜像命中{0}, 交叉失败{0}, 未命中{0};
 };
@@ -1103,39 +1271,107 @@ private:
 // 命中偏移写 pos.log 表头，一眼看出本局走的是哪条链。
 static uint64_t 坐标命中偏移 = 0;   // 0=未命中；否则记录实际生效的首个字段偏移
 
+// ==================== 交叉校验（第 3 件事）====================
+//
+// 主链（0x230 / 解密器 0x90）是我们自己走位实测过的；样本 TrollSpeed 另给了一条
+// coordBase 三跳链（168 → 16 → 0 → 96），入口不同但落在同一个 {x@0, y@8} 结构上。
+// 两条链互相独立，正好拿来对拍：
+//   · 都对且差 ≤5 米 → 说明两条链都健康，记一次"一致"
+//   · 都对但差 >5 米 → 有一条在解错引用，记"不一致"并留最大偏差，但**仍采用主链**
+//     （主链有 #177 走位数据背书，不因为一条没验证过的链去改画面）
+//   · 主链全废、只有它有效 → 用它兜底，至少不至于一个人都不画
+static long 互校一致 = 0, 互校不一致 = 0, 链B命中 = 0;
+static int  互校最差米 = 0;
+
+// 按跳表逐级解引用：e --跳[0]--> p1 --跳[1]--> p2 …
+static uint64_t 解跳(uint64_t 实体, const uint64_t* 跳, int 数) {
+    uint64_t p = 实体;
+    for (int i = 0; i < 数; ++i) {
+        p = vm_read<uint64_t>(p + 跳[i]);
+        if (!IsValidAddr(p)) return 0;
+    }
+    return p;
+}
+
+// 链 B：实体+coordBase → +coordHop2 → +coordHop3 → +coordHop4 → {x@0, z@+8}
+static bool 读坐标链B(uint64_t 实体, int* 出X, int* 出Z) {
+    uint64_t 跳[3] = { 偏移表.坐标基, 偏移表.坐标跳2, 偏移表.坐标跳3 };
+    uint64_t b = 解跳(实体, 跳, 3);
+    if (!b) return false;
+    uint64_t 址 = b + 偏移表.坐标跳4;
+    int x = vm_read<int>(址 + 偏移表.坐标内X);
+    int z = vm_read<int>(址 + 偏移表.坐标内Y);
+    if (!坐标合理(x) || !坐标合理(z) || (x == 0 && z == 0)) return false;
+    *出X = x;
+    *出Z = z;
+    return true;
+}
+
+// 读实体坐标：实时位置在 实体+0x230 → 子对象 +0x128(x) / +0x130(z)，int32 毫米，可为负。
+// 两局对照定的：#177 本链路走位 15 秒坐标连续变化、测速 3.3~3.9 m/s；#180 直读 +0x278 对局 238 秒零变化。
+// +0x278 是静态锚点副本，静止时恰好等于当前位置，所以之前 10/10 对拍是被静止状态骗了。
+// 命中偏移写 pos.log 表头，一眼看出本局走的是哪条链。
 static int 读实体坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
     if (!IsValidAddr(实体)) return -1;
-    // 一级（主路）：坐标解密器 —— 也就是样本第八章那套"常驻单例 + 解密表 + 主/镜像交叉校验"。
+
+    unsigned ux = 0, uz = 0;
+    bool 有主 = false;
+    uint64_t 主源 = 0;
+
+    // 一级（主路）：坐标解密器 —— 样本第八章那套"常驻单例 + 解密表 + 主/镜像交叉校验"。
     //   实体+0x90 → 组件+0x60(主) / +0x78(镜像)。两份都读，不一致就判失败，不硬画。
     {
         uint64_t 来源 = 0;
-        if (坐标解密器::State().读(实体, X, Z, &来源)) {
-            坐标命中偏移 = 来源;
-            return 4;
-        }
+        if (坐标解密器::State().读(实体, &ux, &uz, &来源)) { 有主 = true; 主源 = 来源; }
     }
-    // 二级：实测链。0x230 是主偏移，另带 0x260 / 0x250 两个候选 ——
+    // 二级：实测链。0x230 是主偏移，另带 +0x30 / +0x20 两个候选 ——
     //   #177 版实测有效的正是这套"取第一个能读出合法坐标的候选"，当时 pos.log 坐标连续变化、测速 3.5m/s。
-    //   候选顺序固定，命中哪个由 pos.log 表头 命中=0x… 记录，下一局一读就知道，不用再猜。
-    static const uint64_t 候选[] = { SDK::坐标节点 /*0x230*/, 608 /*0x260*/, 592 /*0x250*/ };
-    for (int i = 0; i < 3; ++i) {
-        uint64_t 位 = vm_read<uint64_t>(实体 + 候选[i]);
-        if (!IsValidAddr(位)) continue;
-        int x = vm_read<int>(位 + SDK::坐标节点X);
-        int z = vm_read<int>(位 + SDK::坐标节点Y);
-        if (x > -300000 && x < 300000 && z > -300000 && z < 300000 && !(x == 0 && z == 0)) {
-            坐标命中偏移 = 候选[i];
-            *X = (unsigned)x;
-            *Z = (unsigned)z;
-            return 4;
+    if (!有主) {
+        const uint64_t 候选[3] = { 偏移表.节点, 偏移表.节点 + 0x30, 偏移表.节点 + 0x20 };
+        for (int i = 0; i < 3; ++i) {
+            uint64_t 位 = vm_read<uint64_t>(实体 + 候选[i]);
+            if (!IsValidAddr(位)) continue;
+            int x = vm_read<int>(位 + 偏移表.节点X);
+            int z = vm_read<int>(位 + 偏移表.节点Y);
+            if (x > -300000 && x < 300000 && z > -300000 && z < 300000 && !(x == 0 && z == 0)) {
+                ux = (unsigned)x; uz = (unsigned)z; 主源 = 候选[i]; 有主 = true;
+                break;
+            }
         }
     }
+
+    // 交叉校验：独立再走一遍样本链 B，和主结果对拍
+    int bx = 0, bz = 0;
+    bool 有B = 读坐标链B(实体, &bx, &bz);
+    if (有B) 链B命中++;
+    if (有主 && 有B) {
+        int dx = abs((int)ux - bx);
+        int dz = abs((int)uz - bz);
+        if (dx <= 5000 && dz <= 5000) {
+            互校一致++;
+        } else {
+            互校不一致++;
+            int 米 = (dx > dz ? dx : dz) / 1000;
+            if (米 > 互校最差米) 互校最差米 = 米;
+        }
+    }
+
+    if (有主) { 坐标命中偏移 = 主源; *X = ux; *Z = uz; return 4; }
+
+    // 主链全废、链 B 有值 → 用它兜底
+    if (有B) {
+        坐标命中偏移 = 偏移表.坐标基;
+        *X = (unsigned)bx;
+        *Z = (unsigned)bz;
+        return 4;
+    }
+
     // 三级兜底：实体自身 +0x278 / +0x280（静态锚点）。只在前两级全废时用，避免"一部分人钉泉水"。
     {
-        int x = vm_read<int>(实体 + SDK::坐标直接X);
-        int z = vm_read<int>(实体 + SDK::坐标直接Z);
+        int x = vm_read<int>(实体 + 偏移表.直接X);
+        int z = vm_read<int>(实体 + 偏移表.直接Z);
         if (x > -300000 && x < 300000 && z > -300000 && z < 300000 && !(x == 0 && z == 0)) {
-            坐标命中偏移 = SDK::坐标直接X;
+            坐标命中偏移 = 偏移表.直接X;
             *X = (unsigned)x;
             *Z = (unsigned)z;
             return 4;
@@ -1147,23 +1383,23 @@ static int 读实体坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
 // ==================== 实体字段 ====================
 
 static int 读血量当前(uint64_t 实体) {
-    uint64_t 对象 = vm_read<uint64_t>(实体 + SDK::血量对象);
+    uint64_t 对象 = vm_read<uint64_t>(实体 + 偏移表.血量对象);
     if (!IsValidAddr(对象)) return -1;
-    return vm_read<int>(对象 + SDK::血量当前);
+    return vm_read<int>(对象 + 偏移表.血量当前);
 }
 static int 读血量上限(uint64_t 实体) {
-    uint64_t 对象 = vm_read<uint64_t>(实体 + SDK::血量对象);
+    uint64_t 对象 = vm_read<uint64_t>(实体 + 偏移表.血量对象);
     if (!IsValidAddr(对象)) return 0;
-    return vm_read<int>(对象 + SDK::血量上限);
+    return vm_read<int>(对象 + 偏移表.血量上限);
 }
-static int 读阵营(uint64_t 实体) { return vm_read<int>(实体 + SDK::阵营); }
+static int 读阵营(uint64_t 实体) { return vm_read<int>(实体 + 偏移表.阵营); }
 
 static unsigned 读召唤技能ID(uint64_t 技能对象) {
-    uint64_t a = vm_read<uint64_t>(技能对象 + SDK::技能对象);
+    uint64_t a = vm_read<uint64_t>(技能对象 + 偏移表.技能对象);
     if (!IsValidAddr(a)) return 0;
-    uint64_t b = vm_read<uint64_t>(a + SDK::技能中转);
+    uint64_t b = vm_read<uint64_t>(a + 偏移表.技能中转);
     if (!IsValidAddr(b)) return 0;
-    int id = vm_read<int>(b + SDK::技能ID);
+    int id = vm_read<int>(b + 偏移表.技能ID);
     if (id <= 0 || id >= 100000) return 0;
     return (unsigned)id;
 }
@@ -1183,9 +1419,9 @@ static unsigned 读CD秒(uint64_t 技能对象, uint64_t 偏移) {
 
 // 回城检测：技能对象+360 → +272 ≥0x128 且 (值-296)==1
 static bool 读回城(uint64_t 技能对象) {
-    uint64_t a = vm_read<uint64_t>(技能对象 + SDK::回城对象);
+    uint64_t a = vm_read<uint64_t>(技能对象 + 偏移表.回城对象);
     if (!IsValidAddr(a)) return false;
-    uint64_t b = vm_read<uint64_t>(a + SDK::回城状态);
+    uint64_t b = vm_read<uint64_t>(a + 偏移表.回城状态);
     if (!IsValidAddr(b)) return false;
     return b >= 0x128 && vm_read<int>(b - 296) == 1;
 }
@@ -1217,12 +1453,12 @@ static bool 读相机矩阵(uint64_t 模块, uint64_t 相机偏移, float* 矩�
 // 读矩阵（主相机失败自动切备并记住）
 static bool 读矩阵(uint64_t 模块, float* 矩阵) {
     if (用备相机) {
-        if (读相机矩阵(模块, SDK::根相机, 矩阵)) return true;
-        if (读相机矩阵(模块, SDK::根相机备, 矩阵)) { 用备相机 = false; return true; }
+        if (读相机矩阵(模块, 偏移表.根相机, 矩阵)) return true;
+        if (读相机矩阵(模块, 偏移表.根相机备, 矩阵)) { 用备相机 = false; return true; }
         return false;
     } else {
-        if (读相机矩阵(模块, SDK::根相机备, 矩阵)) return true;
-        if (读相机矩阵(模块, SDK::根相机, 矩阵)) { 用备相机 = true; return true; }
+        if (读相机矩阵(模块, 偏移表.根相机备, 矩阵)) return true;
+        if (读相机矩阵(模块, 偏移表.根相机, 矩阵)) { 用备相机 = true; return true; }
         return false;
     }
 }
@@ -1591,39 +1827,39 @@ struct 野怪信息 {
 // 读野怪：根野怪 → +952 → +136 → +320（备链根野怪备），每项 24 字节
 static int 读野怪(uint64_t 模块, 野怪信息* 输出, int 上限) {
     uint64_t 根 = 0;
-    uint64_t a = vm_read<uint64_t>(模块 + SDK::根野怪);
+    uint64_t a = vm_read<uint64_t>(模块 + 偏移表.根野怪);
     if (IsValidAddr(a)) {
-        uint64_t b = vm_read<uint64_t>(a + 952);
+        uint64_t b = vm_read<uint64_t>(a + 偏移表.野怪根);
         if (IsValidAddr(b)) {
-            uint64_t c = vm_read<uint64_t>(b + 136);
-            if (IsValidAddr(c)) 根 = vm_read<uint64_t>(c + 320);
+            uint64_t c = vm_read<uint64_t>(b + 偏移表.野怪列表1);
+            if (IsValidAddr(c)) 根 = vm_read<uint64_t>(c + 偏移表.野怪数组);
         }
     }
     if (!IsValidAddr(根)) {
-        uint64_t a2 = vm_read<uint64_t>(模块 + SDK::根野怪备);
+        uint64_t a2 = vm_read<uint64_t>(模块 + 偏移表.根野怪备);
         if (IsValidAddr(a2)) {
-            uint64_t b2 = vm_read<uint64_t>(a2 + 952);
+            uint64_t b2 = vm_read<uint64_t>(a2 + 偏移表.野怪根);
             if (IsValidAddr(b2)) {
-                uint64_t c2 = vm_read<uint64_t>(b2 + 136);
-                if (IsValidAddr(c2)) 根 = vm_read<uint64_t>(c2 + 320);
+                uint64_t c2 = vm_read<uint64_t>(b2 + 偏移表.野怪列表1);
+                if (IsValidAddr(c2)) 根 = vm_read<uint64_t>(c2 + 偏移表.野怪数组);
             }
         }
     }
     if (!IsValidAddr(根)) return 0;
     int 数 = 0;
     for (int i = 0; i < 20 && 数 < 上限; ++i) {
-        uint64_t 怪 = vm_read<uint64_t>(根 + 24ULL * i);
+        uint64_t 怪 = vm_read<uint64_t>(根 + 偏移表.槽距 * (uint64_t)i);
         if (!IsValidAddr(怪)) continue;
-        int x = vm_read<int>(怪 + SDK::坐标X);
-        int z = vm_read<int>(怪 + SDK::坐标Y);
+        int x = vm_read<int>(怪 + 偏移表.野怪坐标X);
+        int z = vm_read<int>(怪 + 偏移表.野怪坐标Y);
         if (x < -200000 || x > 200000 || z < -200000 || z > 200000 || (!x && !z)) continue;
-        int cd = vm_read<int>(怪 + SDK::技能CD);
-        int hp = vm_read<int>(怪 + 484);   // 野怪刷新原始值（0x1E4）
+        int cd = vm_read<int>(怪 + 偏移表.技能CD);
+        int hp = vm_read<int>(怪 + 偏移表.野怪刷新);   // 野怪刷新原始值（0x1E4）
         if (hp <= 0 || hp > 600000) continue;
         野怪信息& m = 输出[数++];
         m.x = x;
         m.z = z;
-        m.camp = vm_read<int>(怪 + SDK::阵营);
+        m.camp = vm_read<int>(怪 + 偏移表.阵营);
         m.cd = cd / 1000 + 3;
         m.刷新 = hp / 1000 + 3;
     }
@@ -1650,11 +1886,11 @@ static void 推小图翻转(uint64_t 数组, int 数量, unsigned 我方阵营) 
     long long 和 = 0;
     int 数 = 0;
     for (int k = 0; k < 数量 && k < cfg_scan_max; ++k) {
-        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * k);
+        uint64_t e = vm_read<uint64_t>(数组 + 偏移表.槽距 * k);
         if (!IsValidAddr(e)) continue;
         unsigned X = 0, Z = 0;
         if (读实体坐标(e, &X, &Z) < 0) continue;
-        if (vm_read<int>(e + SDK::阵营) != (int)我方阵营) continue;
+        if (vm_read<int>(e + 偏移表.阵营) != (int)我方阵营) continue;
         和 += (int)X;
         数++;
     }
@@ -1862,7 +2098,7 @@ static bool 字段取证(uint64_t 数组, int 数量) {
     int 见过数 = 0, 打印类 = 0;
 
     for (int i = 0; i < 数量 && 打印类 < 4; ++i) {
-        uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * i);
+        uint64_t 实体 = vm_read<uint64_t>(数组 + 偏移表.槽距 * i);
         if (!IsValidAddr(实体)) continue;
         uint64_t 类 = vm_read<uint64_t>(实体);
         if (!IsValidAddr(类)) continue;
@@ -1963,7 +2199,7 @@ static void 取证3(uint64_t 世界, uint64_t 容器, uint64_t 数组, int 数�
         fprintf(取证3文件, "=== 取证 v3（坐标时序）===\n");
         fprintf(取证3文件, "pid=%d  模块基址=%#llx  世界槽=%#llx\n",
                 游戏pid, (unsigned long long)模块基址,
-                (unsigned long long)(模块基址 + SDK::根世界));
+                (unsigned long long)(模块基址 + 偏移表.根世界));
         fprintf(取证3文件, "世界=%#llx  容器=%#llx  数组=%#llx  数量=%d  跳=%s\n",
                 (unsigned long long)世界, (unsigned long long)容器,
                 (unsigned long long)数组, 数量,
@@ -1973,7 +2209,7 @@ static void 取证3(uint64_t 世界, uint64_t 容器, uint64_t 数组, int 数�
 
     fprintf(取证3文件, "### 快照 %d\n", 取证3快照);
     for (int k = 0; k < 数量 && k < 32; ++k) {
-        uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)k);
+        uint64_t 实体 = vm_read<uint64_t>(数组 + 偏移表.槽距 * (uint64_t)k);
         if (!IsValidAddr(实体)) {
             fprintf(取证3文件, " [%2d] 实体无效\n", k);
             continue;
@@ -1997,7 +2233,7 @@ static void 取证3(uint64_t 世界, uint64_t 容器, uint64_t 数组, int 数�
                    取证3快照 == 200 || 取证3快照 == 201);
     if (要整块) {
         for (int k = 0; k < 数量 && k < 32; ++k) {
-            uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)k);
+            uint64_t 实体 = vm_read<uint64_t>(数组 + 偏移表.槽距 * (uint64_t)k);
             if (!IsValidAddr(实体)) continue;
             fprintf(取证3文件, "  --- 实体 %#llx 整块 0x380（快照 %d）---\n",
                     (unsigned long long)实体, 取证3快照);
@@ -2076,7 +2312,7 @@ static void 取证4采样(uint64_t 数组, int 数量) {
     取证4当轮数 = 0;
     unsigned char buf[0x200];
     for (int k = 0; k < 数量 && k < 32; ++k) {
-        uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)k);
+        uint64_t 实体 = vm_read<uint64_t>(数组 + 偏移表.槽距 * (uint64_t)k);
         if (!IsValidAddr(实体)) continue;
 
         // A. 实体自身 0x0..0x1200
@@ -2273,7 +2509,7 @@ static void 取证7采样(uint64_t 数组, int 数量, const float* m, float 宽
     float 中X = 宽 * 0.5f, 中Y = 高 * 0.5f;
     if (数量 > 32) 数量 = 32;
     for (int k = 0; k < 数量; ++k) {
-        uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)k);
+        uint64_t 实体 = vm_read<uint64_t>(数组 + 偏移表.槽距 * (uint64_t)k);
         if (!IsValidAddr(实体)) continue;
         if (readMemory(实体, 块, 0x900)) 取证7扫(0, 块, 0x900, m, 宽, 高, 中X, 中Y);
         for (int po = 0; po < 0x300; po += 8) {
@@ -2313,7 +2549,7 @@ static void 取证7结算(uint64_t 数组, int 数量, const float* m, float 宽
         取证7表[最佳].屏内 = -1;   // 排掉，避免重复
         if (数量 > 32) 数量 = 32;
         for (int s = 0; s < 数量; ++s) {
-            uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)s);
+            uint64_t 实体 = vm_read<uint64_t>(数组 + 偏移表.槽距 * (uint64_t)s);
             if (!IsValidAddr(实体)) continue;
             uint64_t 基 = 实体;
             if (p > 0) {
@@ -2430,8 +2666,14 @@ static void 位置日志(uint64_t 数组, int 数量, const float* m, float 宽,
             坐标解密器::State().阶段名(),
             坐标解密器::State().统计主(), 坐标解密器::State().统计镜(),
             坐标解密器::State().统计交叉失败(), 坐标解密器::State().统计未命中());
+    // 偏移表来源 + 样本链 B 的互校结果：一致涨=两条链都健康；
+    // 不一致涨=有一条在解错引用，配合最差偏差看差多远；链B命中=0 说明那三跳在本版本不成立。
+    fprintf(f, "### 偏移=%s 覆盖=%d 未知=%d | 互校 一致=%ld 不一致=%ld 最差=%d米 | 链B命中=%ld | 节点=%llu 组件=%llu 坐标基=%llu\n",
+            偏移来源, 偏移覆盖数, 偏移未知键, 互校一致, 互校不一致, 互校最差米, 链B命中,
+            (unsigned long long)偏移表.节点, (unsigned long long)偏移表.坐标组件,
+            (unsigned long long)偏移表.坐标基);
     for (int i = 0; i < 数量 && i < 16; ++i) {
-        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)i);
+        uint64_t e = vm_read<uint64_t>(数组 + 偏移表.槽距 * (uint64_t)i);
         unsigned X = 0, Z = 0;
         if (读实体坐标(e, &X, &Z) < 0) { fprintf(f, "%d 0 0 0 0 0 0 0\n", i); continue; }
         float sx = 0, sy = 0;
@@ -2469,14 +2711,14 @@ static void 链路诊断(uint64_t 根世界, uint64_t 容器, uint64_t 数组, i
             (unsigned long long)根世界, (unsigned long long)容器,
             (unsigned long long)数组, 数量);
     for (int i = 0; i < 数量 && i < 12; ++i) {
-        uint64_t e = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)i);
+        uint64_t e = vm_read<uint64_t>(数组 + 偏移表.槽距 * (uint64_t)i);
         fprintf(f, "槽%-2d 实体=0x%llx", i, (unsigned long long)e);
         if (!IsValidAddr(e)) { fprintf(f, " [实体无效]\n"); continue; }
-        uint64_t p230 = vm_read<uint64_t>(e + SDK::坐标节点);
-        uint64_t p1d0 = vm_read<uint64_t>(e + SDK::血量对象);
-        unsigned v278 = vm_read<unsigned>(e + 0x278);
-        int v2b8 = vm_read<int>(e + SDK::坐标X);
-        int v2c0 = vm_read<int>(e + SDK::坐标Y);
+        uint64_t p230 = vm_read<uint64_t>(e + 偏移表.节点);
+        uint64_t p1d0 = vm_read<uint64_t>(e + 偏移表.血量对象);
+        unsigned v278 = vm_read<unsigned>(e + 偏移表.直接X);
+        int v2b8 = vm_read<int>(e + 偏移表.野怪坐标X);
+        int v2c0 = vm_read<int>(e + 偏移表.野怪坐标Y);
         fprintf(f, " +230=0x%llx +1D0=0x%llx +278=%u +2B8=%d +2C0=%d",
                 (unsigned long long)p230, (unsigned long long)p1d0,
                 v278, v2b8, v2c0);
@@ -2602,7 +2844,7 @@ void Draw::StartBooks() {
     }
 
     // 世界根 → 实体容器 → 数组
-    uint64_t 根世界 = vm_read<uint64_t>(模块基址 + SDK::根世界);
+    uint64_t 根世界 = vm_read<uint64_t>(模块基址 + 偏移表.根世界);
     uint64_t 容器 = IsValidAddr(根世界) ? vm_read<uint64_t>(根世界 + 312) : 0;
     uint64_t 数组 = IsValidAddr(容器) ? vm_read<uint64_t>(容器 + 120) : 0;
     int 数量 = IsValidAddr(容器) ? vm_read<int>(容器 + 148) : 0;
@@ -2680,6 +2922,7 @@ void Draw::StartBooks() {
 
     // 运行时调参（Documents/tune.txt，2 秒重读一次）与小地图翻转
     读调参();
+    读偏移表();          // Documents/offsets.json，2 秒看一次 mtime，改完存盘即生效
     推小图翻转(数组, 数量, 我方阵营);
     调试我方阵营 = 我方阵营;
 
@@ -2724,12 +2967,12 @@ void Draw::StartBooks() {
     int 诊断屏[12] = {0};
 
     for (int k = 0; k < 数量 && k < cfg_scan_max; ++k) {
-        uint64_t 实体 = vm_read<uint64_t>(数组 + 24ULL * k);
+        uint64_t 实体 = vm_read<uint64_t>(数组 + 偏移表.槽距 * k);
         if (!IsValidAddr(实体)) continue;
         有效实体++;
 
         int 阵营 = vm_read<int>(实体 + 52);
-        if (阵营 < -1 || 阵营 > 7) 阵营 = vm_read<int>(实体 + (int)SDK::阵营);  // 联机部分实体阵营在 +0xC0
+        if (阵营 < -1 || 阵营 > 7) 阵营 = vm_read<int>(实体 + (int)偏移表.阵营);  // 联机部分实体阵营在 +0xC0
         if (阵营 < -1 || 阵营 > 7) continue;   // 阵营读不出来的是垃圾实体，以前会被当成敌人画出来（乱跳的来源之一）
         阵营直方[阵营 + 1]++;
 
