@@ -96,9 +96,16 @@ static unsigned 上次HUDContextId = 0;
     // 应用启动回调
     //log_debug(OS_LOG_DEFAULT, "- [BBZViewController application:%{public}@ didFinishLaunchingWithOptions:%{public}@]", application, launchOptions); // 记录日志
     @autoreleasepool {
-        // HUD 进程：在窗口创建前优先确保内核环境准备好（与原先未拆分时保持一致）
+        // HUD 进程：内核已经被越狱接管（roothide 的 kfd+physrw 在内核里生效），
+        // 先尝试直接接管它的原语表；拿到了就绝不再跑一遍 exploit。
         KernelLogLine("HUD: 准备内核环境...");
-        [DOJailbreaker.sharedInstance run];
+        if (kfd_jailbreak_primitives_ready()) {
+            DOJailbreaker.sharedInstance.isSuccess = YES;
+            KernelLogLine("HUD: 越狱内核已就绪，跳过 exploit 初始化");
+        } else {
+            KernelLogLine("HUD: 没拿到越狱原语，退回本地 exploit");
+            [DOJailbreaker.sharedInstance run];
+        }
         BOOL kernelReady = ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess;
         KernelLogLine(kernelReady ? "HUD: 内核就绪" : "HUD: 内核初始化完成（可能未成功）");
         // 无论状态如何，启动数据线程（内部会自行重试）
@@ -269,6 +276,11 @@ static unsigned 上次HUDContextId = 0;
        
         BOOL kernel = ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess;
         NSLog(@"DH666 kernel %d",kernel);
+        if (!kernel && kfd_jailbreak_primitives_ready()) {
+            DOJailbreaker.sharedInstance.isSuccess = YES;
+            kernel = YES;
+            KernelLogLine("HUD: 后台补接越狱原语成功，跳过 exploit");
+        }
         if (!kernel) {
             KernelLogLine("HUD: 检测到内核环境未就绪，开始在 HUD 进程补充初始化...");
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{

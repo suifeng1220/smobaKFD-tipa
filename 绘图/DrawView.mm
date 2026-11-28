@@ -437,6 +437,14 @@ static void 打印内核来源() {
          (void*)gPrimitives.kreadbuf, (void*)gPrimitives.physreadbuf);
 }
 
+// 给启动流程（BBZViewController）用：接管越狱已就绪的内核原语，全程不跑 exploit。
+// 返回 true 时调用方可以完全跳过 [DOJailbreaker run]。
+extern "C" bool kfd_jailbreak_primitives_ready(void) {
+    bool 通 = 接越狱内核();
+    打印内核来源();
+    return 通;
+}
+
 // ==================== 绘制原语 ====================
 
 static ImDrawList* 画布() { return BBZGUI::GetBackgroundDrawList(); }

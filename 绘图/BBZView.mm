@@ -2530,7 +2530,12 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
         [s->_terminal appendLog:[NSString stringWithFormat:@"开始初始化 · 校验 %d 项偏移", SDK::偏移项数]];
 
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            [DOJailbreaker.sharedInstance run];
+            // 越狱已经把内核拿下了：先接管它的原语，拿不到才跑本地 exploit
+            if (kfd_jailbreak_primitives_ready()) {
+                DOJailbreaker.sharedInstance.isSuccess = YES;
+            } else {
+                [DOJailbreaker.sharedInstance run];
+            }
             BOOL ok = ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess;
             dispatch_async(dispatch_get_main_queue(), ^{
                 __strong typeof(weakSelf) strong = weakSelf;
