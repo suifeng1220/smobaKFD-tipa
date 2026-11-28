@@ -66,6 +66,21 @@ namespace SDK {
     static const uint64_t 坐标直接Y = 636;   // 0x27C
     static const uint64_t 坐标直接Z = 640;   // 0x280
 
+    // ===== 外部样本交叉验证（TrollSpeed 分析报告 附录B，明文偏移表）=====
+    // 那份样本是独立的另一个外挂，它的表和我们实测的字段**逐条对得上**：
+    //   actorArray 120 = 我们的英雄数组 +120；entityStride 24 = 我们的槽距 24
+    //   hpBase 464 = 血量对象 464；hp 192 / maxHp 200 = 血量当前/上限
+    //   monsterPosX 696 / monsterPosY 704 = 野怪坐标 696/704
+    //   skill4 336 = 技能对象 336；recallState 360 = 回城对象 360；monsterHp 576 = 技能CD 576
+    // 说明两边定位的是同一套结构，它的表可以直接拿来当候选链用。
+    // 它给的坐标链形状是「实体+posComponent → 组件内 posPrimary / posMirror」，
+    // 两条都是 {x@0, y@4, z@8} 的 int32 —— 和我们 0x230 链 +0x128/+0x130 完全同构（Y 在中间）。
+    static const uint64_t 坐标组件 = 144;    // 0x90  坐标组件指针
+    static const uint64_t 坐标主   = 96;     // 0x60  组件内主坐标
+    static const uint64_t 坐标镜像 = 120;    // 0x78  组件内镜像坐标（样本作者用它交叉校验解密结果）
+    static const uint64_t 英雄ID   = 40;     // 0x28  英雄 ID
+    static const uint64_t 回城标记 = 32;     // 0x20  回城标记
+
     // 阵营（阵营符号：0/1，camp==1 时小地图 y 取反）
     static const uint64_t 阵营 = 192;    // 0xC0
 

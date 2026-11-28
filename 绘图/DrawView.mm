@@ -448,8 +448,25 @@ static float 读浮点(NSDictionary* cfg, NSString* key, float 缺省) {
 }
 
 
+// 首次启动没有 settings.plist 时，旧代码直接 return —— cfg_draw/cfg_map 全是 false，
+// 结果就是"App 开着但屏幕上什么都不画"，看起来像挂没生效。重装一次必然复现。
+// 现在缺文件就先落一份完整默认值再继续读，保证任何一次重装都是可见状态。
+static void 写默认配置() {
+    NSString* path = @(设置路径取());
+    NSDictionary* 默认 = @{
+        @"draw": @YES, @"line": @YES, @"box": @YES, @"health": @YES,
+        @"map": @YES, @"skill": @YES, @"monster": @YES,
+        @"avatar": @NO, @"livemode": @NO, @"status": @NO,
+        @"team": @0, @"fov": @1.2, @"scan_max": @96,
+    };
+    BOOL ok = [默认 writeToFile:path atomically:YES];
+    日志("没有 settings.plist → 写入默认配置 (%s)", ok ? "成功" : "失败");
+}
+
 static void 读配置() {
-    NSDictionary* cfg = [NSDictionary dictionaryWithContentsOfFile:@(设置路径取())];
+    NSString* 主路径 = @(设置路径取());
+    if (![[NSFileManager defaultManager] fileExistsAtPath:主路径]) 写默认配置();
+    NSDictionary* cfg = [NSDictionary dictionaryWithContentsOfFile:主路径];
     if (!cfg) cfg = [NSDictionary dictionaryWithContentsOfFile:@(旧设置路径)];
     if (!cfg) return;
     {
@@ -974,6 +991,35 @@ static int 读实体坐标(uint64_t 实体, unsigned* X, unsigned* Z) {
             *X = (unsigned)x;
             *Z = (unsigned)z;
             return 4;
+        }
+    }
+    // 三级：外部样本（TrollSpeed 分析报告 附录B）给出的坐标链
+    //   实体+0x90(坐标组件) → +0x60 主坐标 / +0x78 镜像坐标，两者都是 {x@0, y@4, z@8} 的 int32 三元组。
+    // 判据：主/镜像两份都非零时必须在 5 米内一致，否则判为错解引用（这是样本作者"读两份交叉校验"的做法）。
+    // 只在 0x230/0x260/0x250 全部失败时才走这里，不影响已经跑通的链路。
+    {
+        uint64_t 组件 = vm_read<uint64_t>(实体 + SDK::坐标组件);
+        if (IsValidAddr(组件)) {
+            int px = vm_read<int>(组件 + SDK::坐标主);
+            int pz = vm_read<int>(组件 + SDK::坐标主 + 8);
+            int mx = vm_read<int>(组件 + SDK::坐标镜像);
+            int mz = vm_read<int>(组件 + SDK::坐标镜像 + 8);
+            bool 主可用 = px > -300000 && px < 300000 && pz > -300000 && pz < 300000 && !(px == 0 && pz == 0);
+            bool 镜可用 = mx > -300000 && mx < 300000 && mz > -300000 && mz < 300000 && !(mx == 0 && mz == 0);
+            bool 一致 = (!主可用 || !镜可用) ? true
+                      : (llabs((long long)px - mx) < 5000 && llabs((long long)pz - mz) < 5000);
+            if (主可用 && 一致) {
+                坐标命中偏移 = SDK::坐标组件;
+                *X = (unsigned)px;
+                *Z = (unsigned)pz;
+                return 4;
+            }
+            if (镜可用 && 一致) {
+                坐标命中偏移 = SDK::坐标组件 + SDK::坐标镜像;
+                *X = (unsigned)mx;
+                *Z = (unsigned)mz;
+                return 4;
+            }
         }
     }
     // 二级兜底：仅当上面三个候选指针全部无效时才用实体自身 +0x278 / +0x280（静态锚点）
@@ -2265,17 +2311,26 @@ static void 位置日志(uint64_t 数组, int 数量, const float* m, float 宽,
         f = fopen(p2, "w");
         if (!f) return;
         setvbuf(f, nullptr, _IOLBF, 0);
-        fprintf(f, "# 槽 x(毫米) z(毫米) 屏x 屏y 有效  (屏幕 %.0fx%.0f)\n", 宽, 高);
+        fprintf(f, "# 槽 x(毫米) z(毫米) 屏x 屏y 有效  (屏幕 %.0fx%.0f 缩放=%.2f)\n", 宽, 高, 缩放系数);
+        // 小地图框实际画到屏幕上的像素矩形，用来和截图里的原生面板逐像素比对（别再靠猜）
+        fprintf(f, "# 小图框 像素 x=%.0f y=%.0f 边长=%.0f  (点 x=%.1f y=%.1f 边长=%.1f)\n",
+                cfg_mapX * 缩放系数, cfg_mapY * 缩放系数, cfg_mapSize * 缩放系数,
+                cfg_mapX, cfg_mapY, cfg_mapSize);
     }
     fprintf(f, "--- %.2f 命中=0x%llX 阵营=%u 翻转=%.0f 跨度=%.0f ---\n",
             now, (unsigned long long)坐标命中偏移, 调试我方阵营, 小图翻转(), cfg_mapSpan);
     for (int i = 0; i < 数量 && i < 16; ++i) {
         uint64_t e = vm_read<uint64_t>(数组 + 24ULL * (uint64_t)i);
         unsigned X = 0, Z = 0;
-        if (读实体坐标(e, &X, &Z) < 0) { fprintf(f, "%d 0 0 0 0 0\n", i); continue; }
+        if (读实体坐标(e, &X, &Z) < 0) { fprintf(f, "%d 0 0 0 0 0 0 0\n", i); continue; }
         float sx = 0, sy = 0;
         bool ok = 投影(m, (int)X, (int)Z, &sx, &sy, 宽, 高);
-        fprintf(f, "%d %d %d %.0f %.0f %d\n", i, (int)X, (int)Z, sx, sy, ok ? 1 : 0);
+        // 第 7/8 列：小图坐标（像素）。与绘制走同一套换算，可以直接和原生小地图上的圆点对比。
+        ImVec4 地图 = ImVec4(cfg_mapX, cfg_mapY, cfg_mapSize, cfg_mapSize);
+        float mx = 0, my = 0;
+        小图坐标((int)X, (int)Z, 地图, &mx, &my);
+        fprintf(f, "%d %d %d %.0f %.0f %d %.0f %.0f\n", i, (int)X, (int)Z, sx, sy, ok ? 1 : 0,
+                mx * 缩放系数, my * 缩放系数);
     }
     fflush(f);
 }
