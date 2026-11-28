@@ -100,7 +100,7 @@ static unsigned 上次HUDContextId = 0;
         // 先尝试直接接管它的原语表；拿到了就绝不再跑一遍 exploit。
         KernelLogLine("HUD: 准备内核环境...");
         if (kfd_jailbreak_primitives_ready()) {
-            DOJailbreaker.sharedInstance.isSuccess = YES;
+            ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess = YES;
             KernelLogLine("HUD: 越狱内核已就绪，跳过 exploit 初始化");
         } else {
             KernelLogLine("HUD: 没拿到越狱原语，退回本地 exploit");
@@ -277,7 +277,7 @@ static unsigned 上次HUDContextId = 0;
         BOOL kernel = ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess;
         NSLog(@"DH666 kernel %d",kernel);
         if (!kernel && kfd_jailbreak_primitives_ready()) {
-            DOJailbreaker.sharedInstance.isSuccess = YES;
+            ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess = YES;
             kernel = YES;
             KernelLogLine("HUD: 后台补接越狱原语成功，跳过 exploit");
         }

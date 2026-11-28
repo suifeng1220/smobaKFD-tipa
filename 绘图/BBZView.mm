@@ -2532,7 +2532,7 @@ static NSString *SLK_偏移摘要(BOOL 已校验) {
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             // 越狱已经把内核拿下了：先接管它的原语，拿不到才跑本地 exploit
             if (kfd_jailbreak_primitives_ready()) {
-                DOJailbreaker.sharedInstance.isSuccess = YES;
+                ((DOJailbreaker *)DOJailbreaker.sharedInstance).isSuccess = YES;
             } else {
                 [DOJailbreaker.sharedInstance run];
             }
